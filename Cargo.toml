@@ -1,0 +1,55 @@
+[package]
+name = "kafkas"
+version = "0.1.0"
+edition = "2021"
+authors = ["iamazy <iamazy.me@outlook.com>"]
+keywords = ["kafka", "message queue", "async", "tokio", "async-std"]
+license-file = "LICENSE"
+readme = "README.md"
+repository = "https://github.com/iamazy/kafkas"
+description = "async kafka client for rust"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+asynchronous-codec = { version = "0.6", optional = true }
+async-io = { version  = "1", optional = true}
+async-native-tls = { version = "0.4", optional = true }
+async-std = { version = "1", features = ["attributes", "unstable"], optional = true }
+bit-vec = "0.6"
+bytes = "1"
+chrono = "0.4"
+dashmap = "5"
+fnv = "1"
+futures-timer = "3.0"
+futures = "0.3"
+fxhash = "0.2"
+indexmap = "1"
+kafka-protocol = "0.4"
+native-tls = "0.2"
+pin-project-lite = "0.2"
+rand = "0.8"
+regex = "1.1.7"
+thiserror = "1"
+tokio = { version = "1", features = ["full"], optional = true }
+tokio-util = { version = "0.7", features = ["codec"], optional = true }
+tokio-native-tls = { version = "0.3", optional = true }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+url = "2.1"
+uuid = "0.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[features]
+default = ["tokio-runtime", "async-std-runtime"]
+tokio-runtime = ["tokio", "tokio-util", "tokio-native-tls"]
+async-std-runtime = ["async-std", "asynchronous-codec", "async-native-tls", "async-io"]
+
+[profile.release]
+debug = true
+
+# flamegraph
+# rustup default nightly
+# cargo flamegraph --example=hello_kafka
