@@ -25,6 +25,7 @@ use kafkas::{
 };
 use tokio::time::Instant;
 use tracing::{error, info};
+use kafkas::consumer::fetcher::Fetcher;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<Error>> {
@@ -32,18 +33,21 @@ async fn main() -> Result<(), Box<Error>> {
 
     let mut options = KafkaOptions::new();
     options.client_id("app");
-    let kafka_client = Kafka::new("127.0.0.1:50088", options, None, None, TokioExecutor).await?;
+    let kafka_client = Kafka::new("127.0.0.1:9092", options, None, None, TokioExecutor).await?;
 
-    // produce(kafka_client).await?;
+    produce(kafka_client).await?;
 
-    let mut coordinator = ConsumerCoordinator::new(kafka_client, "app").await?;
-    coordinator.subscribe(topic_name("kafka")).await?;
-    coordinator.join_group().await?;
-    coordinator.sync_group().await?;
-    coordinator.offset_fetch(7).await?;
-    coordinator.offset_commit().await?;
-    coordinator.heartbeat().await?;
-    coordinator.leave_group().await?;
+    // let mut coordinator = ConsumerCoordinator::new(kafka_client.clone(), "app").await?;
+    // coordinator.subscribe(topic_name("kafka")).await?;
+    // coordinator.join_group().await?;
+    // coordinator.sync_group().await?;
+    // coordinator.offset_fetch(7).await?;
+    // coordinator.offset_commit().await?;
+    // coordinator.heartbeat().await?;
+    // coordinator.leave_group().await?;
+    //
+    // let mut fetcher = Fetcher::new(kafka_client.clone(), coordinator.subscriptions.clone());
+    // fetcher.fetch().await?;
     Ok(())
 }
 

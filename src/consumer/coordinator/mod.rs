@@ -1,5 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
+use chrono::Local;
 use indexmap::IndexMap;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
@@ -12,6 +17,7 @@ use kafka_protocol::{
         join_group_request::{JoinGroupRequestBuilder, JoinGroupRequestProtocol},
         join_group_response::JoinGroupResponseMember,
         leave_group_request::LeaveGroupRequestBuilder,
+        list_offsets_request::{ListOffsetsPartition, ListOffsetsRequestBuilder, ListOffsetsTopic},
         offset_commit_request::{
             OffsetCommitRequestBuilder, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
         },
@@ -20,9 +26,10 @@ use kafka_protocol::{
             OffsetFetchRequestTopics,
         },
         sync_group_request::{SyncGroupRequestAssignment, SyncGroupRequestBuilder},
-        ConsumerProtocolAssignment, GroupId, TopicName,
+        BrokerId, ConsumerProtocolAssignment, GroupId, TopicName,
     },
     protocol::{Message, StrBytes},
+    records::NO_PARTITION_LEADER_EPOCH,
 };
 use tracing::{debug, error, info};
 
@@ -33,11 +40,12 @@ use crate::{
             Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, RangeAssignor,
             Subscription,
         },
-        ConsumerGroupMetadata, OffsetMetadata, RebalanceConfig, SubscriptionState,
+        ConsumerGroupMetadata, IsolationLevel, RebalanceOptions, SubscriptionState,
+        TopicPartitionState,
     },
     error::{ConsumeError, Result},
     executor::Executor,
-    metadata::{Node, TopicPartition},
+    metadata::Node,
     to_version_prefixed_bytes, Error, ToStrBytes,
 };
 
@@ -63,10 +71,10 @@ pub struct ConsumerCoordinator<Exe: Executor> {
     node: Node,
     group_meta: ConsumerGroupMetadata,
     group_subscription: GroupSubscription,
-    rebalance_config: RebalanceConfig,
+    rebalance_options: RebalanceOptions,
     auto_commit_interval_ms: i32,
     auto_commit_enabled: bool,
-    subscriptions: SubscriptionState,
+    pub subscriptions: Arc<RefCell<SubscriptionState>>,
     assignors: Vec<PartitionAssignor>,
 }
 
@@ -88,16 +96,16 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             node,
             auto_commit_interval_ms: 5000,
             auto_commit_enabled: true,
-            subscriptions: SubscriptionState::default(),
+            subscriptions: Arc::new(RefCell::new(SubscriptionState::default())),
             group_meta: ConsumerGroupMetadata::new(group_id.clone().into()),
             group_subscription: GroupSubscription::default(),
-            rebalance_config: RebalanceConfig::default(),
+            rebalance_options: RebalanceOptions::default(),
             assignors: vec![PartitionAssignor::Range(RangeAssignor)],
         })
     }
 
     pub async fn subscribe(&self, topic: TopicName) -> Result<()> {
-        self.subscriptions.topics.insert(topic.clone());
+        self.subscriptions.borrow_mut().topics.insert(topic.clone());
         self.client.topics_metadata(vec![topic]).await?;
         Ok(())
     }
@@ -196,19 +204,16 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             let assignment =
                 Assignment::deserialize_from_bytes(&mut sync_group_response.assignment)?;
             for (topic, partitions) in assignment.partitions {
-                self.subscriptions.topics.insert(topic.clone());
+                self.subscriptions.borrow_mut().topics.insert(topic.clone());
+                let mut partition_states = Vec::with_capacity(partitions.len());
                 for partition in partitions.iter() {
-                    self.subscriptions.offset_metadata.insert(
-                        TopicPartition {
-                            topic: topic.clone(),
-                            partition: *partition,
-                        },
-                        OffsetMetadata::default(),
-                    );
+                    partition_states.push(TopicPartitionState::new(*partition))
                 }
+
                 self.subscriptions
-                    .assignment
-                    .insert(topic.clone(), partitions);
+                    .borrow_mut()
+                    .assignments
+                    .insert(topic, partition_states);
             }
             debug!(
                 "sync group [{:?}] success, leader = {}, member_id = {}, generation_id = {}, \
@@ -220,7 +225,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 self.group_meta.protocol_type.as_ref(),
                 self.group_meta.protocol_name.as_ref(),
             );
-            debug!("{:?}", self.subscriptions);
+            debug!("{:?}", self.subscriptions.borrow());
             Ok(())
         } else {
             Err(Error::Response {
@@ -233,33 +238,35 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     pub async fn offset_fetch(&mut self, version: i16) -> Result<()> {
         let offset_fetch_response = self
             .client
-            .offset_fetch(
-                &self.node,
-                self.offset_fetch_builder(version).await?.build()?,
-            )
+            .offset_fetch(&self.node, self.offset_fetch_builder(version)?.build()?)
             .await?;
         if offset_fetch_response.error_code.is_ok() {
             if version <= 7 {
                 for topic in offset_fetch_response.topics {
-                    for partition in topic.partitions {
-                        if partition.error_code.is_ok() {
-                            let tp = TopicPartition {
-                                topic: topic.name.clone(),
-                                partition: partition.partition_index,
-                            };
-
-                            if let Some(mut metadata) =
-                                self.subscriptions.offset_metadata.get_mut(&tp)
-                            {
-                                metadata.metadata = partition.metadata;
-                                metadata.committed_offset = partition.committed_offset;
-                                metadata.committed_leader_epoch = partition.committed_leader_epoch;
+                    if let Some(partition_states) = self
+                        .subscriptions
+                        .borrow_mut()
+                        .assignments
+                        .get_mut(&topic.name)
+                    {
+                        for partition in topic.partitions {
+                            if partition.error_code.is_ok() {
+                                for partition_state in partition_states.iter_mut() {
+                                    if partition_state.partition == partition.partition_index {
+                                        // metadata.metadata = partition.metadata;
+                                        partition_state.position.offset =
+                                            partition.committed_offset;
+                                        partition_state.position.offset_epoch =
+                                            Some(partition.committed_leader_epoch);
+                                        break;
+                                    }
+                                }
+                            } else {
+                                error!(
+                                    "failed to fetch offset for partition {}",
+                                    partition.partition_index
+                                );
                             }
-                        } else {
-                            error!(
-                                "failed to fetch offset for partition {}",
-                                partition.partition_index
-                            );
                         }
                     }
                 }
@@ -316,19 +323,23 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     fn join_group_protocol_metadata(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
         debug!(
             "joining group with current subscription: {:?}",
-            self.subscriptions.topics
+            self.subscriptions.borrow().topics
         );
 
-        let mut topics = HashSet::with_capacity(self.subscriptions.topics.len());
-        self.subscriptions.topics.iter().for_each(|topic| {
-            topics.insert(topic.key().clone());
-        });
+        let mut topics = HashSet::with_capacity(self.subscriptions.borrow().topics.len());
+        self.subscriptions
+            .borrow_mut()
+            .topics
+            .iter()
+            .for_each(|topic| {
+                topics.insert(topic.clone());
+            });
         let mut protocols = IndexMap::with_capacity(topics.len());
         for assignor in self.assignors.iter() {
             let subscription = Subscription::new(
                 topics.clone(),
                 assignor.subscription_user_data(&topics)?,
-                self.subscriptions.partitions(),
+                self.subscriptions.borrow().partitions(),
             );
             let metadata = subscription.serialize_to_bytes()?;
             protocols.insert(
@@ -366,8 +377,8 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             .group_id(self.group_meta.group_id.clone())
             .member_id(self.group_meta.member_id.clone())
             .group_instance_id(self.group_meta.group_instance_id.clone())
-            .rebalance_timeout_ms(self.rebalance_config.rebalance_timeout_ms)
-            .session_timeout_ms(self.rebalance_config.session_timeout_ms)
+            .rebalance_timeout_ms(self.rebalance_options.rebalance_timeout_ms)
+            .session_timeout_ms(self.rebalance_options.session_timeout_ms)
             .protocol_type(PROTOCOL_TYPE.to_string().to_str_bytes())
             .protocols(self.join_group_protocol_metadata()?)
             .reason(None)
@@ -417,16 +428,16 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         Ok(builder)
     }
 
-    pub async fn offset_fetch_builder(&self, version: i16) -> Result<OffsetFetchRequestBuilder> {
+    pub fn offset_fetch_builder(&self, version: i16) -> Result<OffsetFetchRequestBuilder> {
         let mut builder = OffsetFetchRequestBuilder::default();
         builder.unknown_tagged_fields(Default::default());
 
         if version <= 7 {
-            let mut topics = Vec::with_capacity(self.subscriptions.topics.len());
-            for assign in self.subscriptions.topics.iter() {
-                let partitions = self.client.partitions(assign.key()).await?;
+            let mut topics = Vec::with_capacity(self.subscriptions.borrow().topics.len());
+            for assign in self.subscriptions.borrow().topics.iter() {
+                let partitions = self.client.cluster_meta.partitions(assign)?;
                 let topic = OffsetFetchRequestTopic {
-                    name: assign.key().clone(),
+                    name: assign.clone(),
                     partition_indexes: partitions.value().clone(),
                     ..Default::default()
                 };
@@ -439,11 +450,11 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 .groups(Default::default())
                 .require_stable(false);
         } else {
-            let mut topics = Vec::with_capacity(self.subscriptions.topics.len());
-            for assign in self.subscriptions.topics.iter() {
-                let partitions = self.client.partitions(assign.key()).await?;
+            let mut topics = Vec::with_capacity(self.subscriptions.borrow().topics.len());
+            for assign in self.subscriptions.borrow().topics.iter() {
+                let partitions = self.client.cluster_meta.partitions(assign)?;
                 let topic = OffsetFetchRequestTopics {
-                    name: assign.key().clone(),
+                    name: assign.clone(),
                     partition_indexes: partitions.value().clone(),
                     ..Default::default()
                 };
@@ -475,26 +486,19 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             .retention_time_ms(-1)
             .unknown_tagged_fields(Default::default());
 
-        let mut topics = Vec::with_capacity(self.subscriptions.topics.len());
-        for (topic, partitions) in self.subscriptions.assignment.iter() {
+        let mut topics = Vec::with_capacity(self.subscriptions.borrow().topics.len());
+        for (topic, partitions) in self.subscriptions.borrow().assignments.iter() {
             let mut offset_metadata = Vec::with_capacity(partitions.len());
-            for partition in partitions {
-                let tp = TopicPartition {
-                    topic: topic.clone(),
-                    partition: *partition,
+            for partition_state in partitions {
+                let partition = OffsetCommitRequestPartition {
+                    partition_index: partition_state.partition,
+                    committed_offset: partition_state.position.offset,
+                    committed_leader_epoch: partition_state.position.offset_epoch.unwrap_or(-1),
+                    commit_timestamp: -1,
+                    ..Default::default()
                 };
 
-                if let Some(meta) = self.subscriptions.offset_metadata.get(&tp) {
-                    let partition = OffsetCommitRequestPartition {
-                        partition_index: *partition,
-                        committed_offset: meta.committed_offset,
-                        committed_leader_epoch: meta.committed_leader_epoch,
-                        commit_timestamp: -1,
-                        ..Default::default()
-                    };
-
-                    offset_metadata.push(partition);
-                }
+                offset_metadata.push(partition);
             }
 
             let topic = OffsetCommitRequestTopic {
@@ -505,6 +509,36 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             topics.push(topic);
         }
 
+        builder.topics(topics);
+        Ok(builder)
+    }
+
+    pub fn list_offsets_builder(&self) -> Result<ListOffsetsRequestBuilder> {
+        let mut builder = ListOffsetsRequestBuilder::default();
+        builder
+            .replica_id(BrokerId(-1))
+            .isolation_level(IsolationLevel::ReadCommitted.into());
+
+        let mut topics = Vec::new();
+        let timestamp = Local::now().timestamp();
+        for (topic_name, partition_list) in self.subscriptions.borrow().assignments.iter() {
+            let mut partitions = Vec::new();
+            for partition in partition_list {
+                let partition = ListOffsetsPartition {
+                    partition_index: partition.partition,
+                    current_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                    timestamp,
+                    ..Default::default()
+                };
+                partitions.push(partition);
+            }
+            let topic = ListOffsetsTopic {
+                name: topic_name.clone(),
+                partitions,
+                ..Default::default()
+            };
+            topics.push(topic);
+        }
         builder.topics(topics);
         Ok(builder)
     }

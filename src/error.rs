@@ -7,7 +7,7 @@ use kafka_protocol::{
     messages::{
         consumer_protocol_assignment::ConsumerProtocolAssignmentBuilderError,
         describe_groups_request::DescribeGroupsRequestBuilderError,
-        heartbeat_request::HeartbeatRequestBuilderError,
+        fetch_request::FetchRequestBuilderError, heartbeat_request::HeartbeatRequestBuilderError,
         join_group_request::JoinGroupRequestBuilderError,
         leave_group_request::LeaveGroupRequestBuilderError,
         offset_commit_request::OffsetCommitRequestBuilderError,
@@ -19,7 +19,7 @@ use kafka_protocol::{
     ResponseError,
 };
 
-use crate::{metadata::Node, producer::SendFuture};
+use crate::{producer::SendFuture, NodeId, PartitionId};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -36,7 +36,7 @@ pub enum Error {
         partition: i32,
     },
     NodeNotAvailable {
-        node: Node,
+        node: NodeId,
     },
     Produce(ProduceError),
     Consume(ConsumeError),
@@ -85,6 +85,12 @@ impl From<EncodeError> for Error {
 impl From<DecodeError> for Error {
     fn from(_: DecodeError) -> Self {
         Error::Connection(ConnectionError::Decoding("decode error".into()))
+    }
+}
+
+impl From<FetchRequestBuilderError> for Error {
+    fn from(value: FetchRequestBuilderError) -> Self {
+        Error::Custom(value.to_string())
     }
 }
 
@@ -229,7 +235,7 @@ pub enum ProduceError {
     /// Indicates this producer has lost exclusive access to the topic. Client can decided whether
     /// to recreate or not
     Fenced,
-    NoCapacity(Record),
+    NoCapacity((PartitionId, Record)),
     MessageTooLarge,
 }
 
@@ -238,7 +244,7 @@ impl std::fmt::Display for ProduceError {
         match self {
             ProduceError::Connection(e) => write!(f, "Connection error: {e}"),
             ProduceError::Io(e) => write!(f, "Compression error: {e}"),
-            ProduceError::Custom(e) => write!(f, "Custom error: {e}"),
+            ProduceError::Custom(e) => write!(f, "{e}"),
             ProduceError::Batch(e) => write!(f, "Batch error: {e}"),
             ProduceError::PartialSend(e) => {
                 let (successes, failures) = e.iter().fold((0, 0), |(s, f), r| match r {
@@ -320,7 +326,7 @@ impl std::fmt::Display for ConsumeError {
         match self {
             ConsumeError::Connection(e) => write!(f, "Connection error: {e}"),
             ConsumeError::Io(e) => write!(f, "Decompression error: {e}"),
-            ConsumeError::Custom(e) => write!(f, "Custom error: {e}"),
+            ConsumeError::Custom(e) => write!(f, "{e}"),
             ConsumeError::PartitionAssignorNotAvailable(name) => {
                 write!(f, "PartitionAssignor: {name} not available")
             }

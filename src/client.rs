@@ -6,9 +6,10 @@ use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
         metadata_request::MetadataRequestTopic, DescribeGroupsRequest, DescribeGroupsResponse,
-        FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
-        InitProducerIdRequest, JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest,
-        LeaveGroupResponse, MetadataRequest, OffsetCommitRequest, OffsetCommitResponse,
+        FetchRequest, FetchResponse, FindCoordinatorRequest, FindCoordinatorResponse,
+        HeartbeatRequest, HeartbeatResponse, InitProducerIdRequest, JoinGroupRequest,
+        JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsRequest,
+        ListOffsetsResponse, MetadataRequest, OffsetCommitRequest, OffsetCommitResponse,
         OffsetFetchRequest, OffsetFetchResponse, ProduceRequest, ProduceResponse, ProducerId,
         RequestKind, ResponseKind, SyncGroupRequest, SyncGroupResponse, TopicName,
     },
@@ -44,6 +45,7 @@ pub trait SerializeMessage {
     fn serialize_message(input: Self) -> Result<Record>;
 }
 
+#[derive(Clone)]
 pub struct Kafka<Exe: Executor> {
     pub(crate) manager: Arc<ConnectionManager<Exe>>,
     pub(crate) operation_retry_options: OperationRetryOptions,
@@ -127,10 +129,7 @@ impl<Exe: Executor> Kafka<Exe> {
         })
     }
 
-    pub async fn partitions(&self, topic: &TopicName) -> Result<PartitionRef> {
-        if !self.cluster_meta.topics.contains_key(topic) {
-            self.topics_metadata(vec![topic.clone()]).await?;
-        }
+    pub fn partitions(&self, topic: &TopicName) -> Result<PartitionRef> {
         self.cluster_meta.partitions(topic)
     }
 }
@@ -306,6 +305,22 @@ impl<Exe: Executor> Kafka<Exe> {
         }
     }
 
+    pub async fn list_offsets(
+        &self,
+        node: &Node,
+        request: ListOffsetsRequest,
+    ) -> Result<ListOffsetsResponse> {
+        let request = RequestKind::ListOffsetsRequest(request);
+        let response = self.manager.invoke(node.address(), request).await?;
+        if let ResponseKind::ListOffsetsResponse(response) = response {
+            Ok(response)
+        } else {
+            Err(Error::Connection(ConnectionError::UnexpectedResponse(
+                format!("{response:?}"),
+            )))
+        }
+    }
+
     pub async fn heartbeat(
         &self,
         node: &Node,
@@ -314,6 +329,18 @@ impl<Exe: Executor> Kafka<Exe> {
         let request = RequestKind::HeartbeatRequest(request);
         let response = self.manager.invoke(node.address(), request).await?;
         if let ResponseKind::HeartbeatResponse(response) = response {
+            Ok(response)
+        } else {
+            Err(Error::Connection(ConnectionError::UnexpectedResponse(
+                format!("{response:?}"),
+            )))
+        }
+    }
+
+    pub async fn fetch(&self, node: &Node, request: FetchRequest) -> Result<FetchResponse> {
+        let request = RequestKind::FetchRequest(request);
+        let response = self.manager.invoke(node.address(), request).await?;
+        if let ResponseKind::FetchResponse(response) = response {
             Ok(response)
         } else {
             Err(Error::Connection(ConnectionError::UnexpectedResponse(
@@ -337,7 +364,7 @@ impl<Exe: Executor> Kafka<Exe> {
         let request = RequestKind::MetadataRequest(request);
         let response = self.manager.invoke(&self.manager.url, request).await?;
         if let ResponseKind::MetadataResponse(metadata) = response {
-            self.cluster_meta.merge_meta(metadata).await
+            self.cluster_meta.merge_meta(metadata)
         } else {
             Err(Error::Connection(ConnectionError::UnexpectedResponse(
                 format!("{response:?}"),

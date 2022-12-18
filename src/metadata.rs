@@ -1,7 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dashmap::{DashMap, DashSet};
-use futures::lock::Mutex;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
@@ -17,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{Error, Result},
-    NodeRef, PartitionRef,
+    NodeId, NodeRef, PartitionRef,
 };
 
 pub(crate) const GROUP_METADATA_TOPIC_NAME: &str = "__consumer_offsets";
@@ -98,14 +97,14 @@ pub struct TopicPartition {
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Hash)]
 pub struct Node {
-    pub id: i32,
+    pub id: NodeId,
     pub host: String,
     pub port: u16,
     address: String,
 }
 
 impl Node {
-    pub fn new(id: i32, host: String, port: u16) -> Self {
+    pub fn new(id: NodeId, host: String, port: u16) -> Self {
         Self {
             id,
             host: host.clone(),
@@ -127,7 +126,7 @@ impl From<(&BrokerId, &MetadataResponseBroker)> for Node {
 
 #[derive(Debug, Clone, Default)]
 pub struct Cluster {
-    pub id: Arc<Mutex<Option<String>>>,
+    pub id: Arc<Mutex<Option<StrBytes>>>,
     pub unauthorized_topics: DashSet<TopicName>,
     pub invalid_topics: DashSet<TopicName>,
     pub internal_topics: DashSet<TopicName>,
@@ -144,10 +143,10 @@ impl Cluster {
         Default::default()
     }
 
-    pub async fn merge_meta(&self, other: MetadataResponse) -> Result<()> {
-        let cluster_id = other.cluster_id.map(|str| str.to_string());
+    pub fn merge_meta(&self, other: MetadataResponse) -> Result<()> {
+        let cluster_id = other.cluster_id;
         {
-            let mut lock = self.id.lock().await;
+            let mut lock = self.id.lock()?;
             if matches!(*lock, None) {
                 *lock = cluster_id;
             } else if *lock != cluster_id {
@@ -158,7 +157,7 @@ impl Cluster {
             }
         }
         {
-            let mut lock = self.controller.lock().await;
+            let mut lock = self.controller.lock()?;
             *lock = other.controller_id.0;
         }
         for broker in other.brokers.iter() {
@@ -235,11 +234,11 @@ impl Cluster {
         })
     }
 
-    pub fn drain_node(&self, node: &Node) -> Result<NodeRef> {
-        if !self.nodes.contains_key(&node.id) {
-            return Err(Error::NodeNotAvailable { node: node.clone() });
+    pub fn drain_node(&self, node: NodeId) -> Result<NodeRef> {
+        if !self.nodes.contains_key(&node) {
+            return Err(Error::NodeNotAvailable { node });
         }
-        return if let Some(node_entry) = self.partitions_by_nodes.get(&node.id) {
+        return if let Some(node_entry) = self.partitions_by_nodes.get(&node) {
             Ok(node_entry)
         } else {
             let mut topic_partitions = Vec::new();
@@ -248,12 +247,12 @@ impl Cluster {
                     .value()
                     .partitions
                     .iter()
-                    .filter(|p| p.leader == node.id)
+                    .filter(|p| p.leader == node)
                     .map(|p| p.partition)
                     .collect();
                 topic_partitions.push((topic_entry.name.clone().into(), partitions));
             }
-            self.partitions_by_nodes.insert(node.id, topic_partitions);
+            self.partitions_by_nodes.insert(node, topic_partitions);
             self.drain_node(node)
         };
     }
