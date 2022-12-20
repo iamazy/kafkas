@@ -80,7 +80,7 @@ impl Aggregator for RecordAggregator {
     type Input = Record;
     type Tag = usize;
 
-    fn try_push(&mut self, record: Self::Input) -> Result<TryPush<Self::Input, Self::Tag>> {
+    fn try_push(&mut self, mut record: Self::Input) -> Result<TryPush<Self::Input, Self::Tag>> {
         let record_size: usize = record_size(&record);
 
         if self.state.batch_size + record_size > self.max_batch_size {
@@ -88,6 +88,10 @@ impl Aggregator for RecordAggregator {
         }
 
         let tag = self.state.records.len();
+
+        record.offset = tag as i64;
+        record.sequence = tag as i32;
+
         self.state.batch_size += record_size;
         self.state.records.push(record);
         Ok(TryPush::Aggregated(tag))
