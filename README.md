@@ -1,17 +1,17 @@
 # kafkas
 
-async kafka client for rust which **not** depend on `librdkafka`
+async kafka client in pure Rust.
 
 ## Features
 
 - multiple async runtime (`tokio`, `async-std`, etc.)
 - all kafka versions
-- compression (`gzip`, `snappy`, `lz4` and `zstd` coming soon.)
+- compression (`gzip`, `snappy`, `lz4`)
 
 ## APIs
 
 - [x] producer
-- [ ] consumer (coming soon.)
+- [ ] consumer
 - [ ] streams
 - [ ] connect
 - [ ] admin client
@@ -64,7 +64,7 @@ Examples can be found in [`examples`](https://github.com/iamazy/kafkas/blob/main
 
 ## Rust version requirements
 
-The rust version used for `kafkas` development is `1.65` and built upon `nightly` toolchain.
+The rust version used for `kafkas` development is `1.65`.
 
 ## Acknowledgments
 
