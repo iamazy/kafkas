@@ -1,13 +1,22 @@
-use std::{cell::RefCell, sync::Arc};
-use std::collections::VecDeque;
+use std::{cell::RefCell, collections::VecDeque, sync::Arc};
+
 use dashmap::DashMap;
-use kafka_protocol::error::ParseResponseErrorCode;
-use kafka_protocol::messages::BrokerId;
+use kafka_protocol::{
+    error::ParseResponseErrorCode,
+    messages::{
+        fetch_request::{FetchPartition, FetchRequestBuilder, FetchTopic},
+        BrokerId,
+    },
+    records::{Record, RecordBatchDecoder},
+};
 
-use kafka_protocol::messages::fetch_request::{FetchPartition, FetchRequestBuilder, FetchTopic};
-use kafka_protocol::records::{Record, RecordBatchDecoder};
-
-use crate::{client::Kafka, consumer::{IsolationLevel, SubscriptionState}, error::Result, executor::Executor, NodeId, PartitionId};
+use crate::{
+    client::Kafka,
+    consumer::{IsolationLevel, SubscriptionState},
+    error::Result,
+    executor::Executor,
+    NodeId, PartitionId,
+};
 
 const INITIAL_EPOCH: i32 = 0;
 const FINAL_EPOCH: i32 = -1;
@@ -26,7 +35,7 @@ pub struct Fetcher<Exe: Executor> {
     client_rack_id: String,
     subscription: Arc<RefCell<SubscriptionState>>,
     sessions: DashMap<i32, FetchSession>,
-    completed_fetch: VecDeque<FetchedRecords>
+    completed_fetch: VecDeque<FetchedRecords>,
 }
 
 impl<Exe: Executor> Fetcher<Exe> {
@@ -49,7 +58,7 @@ impl<Exe: Executor> Fetcher<Exe> {
             client_rack_id: String::default(),
             subscription,
             sessions,
-            completed_fetch: VecDeque::new()
+            completed_fetch: VecDeque::new(),
         }
     }
 
@@ -69,16 +78,28 @@ impl<Exe: Executor> Fetcher<Exe> {
 
                     for fetchable_topic in fetch_response.responses {
                         for partition in fetchable_topic.partitions {
-                            if let Some(partition_states) = self.subscription.borrow_mut().assignments.get_mut(&fetchable_topic.topic) {
-                                if let Some(partition_state) = partition_states.iter_mut().find(|p| p.partition == partition.partition_index) {
-                                    partition_state.last_stable_offset = partition.last_stable_offset;
+                            if let Some(partition_states) = self
+                                .subscription
+                                .borrow_mut()
+                                .assignments
+                                .get_mut(&fetchable_topic.topic)
+                            {
+                                if let Some(partition_state) = partition_states
+                                    .iter_mut()
+                                    .find(|p| p.partition == partition.partition_index)
+                                {
+                                    partition_state.last_stable_offset =
+                                        partition.last_stable_offset;
                                     partition_state.log_start_offset = partition.log_start_offset;
                                     partition_state.high_water_mark = partition.high_watermark;
                                     if let Some(mut records) = partition.records {
                                         let records = RecordBatchDecoder::decode(&mut records)?;
-                                        if let Some(record) = records.iter().max_by_key(|record| record.offset) {
+                                        if let Some(record) =
+                                            records.iter().max_by_key(|record| record.offset)
+                                        {
                                             partition_state.position.offset = record.offset;
-                                            partition_state.position.current_leader.epoch = Some(record.partition_leader_epoch);
+                                            partition_state.position.current_leader.epoch =
+                                                Some(record.partition_leader_epoch);
                                         }
 
                                         for record in records.iter() {
@@ -89,7 +110,7 @@ impl<Exe: Executor> Fetcher<Exe> {
 
                                         let fetched_records = FetchedRecords {
                                             partition: partition.partition_index,
-                                            records
+                                            records,
                                         };
                                         self.completed_fetch.push_back(fetched_records);
                                     }

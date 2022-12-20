@@ -6,8 +6,7 @@ use std::sync::{
 use bytes::Bytes;
 use kafka_protocol::messages::TopicName;
 
-use crate::error::Result;
-use crate::metadata::Cluster;
+use crate::{error::Result, metadata::Cluster};
 
 pub trait PartitionSelector {
     fn select<'a>(
@@ -42,7 +41,9 @@ impl PartitionSelector for PartitionerSelector {
         cluster: Arc<Cluster>,
     ) -> Result<i32> {
         match self {
-            PartitionerSelector::RoundRobin(roundbin) => roundbin.select(topic, key, value, cluster),
+            PartitionerSelector::RoundRobin(roundbin) => {
+                roundbin.select(topic, key, value, cluster)
+            }
         }
     }
 }

@@ -17,7 +17,10 @@ use kafka_protocol::{
 use kafkas::{
     client::{Kafka, KafkaOptions, SerializeMessage},
     connection_manager::ConnectionManager,
-    consumer::coordinator::{ConsumerCoordinator, CoordinatorType},
+    consumer::{
+        coordinator::{ConsumerCoordinator, CoordinatorType},
+        fetcher::Fetcher,
+    },
     executor::{AsyncStdExecutor, Executor, TokioExecutor},
     producer::{Producer, ProducerOptions},
     topic_name, Error, Record, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
@@ -25,7 +28,6 @@ use kafkas::{
 };
 use tokio::time::Instant;
 use tracing::{error, info};
-use kafkas::consumer::fetcher::Fetcher;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<Error>> {

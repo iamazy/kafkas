@@ -8,7 +8,11 @@ use super::{
     aggregator::{Aggregator, RecordAggregator, TryPush},
     RecordMetadata,
 };
-use crate::{error::{Error, ProduceError, Result}, PartitionId, producer::SendFuture};
+use crate::{
+    error::{Error, ProduceError, Result},
+    producer::SendFuture,
+    PartitionId,
+};
 
 #[derive(Debug)]
 pub struct Thunk {

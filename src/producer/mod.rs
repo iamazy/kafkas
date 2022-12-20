@@ -276,10 +276,7 @@ impl<Exe: Executor> Producer<Exe> {
                 }
             }
             Err(err) => {
-                error!(
-                    "failed to push record, topic: {:?}, err: {err}",
-                    topic,
-                );
+                error!("failed to push record, topic: {:?}, err: {err}", topic,);
                 Err(err)
             }
         };
