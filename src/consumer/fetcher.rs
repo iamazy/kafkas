@@ -63,8 +63,6 @@ impl<Exe: Executor> Fetcher<Exe> {
         }
     }
 
-    fn prepare_fetch_request(&self) {}
-
     pub async fn fetch(&mut self) -> Result<()> {
         for mut entry in self.sessions.iter_mut() {
             let node_id = entry.node;
@@ -84,44 +82,39 @@ impl<Exe: Executor> Fetcher<Exe> {
                             .get_mut(&fetchable_topic.topic)
                         {
                             for partition in fetchable_topic.partitions {
-                                if !partition.error_code.is_ok() {
+                                if partition.error_code.is_ok() {
+                                    if let Some(partition_state) = partition_states
+                                        .iter_mut()
+                                        .find(|p| p.partition == partition.partition_index)
+                                    {
+                                        partition_state.last_stable_offset =
+                                            partition.last_stable_offset;
+                                        partition_state.log_start_offset =
+                                            partition.log_start_offset;
+                                        partition_state.high_water_mark = partition.high_watermark;
+                                        if let Some(mut records) = partition.records {
+                                            let records = RecordBatchDecoder::decode(&mut records)?;
+                                            if let Some(record) =
+                                                records.iter().max_by_key(|record| record.offset)
+                                            {
+                                                partition_state.position.offset = record.offset;
+                                                partition_state.position.current_leader.epoch =
+                                                    Some(record.partition_leader_epoch);
+                                            }
+
+                                            let fetched_records = FetchedRecords {
+                                                partition: partition.partition_index,
+                                                records,
+                                            };
+                                            self.completed_fetch.push_back(fetched_records);
+                                        }
+                                    }
+                                } else {
                                     error!(
                                         "fetch partition {} error: {}",
                                         partition.partition_index,
                                         partition.error_code.err().unwrap()
                                     );
-                                    continue;
-                                }
-                                if let Some(partition_state) = partition_states
-                                    .iter_mut()
-                                    .find(|p| p.partition == partition.partition_index)
-                                {
-                                    partition_state.last_stable_offset =
-                                        partition.last_stable_offset;
-                                    partition_state.log_start_offset = partition.log_start_offset;
-                                    partition_state.high_water_mark = partition.high_watermark;
-                                    if let Some(mut records) = partition.records {
-                                        let records = RecordBatchDecoder::decode(&mut records)?;
-                                        if let Some(record) =
-                                            records.iter().max_by_key(|record| record.offset)
-                                        {
-                                            partition_state.position.offset = record.offset;
-                                            partition_state.position.current_leader.epoch =
-                                                Some(record.partition_leader_epoch);
-                                        }
-
-                                        for record in records.iter() {
-                                            if let Some(ref value) = record.value {
-                                                println!("{:?}", String::from_utf8_lossy(value));
-                                            }
-                                        }
-
-                                        let fetched_records = FetchedRecords {
-                                            partition: partition.partition_index,
-                                            records,
-                                        };
-                                        self.completed_fetch.push_back(fetched_records);
-                                    }
                                 }
                             }
                         }
@@ -129,7 +122,6 @@ impl<Exe: Executor> Fetcher<Exe> {
                 }
             }
         }
-
         Ok(())
     }
 }
