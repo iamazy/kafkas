@@ -7,9 +7,12 @@ use kafka_protocol::{
     messages::{
         consumer_protocol_assignment::ConsumerProtocolAssignmentBuilderError,
         describe_groups_request::DescribeGroupsRequestBuilderError,
-        fetch_request::FetchRequestBuilderError, heartbeat_request::HeartbeatRequestBuilderError,
+        fetch_request::FetchRequestBuilderError,
+        find_coordinator_request::FindCoordinatorRequestBuilderError,
+        heartbeat_request::HeartbeatRequestBuilderError,
         join_group_request::JoinGroupRequestBuilderError,
         leave_group_request::LeaveGroupRequestBuilderError,
+        list_offsets_request::ListOffsetsRequestBuilderError,
         offset_commit_request::OffsetCommitRequestBuilderError,
         offset_fetch_request::OffsetFetchRequestBuilderError,
         sync_group_request::SyncGroupRequestBuilderError, TopicName,
@@ -85,6 +88,18 @@ impl From<EncodeError> for Error {
 impl From<DecodeError> for Error {
     fn from(_: DecodeError) -> Self {
         Error::Connection(ConnectionError::Decoding("decode error".into()))
+    }
+}
+
+impl From<FindCoordinatorRequestBuilderError> for Error {
+    fn from(value: FindCoordinatorRequestBuilderError) -> Self {
+        Error::Custom(value.to_string())
+    }
+}
+
+impl From<ListOffsetsRequestBuilderError> for Error {
+    fn from(value: ListOffsetsRequestBuilderError) -> Self {
+        Error::Custom(value.to_string())
     }
 }
 
@@ -318,6 +333,7 @@ pub enum ConsumeError {
     Connection(ConnectionError),
     Custom(String),
     Io(std::io::Error),
+    CoordinatorNotAvailable,
     PartitionAssignorNotAvailable(String),
 }
 
@@ -327,6 +343,7 @@ impl std::fmt::Display for ConsumeError {
             ConsumeError::Connection(e) => write!(f, "Connection error: {e}"),
             ConsumeError::Io(e) => write!(f, "Decompression error: {e}"),
             ConsumeError::Custom(e) => write!(f, "{e}"),
+            ConsumeError::CoordinatorNotAvailable => write!(f, "Coordinator not available"),
             ConsumeError::PartitionAssignorNotAvailable(name) => {
                 write!(f, "PartitionAssignor: {name} not available")
             }
@@ -340,6 +357,7 @@ impl std::fmt::Debug for ConsumeError {
             ConsumeError::Connection(e) => write!(f, "Connection({e})"),
             ConsumeError::Custom(msg) => write!(f, "Custom({msg})"),
             ConsumeError::Io(e) => write!(f, "Io({e})"),
+            ConsumeError::CoordinatorNotAvailable => write!(f, "CoordinatorNotAvailable"),
             ConsumeError::PartitionAssignorNotAvailable(name) => {
                 write!(f, "PartitionAssignorNotAvailable({name})")
             }

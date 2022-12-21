@@ -37,17 +37,18 @@ async fn main() -> Result<(), Box<Error>> {
     options.client_id("app");
     let kafka_client = Kafka::new("127.0.0.1:9092", options, None, None, TokioExecutor).await?;
 
-    produce(kafka_client).await?;
+    // produce(kafka_client).await?;
 
-    // let mut coordinator = ConsumerCoordinator::new(kafka_client.clone(), "app").await?;
-    // coordinator.subscribe(topic_name("kafka")).await?;
-    // coordinator.join_group().await?;
-    // coordinator.sync_group().await?;
+    let mut coordinator = ConsumerCoordinator::new(kafka_client.clone(), "app").await?;
+    coordinator.subscribe(topic_name("kafka")).await?;
+    coordinator.join_group().await?;
+    coordinator.sync_group().await?;
     // coordinator.offset_fetch(7).await?;
     // coordinator.offset_commit().await?;
+    coordinator.list_offsets().await?;
     // coordinator.heartbeat().await?;
     // coordinator.leave_group().await?;
-    //
+
     // let mut fetcher = Fetcher::new(kafka_client.clone(), coordinator.subscriptions.clone());
     // fetcher.fetch().await?;
     Ok(())
@@ -94,153 +95,6 @@ impl SerializeMessage for TestData {
             headers: indexmap::IndexMap::new(),
         })
     }
-}
-
-async fn api_versions<Exe: Executor>(
-    addr: &String,
-    manager: &ConnectionManager<Exe>,
-) -> Result<(), Box<Error>> {
-    let request = RequestKind::ApiVersionsRequest(ApiVersionsRequest::default());
-    let response = manager.invoke(&addr, request).await?;
-    if let ResponseKind::ApiVersionsResponse(res) = response {
-        println!("{:?}", res);
-    }
-    Ok(())
-}
-
-async fn heartbeat<Exe: Executor>(
-    addr: &String,
-    manager: &ConnectionManager<Exe>,
-) -> Result<(), Box<Error>> {
-    let mut request = HeartbeatRequest::default();
-    request.group_id = GroupId(StrBytes::from_str("test_group_id"));
-    request.member_id = StrBytes::from_str("test_member_id");
-    let request = RequestKind::HeartbeatRequest(request);
-    let response = manager.invoke(&addr, request).await?;
-    if let ResponseKind::HeartbeatResponse(res) = response {
-        println!("{:?}", res);
-    }
-    Ok(())
-}
-
-async fn describe_cluster<Exe: Executor>(
-    addr: &String,
-    manager: &ConnectionManager<Exe>,
-) -> Result<(), Box<Error>> {
-    let request = RequestKind::DescribeClusterRequest(DescribeClusterRequest::default());
-    let response = manager.invoke(&addr, request).await?;
-    if let ResponseKind::DescribeClusterResponse(res) = response {
-        println!("{:?}", res);
-    }
-    Ok(())
-}
-
-async fn find_coordinator<Exe: Executor>(
-    addr: &String,
-    manager: &ConnectionManager<Exe>,
-) -> Result<(), Box<Error>> {
-    let mut request = FindCoordinatorRequest::default();
-    request.key_type = CoordinatorType::Group.into();
-    let request = RequestKind::FindCoordinatorRequest(request);
-    let response = manager.invoke(&addr, request).await?;
-    if let ResponseKind::FindCoordinatorResponse(res) = response {
-        println!("{:?}", res);
-    }
-    Ok(())
-}
-
-async fn describe_groups<Exe: Executor>(
-    addr: &String,
-    manager: &ConnectionManager<Exe>,
-) -> Result<(), Box<Error>> {
-    let mut request = DescribeGroupsRequest::default();
-    request.groups = vec![GroupId(StrBytes::from_str("test_group_id"))];
-
-    let request = RequestKind::DescribeGroupsRequest(request);
-    let response = manager.invoke(&addr, request).await?;
-    if let ResponseKind::DescribeGroupsResponse(res) = response {
-        println!("{:?}", res);
-    }
-    Ok(())
-}
-
-async fn join_group<Exe: Executor>(
-    addr: &String,
-    manager: &ConnectionManager<Exe>,
-) -> Result<(), Box<Error>> {
-    let mut request = JoinGroupRequest::default();
-    request.group_id = GroupId(StrBytes::from_str("test_group_id"));
-    request.member_id = StrBytes::from_str("test_member_id");
-    request.protocol_type = StrBytes::from_str("consumer");
-    let request = RequestKind::JoinGroupRequest(request);
-    let response = manager.invoke(&addr, request).await?;
-    if let ResponseKind::JoinGroupResponse(res) = response {
-        println!("{:?}", res);
-    }
-    Ok(())
-}
-
-async fn list_groups<Exe: Executor>(
-    addr: &String,
-    manager: &ConnectionManager<Exe>,
-) -> Result<(), Box<Error>> {
-    let request = ListGroupsRequest::default();
-    let request = RequestKind::ListGroupsRequest(request);
-    let response = manager.invoke(&addr, request).await?;
-    if let ResponseKind::ListGroupsResponse(res) = response {
-        println!("{:?}", res);
-    }
-    Ok(())
-}
-
-async fn describe_configs<Exe: Executor>(
-    addr: &String,
-    manager: &ConnectionManager<Exe>,
-) -> Result<(), Box<Error>> {
-    let request = DescribeConfigsRequest::default();
-    let request = RequestKind::DescribeConfigsRequest(request);
-    let response = manager.invoke(&addr, request).await?;
-    if let ResponseKind::DescribeConfigsResponse(res) = response {
-        println!("{:?}", res);
-    }
-    Ok(())
-}
-
-async fn create_topic<Exe: Executor>(
-    addr: &String,
-    manager: &ConnectionManager<Exe>,
-) -> Result<(), Box<Error>> {
-    let mut request = CreateTopicsRequest::default();
-    let mut create_topic = CreatableTopic::default();
-    create_topic.num_partitions = 4;
-    create_topic.replication_factor = 1;
-    let topic_name = TopicName(StrBytes::from_str("test_topic"));
-    request.topics = indexmap! {
-        topic_name => create_topic,
-    };
-    let request = RequestKind::CreateTopicsRequest(request);
-    let response = manager.invoke(&addr, request).await?;
-    if let ResponseKind::CreateTopicsResponse(res) = response {
-        println!("{:?}", res);
-    }
-    Ok(())
-}
-
-async fn metadata<Exe: Executor>(
-    addr: &String,
-    manager: &ConnectionManager<Exe>,
-) -> Result<(), Box<Error>> {
-    let mut request = MetadataRequest::default();
-    let topic_name = TopicName(StrBytes::from_str("test_topic"));
-    let mut metadata_topic = MetadataRequestTopic::default();
-    metadata_topic.name = Some(topic_name);
-    request.topics = Some(vec![metadata_topic]);
-    let request = RequestKind::MetadataRequest(request);
-    let response = manager.invoke(&addr, request).await?;
-    if let ResponseKind::MetadataResponse(res) = response {
-        println!("{:?}", res);
-    }
-    Ok(())
 }
 
 async fn produce<Exe: Executor>(client: Kafka<Exe>) -> Result<(), Box<Error>> {

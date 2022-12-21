@@ -3,7 +3,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::StreamExt;
 use kafka_protocol::{
-    error::ParseResponseErrorCode,
     messages::{
         metadata_request::MetadataRequestTopic, DescribeGroupsRequest, DescribeGroupsResponse,
         FetchRequest, FetchResponse, FindCoordinatorRequest, FindCoordinatorResponse,
@@ -13,7 +12,6 @@ use kafka_protocol::{
         OffsetFetchRequest, OffsetFetchResponse, ProduceRequest, ProduceResponse, ProducerId,
         RequestKind, ResponseKind, SyncGroupRequest, SyncGroupResponse, TopicName,
     },
-    protocol::StrBytes,
     records::Record,
 };
 use tracing::error;
@@ -21,7 +19,7 @@ use tracing::error;
 use crate::{
     connection::Connection,
     connection_manager::{ConnectionManager, ConnectionRetryOptions, OperationRetryOptions},
-    consumer::{coordinator::CoordinatorType, ConsumerRecord},
+    consumer::ConsumerRecord,
     error::{ConnectionError, Error, Result},
     executor::Executor,
     metadata::{Cluster, Node},
@@ -165,41 +163,12 @@ impl<Exe: Executor> Kafka<Exe> {
         }
     }
 
-    pub async fn find_coordinator(&self, key: StrBytes, typ: CoordinatorType) -> Result<Node> {
-        let request = FindCoordinatorRequest {
-            key,
-            key_type: typ.into(),
-            ..Default::default()
-        };
-        let request = RequestKind::FindCoordinatorRequest(request);
-        let response = self.manager.invoke(&self.manager.url, request).await?;
-        if let ResponseKind::FindCoordinatorResponse(response) = response {
-            if response.error_code.is_ok() {
-                Ok(Node::new(
-                    response.node_id.0,
-                    response.host.to_string(),
-                    response.port as u16,
-                ))
-            } else {
-                Err(Error::Response {
-                    error: response.error_code.err().unwrap(),
-                    msg: response.error_message.map(|s| s.to_string()),
-                })
-            }
-        } else {
-            Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                format!("{response:?}"),
-            )))
-        }
-    }
-
-    pub async fn find_coordinator1(
+    pub async fn find_coordinator(
         &self,
-        node: &Node,
         request: FindCoordinatorRequest,
     ) -> Result<FindCoordinatorResponse> {
         let request = RequestKind::FindCoordinatorRequest(request);
-        let response = self.manager.invoke(node.address(), request).await?;
+        let response = self.manager.invoke(&self.manager.url, request).await?;
         if let ResponseKind::FindCoordinatorResponse(response) = response {
             Ok(response)
         } else {

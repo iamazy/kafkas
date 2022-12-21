@@ -13,6 +13,7 @@ use kafka_protocol::{
             ConsumerProtocolAssignmentBuilder, TopicPartition as CpaTopicPartition,
         },
         describe_groups_request::DescribeGroupsRequestBuilder,
+        find_coordinator_request::FindCoordinatorRequestBuilder,
         heartbeat_request::HeartbeatRequestBuilder,
         join_group_request::{JoinGroupRequestBuilder, JoinGroupRequestProtocol},
         join_group_response::JoinGroupResponseMember,
@@ -26,7 +27,9 @@ use kafka_protocol::{
             OffsetFetchRequestTopics,
         },
         sync_group_request::{SyncGroupRequestAssignment, SyncGroupRequestBuilder},
-        BrokerId, ConsumerProtocolAssignment, GroupId, TopicName,
+        BrokerId, ConsumerProtocolAssignment, DescribeGroupsRequest, FindCoordinatorRequest,
+        GroupId, HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest, ListOffsetsRequest,
+        OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest, TopicName,
     },
     protocol::{Message, StrBytes},
     records::NO_PARTITION_LEADER_EPOCH,
@@ -82,9 +85,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     pub async fn new<S: AsRef<str>>(client: Kafka<Exe>, group_id: S) -> Result<Self> {
         let group_id = group_id.as_ref().to_string().to_str_bytes();
 
-        let node = client
-            .find_coordinator(group_id.clone(), CoordinatorType::Group)
-            .await?;
+        let node = Self::find_coordinator(&client, group_id.clone()).await?;
 
         info!(
             "find coordinator success, group {:?}, node: {:?}",
@@ -104,6 +105,27 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         })
     }
 
+    pub async fn find_coordinator(client: &Kafka<Exe>, key: StrBytes) -> Result<Node> {
+        let find_coordinator_response = client
+            .find_coordinator(Self::find_coordinator_builder(key)?)
+            .await?;
+
+        if find_coordinator_response.error_code.is_ok() {
+            Ok(Node::new(
+                find_coordinator_response.node_id.0,
+                find_coordinator_response.host.to_string(),
+                find_coordinator_response.port as u16,
+            ))
+        } else {
+            error!(
+                "find coordinator error: {}, message: {:?}",
+                find_coordinator_response.error_code.err().unwrap(),
+                find_coordinator_response.error_message
+            );
+            Err(ConsumeError::CoordinatorNotAvailable.into())
+        }
+    }
+
     pub async fn subscribe(&self, topic: TopicName) -> Result<()> {
         self.subscriptions.borrow_mut().topics.insert(topic.clone());
         self.client.topics_metadata(vec![topic]).await?;
@@ -113,7 +135,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     pub async fn describe_groups(&mut self) -> Result<()> {
         let describe_groups_response = self
             .client
-            .describe_groups(&self.node, self.describe_groups_builder()?.build()?)
+            .describe_groups(&self.node, self.describe_groups_builder()?)
             .await?;
 
         for group in describe_groups_response.groups {
@@ -128,7 +150,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     pub async fn join_group(&mut self) -> Result<()> {
         let join_group_response = self
             .client
-            .join_group(&self.node, self.join_group_builder()?.build()?)
+            .join_group(&self.node, self.join_group_builder()?)
             .await?;
         if join_group_response.error_code.is_ok() {
             self.group_meta.member_id = join_group_response.member_id;
@@ -159,7 +181,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     pub async fn leave_group(&mut self) -> Result<()> {
         let leave_group_response = self
             .client
-            .leave_group(&self.node, self.leave_group_builder()?.build()?)
+            .leave_group(&self.node, self.leave_group_builder()?)
             .await?;
 
         if leave_group_response.error_code.is_ok() {
@@ -192,7 +214,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     pub async fn sync_group(&mut self) -> Result<()> {
         let mut sync_group_response = self
             .client
-            .sync_group(&self.node, self.sync_group_builder()?.build()?)
+            .sync_group(&self.node, self.sync_group_builder()?)
             .await?;
         if sync_group_response.error_code.is_ok() {
             if self.group_meta.protocol_name.is_none() {
@@ -225,7 +247,6 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 self.group_meta.protocol_type.as_ref(),
                 self.group_meta.protocol_name.as_ref(),
             );
-            debug!("{:?}", self.subscriptions.borrow());
             Ok(())
         } else {
             Err(Error::Response {
@@ -238,7 +259,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     pub async fn offset_fetch(&mut self, version: i16) -> Result<()> {
         let offset_fetch_response = self
             .client
-            .offset_fetch(&self.node, self.offset_fetch_builder(version)?.build()?)
+            .offset_fetch(&self.node, self.offset_fetch_builder(version)?)
             .await?;
         if offset_fetch_response.error_code.is_ok() {
             if version <= 7 {
@@ -251,20 +272,24 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                     {
                         for partition in topic.partitions {
                             if partition.error_code.is_ok() {
-                                for partition_state in partition_states.iter_mut() {
-                                    if partition_state.partition == partition.partition_index {
-                                        // metadata.metadata = partition.metadata;
-                                        partition_state.position.offset =
-                                            partition.committed_offset;
-                                        partition_state.position.offset_epoch =
-                                            Some(partition.committed_leader_epoch);
-                                        break;
-                                    }
+                                if let Some(partition_state) = partition_states
+                                    .iter_mut()
+                                    .find(|p| p.partition == partition.partition_index)
+                                {
+                                    partition_state.position.offset = partition.committed_offset;
+                                    partition_state.position.offset_epoch =
+                                        Some(partition.committed_leader_epoch);
+
+                                    debug!(
+                                        "fetch partition {} offset success, offset: {}",
+                                        partition.partition_index, partition.committed_offset
+                                    );
                                 }
                             } else {
                                 error!(
-                                    "failed to fetch offset for partition {}",
-                                    partition.partition_index
+                                    "failed to fetch offset for partition {}, error: {}",
+                                    partition.partition_index,
+                                    partition.error_code.err().unwrap()
                                 );
                             }
                         }
@@ -283,7 +308,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     pub async fn offset_commit(&mut self) -> Result<()> {
         let offset_commit_response = self
             .client
-            .offset_commit(&self.node, self.offset_commit_builder()?.build()?)
+            .offset_commit(&self.node, self.offset_commit_builder()?)
             .await?;
         for topic in offset_commit_response.topics {
             for partition in topic.partitions {
@@ -298,10 +323,48 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         Ok(())
     }
 
+    pub async fn list_offsets(&mut self) -> Result<()> {
+        let list_offsets_response = self
+            .client
+            .list_offsets(&self.node, self.list_offsets_builder()?)
+            .await?;
+        for topic in list_offsets_response.topics {
+            if let Some(partition_states) = self
+                .subscriptions
+                .borrow_mut()
+                .assignments
+                .get_mut(&topic.name)
+            {
+                for partition in topic.partitions {
+                    if partition.error_code.is_ok() {
+                        if let Some(partition_state) = partition_states
+                            .iter_mut()
+                            .find(|p| p.partition == partition.partition_index)
+                        {
+                            partition_state.position.offset = partition.offset;
+                            partition_state.position.offset_epoch = Some(partition.leader_epoch);
+                            debug!(
+                                "list offsets for partition {}, offset: {}, leader_epoch: {}",
+                                partition.partition_index, partition.offset, partition.leader_epoch
+                            );
+                        }
+                    } else {
+                        error!(
+                            "list offsets failed, partition {}, error: {}",
+                            partition.partition_index,
+                            partition.error_code.err().unwrap()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn heartbeat(&mut self) -> Result<()> {
         let heartbeat_response = self
             .client
-            .heartbeat(&self.node, self.heartbeat_builder()?.build()?)
+            .heartbeat(&self.node, self.heartbeat_builder()?)
             .await?;
         if heartbeat_response.error_code.is_ok() {
             debug!(
@@ -320,12 +383,17 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 
 /// for request builder and response handler
 impl<Exe: Executor> ConsumerCoordinator<Exe> {
-    fn join_group_protocol_metadata(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
-        debug!(
-            "joining group with current subscription: {:?}",
-            self.subscriptions.borrow().topics
-        );
+    fn find_coordinator_builder(key: StrBytes) -> Result<FindCoordinatorRequest> {
+        let mut builder = FindCoordinatorRequestBuilder::default();
+        builder
+            .key(key)
+            .key_type(CoordinatorType::Group.into())
+            .coordinator_keys(Default::default())
+            .unknown_tagged_fields(Default::default());
+        Ok(builder.build()?)
+    }
 
+    fn join_group_protocol_metadata(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
         let mut topics = HashSet::with_capacity(self.subscriptions.borrow().topics.len());
         self.subscriptions
             .borrow_mut()
@@ -362,16 +430,16 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         Err(ConsumeError::PartitionAssignorNotAvailable(name.as_ref().to_string()).into())
     }
 
-    fn describe_groups_builder(&self) -> Result<DescribeGroupsRequestBuilder> {
+    fn describe_groups_builder(&self) -> Result<DescribeGroupsRequest> {
         let mut builder = DescribeGroupsRequestBuilder::default();
         builder
             .groups(vec![self.group_meta.group_id.clone()])
             .include_authorized_operations(false)
             .unknown_tagged_fields(Default::default());
-        Ok(builder)
+        Ok(builder.build()?)
     }
 
-    fn join_group_builder(&self) -> Result<JoinGroupRequestBuilder> {
+    fn join_group_builder(&self) -> Result<JoinGroupRequest> {
         let mut builder = JoinGroupRequestBuilder::default();
         builder
             .group_id(self.group_meta.group_id.clone())
@@ -383,10 +451,10 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             .protocols(self.join_group_protocol_metadata()?)
             .reason(None)
             .unknown_tagged_fields(Default::default());
-        Ok(builder)
+        Ok(builder.build()?)
     }
 
-    fn leave_group_builder(&self) -> Result<LeaveGroupRequestBuilder> {
+    fn leave_group_builder(&self) -> Result<LeaveGroupRequest> {
         let mut builder = LeaveGroupRequestBuilder::default();
         builder
             .group_id(self.group_meta.group_id.clone())
@@ -403,10 +471,10 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         // members.push(member);
         // builder.members(members);
 
-        Ok(builder)
+        Ok(builder.build()?)
     }
 
-    fn sync_group_builder(&self) -> Result<SyncGroupRequestBuilder> {
+    fn sync_group_builder(&self) -> Result<SyncGroupRequest> {
         let mut builder = SyncGroupRequestBuilder::default();
         builder
             .group_id(self.group_meta.group_id.clone())
@@ -425,10 +493,10 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         } else {
             builder.assignments(Default::default());
         }
-        Ok(builder)
+        Ok(builder.build()?)
     }
 
-    pub fn offset_fetch_builder(&self, version: i16) -> Result<OffsetFetchRequestBuilder> {
+    pub fn offset_fetch_builder(&self, version: i16) -> Result<OffsetFetchRequest> {
         let mut builder = OffsetFetchRequestBuilder::default();
         builder.unknown_tagged_fields(Default::default());
 
@@ -473,10 +541,10 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 .require_stable(true);
         }
 
-        Ok(builder)
+        Ok(builder.build()?)
     }
 
-    pub fn offset_commit_builder(&self) -> Result<OffsetCommitRequestBuilder> {
+    pub fn offset_commit_builder(&self) -> Result<OffsetCommitRequest> {
         let mut builder = OffsetCommitRequestBuilder::default();
         builder
             .group_id(self.group_meta.group_id.clone())
@@ -510,14 +578,15 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         }
 
         builder.topics(topics);
-        Ok(builder)
+        Ok(builder.build()?)
     }
 
-    pub fn list_offsets_builder(&self) -> Result<ListOffsetsRequestBuilder> {
+    pub fn list_offsets_builder(&self) -> Result<ListOffsetsRequest> {
         let mut builder = ListOffsetsRequestBuilder::default();
         builder
             .replica_id(BrokerId(-1))
-            .isolation_level(IsolationLevel::ReadCommitted.into());
+            .isolation_level(IsolationLevel::ReadUncommitted.into())
+            .unknown_tagged_fields(Default::default());
 
         let mut topics = Vec::new();
         let timestamp = Local::now().timestamp();
@@ -540,10 +609,10 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             topics.push(topic);
         }
         builder.topics(topics);
-        Ok(builder)
+        Ok(builder.build()?)
     }
 
-    pub fn heartbeat_builder(&self) -> Result<HeartbeatRequestBuilder> {
+    pub fn heartbeat_builder(&self) -> Result<HeartbeatRequest> {
         let mut builder = HeartbeatRequestBuilder::default();
         builder
             .group_id(self.group_meta.group_id.clone())
@@ -551,7 +620,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             .member_id(self.group_meta.member_id.clone())
             .group_instance_id(self.group_meta.group_instance_id.clone())
             .unknown_tagged_fields(Default::default());
-        Ok(builder)
+        Ok(builder.build()?)
     }
 }
 

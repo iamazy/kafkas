@@ -9,6 +9,7 @@ use kafka_protocol::{
     },
     records::{Record, RecordBatchDecoder},
 };
+use tracing::error;
 
 use crate::{
     client::Kafka,
@@ -75,15 +76,22 @@ impl<Exe: Executor> Fetcher<Exe> {
                     .await?;
                 if fetch_response.error_code.is_ok() {
                     session.next_metadata.session_id = fetch_response.session_id;
-
                     for fetchable_topic in fetch_response.responses {
-                        for partition in fetchable_topic.partitions {
-                            if let Some(partition_states) = self
-                                .subscription
-                                .borrow_mut()
-                                .assignments
-                                .get_mut(&fetchable_topic.topic)
-                            {
+                        if let Some(partition_states) = self
+                            .subscription
+                            .borrow_mut()
+                            .assignments
+                            .get_mut(&fetchable_topic.topic)
+                        {
+                            for partition in fetchable_topic.partitions {
+                                if !partition.error_code.is_ok() {
+                                    error!(
+                                        "fetch partition {} error: {}",
+                                        partition.partition_index,
+                                        partition.error_code.err().unwrap()
+                                    );
+                                    continue;
+                                }
                                 if let Some(partition_state) = partition_states
                                     .iter_mut()
                                     .find(|p| p.partition == partition.partition_index)
