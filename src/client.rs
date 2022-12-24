@@ -1,29 +1,35 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use bytes::Bytes;
+use chrono::Local;
 use futures::StreamExt;
 use kafka_protocol::{
     messages::{
-        metadata_request::MetadataRequestTopic, DescribeGroupsRequest, DescribeGroupsResponse,
-        FetchRequest, FetchResponse, FindCoordinatorRequest, FindCoordinatorResponse,
-        HeartbeatRequest, HeartbeatResponse, InitProducerIdRequest, JoinGroupRequest,
-        JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsRequest,
-        ListOffsetsResponse, MetadataRequest, OffsetCommitRequest, OffsetCommitResponse,
-        OffsetFetchRequest, OffsetFetchResponse, ProduceRequest, ProduceResponse, ProducerId,
-        RequestKind, ResponseKind, SyncGroupRequest, SyncGroupResponse, TopicName,
+        api_versions_request::{ApiVersionsRequest, ApiVersionsRequestBuilder},
+        api_versions_response::ApiVersionsResponse,
+        list_offsets_request::{ListOffsetsPartition, ListOffsetsRequestBuilder, ListOffsetsTopic},
+        metadata_request::MetadataRequestTopic,
+        ApiKey, BrokerId, DescribeGroupsRequest, DescribeGroupsResponse, FetchRequest,
+        FetchResponse, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest,
+        HeartbeatResponse, JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest,
+        LeaveGroupResponse, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest,
+        OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse,
+        ProduceRequest, ProduceResponse, RequestKind, ResponseKind, SyncGroupRequest,
+        SyncGroupResponse, TopicName,
     },
-    records::Record,
+    protocol::VersionRange,
+    records::{Record, NO_PARTITION_LEADER_EPOCH},
 };
 use tracing::error;
 
 use crate::{
     connection::Connection,
     connection_manager::{ConnectionManager, ConnectionRetryOptions, OperationRetryOptions},
-    consumer::ConsumerRecord,
+    consumer::{ConsumerRecord, IsolationLevel, TopicPartitionState},
     error::{ConnectionError, Error, Result},
     executor::Executor,
     metadata::{Cluster, Node},
-    PartitionRef,
+    PartitionRef, ToStrBytes,
 };
 
 /// Helper trait for consumer deserialization
@@ -48,8 +54,8 @@ pub struct Kafka<Exe: Executor> {
     pub(crate) manager: Arc<ConnectionManager<Exe>>,
     pub(crate) operation_retry_options: OperationRetryOptions,
     pub(crate) executor: Arc<Exe>,
-    pub(crate) options: KafkaOptions,
     pub cluster_meta: Arc<Cluster>,
+    supported_versions: HashMap<i16, VersionRange>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,12 +97,25 @@ impl<Exe: Executor> Kafka<Exe> {
 
         let manager = ConnectionManager::new(
             url,
-            options.clone(),
+            options,
             connection_retry_options,
             operation_retry_options.clone(),
             executor.clone(),
         )
         .await?;
+
+        let api_versions_response = Self::api_version(&manager).await?;
+        let mut supported_versions = HashMap::with_capacity(api_versions_response.api_keys.len());
+        for (k, v) in api_versions_response.api_keys.iter() {
+            supported_versions.insert(
+                *k,
+                VersionRange {
+                    min: v.min_version,
+                    max: v.max_version,
+                },
+            );
+        }
+
         let manager = Arc::new(manager);
 
         let weak_manager = Arc::downgrade(&manager);
@@ -122,31 +141,29 @@ impl<Exe: Executor> Kafka<Exe> {
             manager,
             operation_retry_options,
             executor,
-            options,
             cluster_meta: Arc::new(Cluster::empty()),
+            supported_versions,
         })
     }
 
     pub fn partitions(&self, topic: &TopicName) -> Result<PartitionRef> {
         self.cluster_meta.partitions(topic)
     }
+
+    pub fn version_range(&self, key: ApiKey) -> Option<&VersionRange> {
+        self.supported_versions.get(&(key as i16))
+    }
 }
 
 impl<Exe: Executor> Kafka<Exe> {
-    pub async fn init_producer_id(&self) -> Result<()> {
-        let request = InitProducerIdRequest {
-            producer_id: ProducerId(-1),
-            producer_epoch: -1,
-            ..Default::default()
-        };
-        let request = RequestKind::InitProducerIdRequest(request);
-        let response = self.manager.invoke(&self.manager.url, request).await?;
-        if let ResponseKind::InitProducerIdResponse(init_producer_id) = response {
-            println!("{init_producer_id:?}");
-            Ok(())
+    async fn api_version(manager: &ConnectionManager<Exe>) -> Result<ApiVersionsResponse> {
+        let request = RequestKind::ApiVersionsRequest(Self::api_version_builder()?);
+        let response = manager.invoke(&manager.url, request).await?;
+        if let ResponseKind::ApiVersionsResponse(response) = response {
+            Ok(response)
         } else {
             Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                "unexpected response".into(),
+                format!("{response:?}"),
             )))
         }
     }
@@ -339,6 +356,54 @@ impl<Exe: Executor> Kafka<Exe> {
                 format!("{response:?}"),
             )))
         }
+    }
+}
+
+impl<Exe: Executor> Kafka<Exe> {
+    const PKG_VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    const PKG_NAME: &'static str = env!("CARGO_PKG_NAME");
+
+    pub fn api_version_builder() -> Result<ApiVersionsRequest> {
+        let mut builder = ApiVersionsRequestBuilder::default();
+        builder
+            .client_software_name(Self::PKG_NAME.to_string().to_str_bytes())
+            .client_software_version(Self::PKG_VERSION.to_string().to_str_bytes())
+            .unknown_tagged_fields(Default::default());
+        Ok(builder.build()?)
+    }
+
+    pub fn list_offsets_builder(
+        &self,
+        assignments: &HashMap<TopicName, Vec<TopicPartitionState>>,
+    ) -> Result<ListOffsetsRequest> {
+        let mut builder = ListOffsetsRequestBuilder::default();
+        builder
+            .replica_id(BrokerId(-1))
+            .isolation_level(IsolationLevel::ReadUncommitted.into())
+            .unknown_tagged_fields(Default::default());
+
+        let mut topics = Vec::new();
+        let timestamp = Local::now().timestamp();
+        for (topic_name, partition_list) in assignments.iter() {
+            let mut partitions = Vec::new();
+            for partition in partition_list {
+                let partition = ListOffsetsPartition {
+                    partition_index: partition.partition(),
+                    current_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                    timestamp,
+                    ..Default::default()
+                };
+                partitions.push(partition);
+            }
+            let topic = ListOffsetsTopic {
+                name: topic_name.clone(),
+                partitions,
+                ..Default::default()
+            };
+            topics.push(topic);
+        }
+        builder.topics(topics);
+        Ok(builder.build()?)
     }
 }
 

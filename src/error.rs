@@ -5,6 +5,7 @@ use std::sync::{
 
 use kafka_protocol::{
     messages::{
+        api_versions_request::ApiVersionsRequestBuilderError,
         consumer_protocol_assignment::ConsumerProtocolAssignmentBuilderError,
         describe_groups_request::DescribeGroupsRequestBuilderError,
         fetch_request::FetchRequestBuilderError,
@@ -15,9 +16,9 @@ use kafka_protocol::{
         list_offsets_request::ListOffsetsRequestBuilderError,
         offset_commit_request::OffsetCommitRequestBuilderError,
         offset_fetch_request::OffsetFetchRequestBuilderError,
-        sync_group_request::SyncGroupRequestBuilderError, TopicName,
+        sync_group_request::SyncGroupRequestBuilderError, ApiKey, TopicName,
     },
-    protocol::{DecodeError, EncodeError},
+    protocol::{buf::NotEnoughBytesError, DecodeError, EncodeError},
     records::Record,
     ResponseError,
 };
@@ -31,6 +32,7 @@ pub enum Error {
     Custom(String),
     Connection(ConnectionError),
     InvalidVersion(i16),
+    InvalidApiRequest(ApiKey),
     TopicNotAvailable {
         topic: TopicName,
     },
@@ -88,6 +90,12 @@ impl From<EncodeError> for Error {
 impl From<DecodeError> for Error {
     fn from(_: DecodeError) -> Self {
         Error::Connection(ConnectionError::Decoding("decode error".into()))
+    }
+}
+
+impl From<ApiVersionsRequestBuilderError> for Error {
+    fn from(value: ApiVersionsRequestBuilderError) -> Self {
+        Error::Custom(value.to_string())
     }
 }
 
@@ -163,6 +171,7 @@ impl std::fmt::Display for Error {
             Error::Custom(e) => write!(f, "{e}"),
             Error::Connection(e) => write!(f, "Connection error: {e}"),
             Error::InvalidVersion(v) => write!(f, "Invalid version: {v}"),
+            Error::InvalidApiRequest(v) => write!(f, "Invalid Api Request: {v:?}"),
             Error::Produce(e) => write!(f, "Produce error: {e}"),
             Error::Consume(e) => write!(f, "Consume error: {e}"),
             Error::PartitionNotAvailable { topic, partition } => {
@@ -193,6 +202,12 @@ pub enum ConnectionError {
     Canceled,
     Shutdown,
     Timeout,
+}
+
+impl From<NotEnoughBytesError> for ConnectionError {
+    fn from(_: NotEnoughBytesError) -> Self {
+        Self::Decoding("Not Enough Bytes".into())
+    }
 }
 
 impl From<EncodeError> for ConnectionError {

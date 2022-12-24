@@ -1,27 +1,12 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::Local;
 use futures::{SinkExt, StreamExt};
-use indexmap::indexmap;
-use kafka_protocol::{
-    messages::{
-        create_topics_request::CreatableTopic, metadata_request::MetadataRequestTopic,
-        ApiVersionsRequest, CreateTopicsRequest, DescribeClusterRequest, DescribeConfigsRequest,
-        DescribeGroupsRequest, FindCoordinatorRequest, GroupId, HeartbeatRequest, JoinGroupRequest,
-        ListGroupsRequest, MetadataRequest, RequestKind, ResponseKind, TopicName,
-    },
-    protocol::StrBytes,
-    records::TimestampType,
-};
+use kafka_protocol::records::TimestampType;
 use kafkas::{
     client::{Kafka, KafkaOptions, SerializeMessage},
-    connection_manager::ConnectionManager,
-    consumer::{
-        coordinator::{ConsumerCoordinator, CoordinatorType},
-        fetcher::Fetcher,
-    },
-    executor::{AsyncStdExecutor, Executor, TokioExecutor},
+    consumer::{coordinator::ConsumerCoordinator, fetcher::Fetcher},
+    executor::{Executor, TokioExecutor},
     producer::{Producer, ProducerOptions},
     topic_name, Error, Record, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
     NO_SEQUENCE,
@@ -43,14 +28,14 @@ async fn main() -> Result<(), Box<Error>> {
     coordinator.subscribe(topic_name("kafka")).await?;
     coordinator.join_group().await?;
     coordinator.sync_group().await?;
-    // coordinator.offset_fetch(7).await?;
+    coordinator.offset_fetch().await?;
     // coordinator.offset_commit().await?;
-    coordinator.list_offsets().await?;
+    // coordinator.list_offsets().await?;
     // coordinator.heartbeat().await?;
     // coordinator.leave_group().await?;
 
-    // let mut fetcher = Fetcher::new(kafka_client.clone(), coordinator.subscriptions.clone());
-    // fetcher.fetch().await?;
+    let mut fetcher = Fetcher::new(kafka_client.clone(), coordinator.subscriptions.clone());
+    fetcher.fetch().await?;
     Ok(())
 }
 

@@ -296,7 +296,7 @@ impl<Exe: Executor> Producer<Exe> {
                 let request = ProduceRequest {
                     topic_data: result.data,
                     acks: options.acks,
-                    timeout_ms: self.client.options.request_timeout_ms,
+                    timeout_ms: self.client.manager.options().request_timeout_ms,
                     ..Default::default()
                 };
                 if let Ok(res) = self.client.produce(&node, request).await {

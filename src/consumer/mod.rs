@@ -123,6 +123,10 @@ impl TopicPartitionState {
             ..Default::default()
         }
     }
+
+    pub fn partition(&self) -> PartitionId {
+        self.partition
+    }
 }
 
 #[derive(Debug, Clone)]

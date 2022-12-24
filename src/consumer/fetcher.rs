@@ -9,7 +9,7 @@ use kafka_protocol::{
     },
     records::{Record, RecordBatchDecoder},
 };
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::{
     client::Kafka,
@@ -119,6 +119,11 @@ impl<Exe: Executor> Fetcher<Exe> {
                             }
                         }
                     }
+                } else {
+                    error!(
+                        "fetch records error: {}",
+                        fetch_response.error_code.err().unwrap()
+                    );
                 }
             }
         }
@@ -133,11 +138,11 @@ impl<Exe: Executor> Fetcher<Exe> {
             .cluster_id(None)
             .session_id(session.next_metadata.session_id)
             .session_epoch(session.next_metadata.epoch)
-            .replica_id(BrokerId(node))
+            .replica_id(BrokerId(-1))
             .max_wait_ms(self.max_wait_ms)
             .min_bytes(self.min_bytes)
             .max_bytes(self.max_bytes)
-            .isolation_level(IsolationLevel::ReadCommitted.into())
+            .isolation_level(IsolationLevel::ReadUncommitted.into())
             .rack_id(Default::default())
             .forgotten_topics_data(Default::default())
             .unknown_tagged_fields(Default::default());
@@ -168,6 +173,10 @@ impl<Exe: Executor> Fetcher<Exe> {
                         partition_max_bytes: self.max_bytes,
                         ..Default::default()
                     };
+                    debug!(
+                        "fetch partition {} for records with offset: {}, log_start_offset: {}",
+                        partition.partition, partition.fetch_offset, partition.log_start_offset
+                    );
                     partitions.push(partition);
                 }
 

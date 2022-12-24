@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 pub use kafka_protocol::protocol::*;
 use kafka_protocol::{messages::*, protocol::buf::ByteBuf};
 use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
@@ -179,7 +179,7 @@ impl KafkaCodec {
                     api_key
                 )));
             }
-            api_version = supported_range.min;
+            api_version = supported_range.max;
         }
 
         header.request_api_key = api_key;
@@ -190,25 +190,40 @@ impl KafkaCodec {
 
         self.active_requests.insert(header.correlation_id, header);
 
-        // TODO: negotiate api_version when decoding request
         req.encode(dst, api_version)?;
         Ok(())
     }
 
+    fn response_header_version(&self, api_key: i16, api_version: i16) -> i16 {
+        if let Some(version_range) = self.support_versions.get(&api_key) {
+            if api_version >= version_range.max {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
     fn decode_response(&mut self, src: &mut BytesMut) -> Result<Option<Command>, ConnectionError> {
-        // TODO: how to negotiate api_version when decode `ResponseHeader`
-        let response_header = ResponseHeader::decode(src, DEFAULT_API_VERSION)?;
+        let mut correlation_id_bytes = src.try_peek_bytes(0..4)?;
+        let correlation_id = correlation_id_bytes.get_i32();
+
         let request_header = self
             .active_requests
-            .remove(&response_header.correlation_id)
+            .remove(&correlation_id)
             .ok_or_else(|| {
-                ConnectionError::UnexpectedResponse(format!(
-                    "correlation_id: {}",
-                    response_header.correlation_id
-                ))
+                ConnectionError::UnexpectedResponse(format!("correlation_id: {}", correlation_id))
             })?;
-        let api_key = ApiKey::try_from(request_header.request_api_key)?;
+
+        let response_header_version = self.response_header_version(
+            request_header.request_api_key,
+            request_header.request_api_version,
+        );
+
+        // decode response header
+        let response_header = ResponseHeader::decode(src, response_header_version)?;
         let header_version = request_header.request_api_version;
+
+        let api_key = ApiKey::try_from(request_header.request_api_key)?;
         let response_kind = match api_key {
             ApiKey::ProduceKey => {
                 let res = ProduceResponse::decode(src, header_version)?;
