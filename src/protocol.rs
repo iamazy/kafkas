@@ -200,7 +200,7 @@ impl KafkaCodec {
                 return 1;
             }
         }
-        return 0;
+        0
     }
 
     fn decode_response(&mut self, src: &mut BytesMut) -> Result<Option<Command>, ConnectionError> {

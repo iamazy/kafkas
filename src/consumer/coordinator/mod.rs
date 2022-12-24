@@ -464,7 +464,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             request.coordinator_keys = vec![key];
         }
 
-        if version >= 1 && version <= 4 {
+        if (1..=4).contains(&version) {
             request.key_type = CoordinatorType::Group.into();
         }
         Ok(request)
@@ -660,7 +660,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 request.group_instance_id = self.group_meta.group_instance_id.clone();
             }
 
-            if version >= 2 && version <= 4 {
+            if (2..=4).contains(&version) {
                 request.retention_time_ms = -1;
             }
         }
