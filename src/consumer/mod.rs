@@ -1,15 +1,15 @@
 pub mod coordinator;
+pub mod fetcher;
 pub mod partition_assignor;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use dashmap::{DashMap, DashSet};
 use kafka_protocol::{
     messages::{GroupId, TopicName},
     protocol::StrBytes,
 };
 
-use crate::metadata::TopicPartition;
+use crate::{metadata::Node, PartitionId};
 
 /// High-level consumer record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +37,10 @@ impl Default for OffsetStrategy {
 }
 
 #[derive(Debug, Clone)]
-pub struct RebalanceConfig {
+pub struct ConsumerOptions {}
+
+#[derive(Debug, Clone)]
+pub struct RebalanceOptions {
     pub session_timeout_ms: i32,
     pub rebalance_timeout_ms: i32,
     pub heartbeat_interval_ms: i32,
@@ -45,7 +48,7 @@ pub struct RebalanceConfig {
     pub leave_group_on_close: bool,
 }
 
-impl Default for RebalanceConfig {
+impl Default for RebalanceOptions {
     fn default() -> Self {
         Self {
             session_timeout_ms: 30_000,
@@ -61,15 +64,21 @@ impl Default for RebalanceConfig {
 #[derive(Debug, Clone, Default)]
 pub struct SubscriptionState {
     subscription_type: SubscriptionType,
-    topics: DashSet<TopicName>,
+    topics: HashSet<TopicName>,
     offset_strategy: OffsetStrategy,
-    offset_metadata: DashMap<TopicPartition, OffsetMetadata>,
-    assignment: HashMap<TopicName, Vec<i32>>,
+    assignments: HashMap<TopicName, Vec<TopicPartitionState>>,
 }
 
 impl SubscriptionState {
-    pub fn partitions(&self) -> HashMap<TopicName, Vec<i32>> {
-        self.assignment.clone()
+    pub fn partitions(&self) -> HashMap<TopicName, Vec<PartitionId>> {
+        let mut partitions = HashMap::with_capacity(self.assignments.len());
+        for (topic, partition_states) in self.assignments.iter() {
+            partitions.insert(
+                topic.clone(),
+                partition_states.iter().map(|p| p.partition).collect(),
+            );
+        }
+        partitions
     }
 }
 
@@ -96,14 +105,28 @@ pub struct OffsetMetadata {
 
 #[derive(Debug, Clone, Default)]
 pub struct TopicPartitionState {
+    partition: PartitionId,
     fetch_state: FetchState,
-    position: i64,
+    position: FetchPosition,
     high_water_mark: i64,
     log_start_offset: i64,
     last_stable_offset: i64,
     paused: bool,
     offset_strategy: OffsetStrategy,
     next_allowed_retry_time_ms: i64,
+}
+
+impl TopicPartitionState {
+    pub fn new(partition: PartitionId) -> Self {
+        Self {
+            partition,
+            ..Default::default()
+        }
+    }
+
+    pub fn partition(&self) -> PartitionId {
+        self.partition
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +141,29 @@ impl Default for FetchState {
     fn default() -> Self {
         Self::Initializing
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FetchPosition {
+    offset: i64,
+    offset_epoch: Option<i32>,
+    current_leader: LeaderAndEpoch,
+}
+
+impl FetchPosition {
+    pub fn new(offset: i64, epoch: Option<i32>) -> Self {
+        Self {
+            offset,
+            offset_epoch: epoch,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LeaderAndEpoch {
+    leader: Option<Node>,
+    epoch: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +187,21 @@ impl ConsumerGroupMetadata {
             group_instance_id: None,
             protocol_name: None,
             protocol_type: None,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum IsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+}
+
+impl From<IsolationLevel> for i8 {
+    fn from(value: IsolationLevel) -> Self {
+        match value {
+            IsolationLevel::ReadCommitted => 1,
+            IsolationLevel::ReadUncommitted => 0,
         }
     }
 }

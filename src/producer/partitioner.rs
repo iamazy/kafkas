@@ -1,28 +1,21 @@
-use std::{
-    future::Future,
-    sync::{
-        atomic::{AtomicI32, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicI32, Ordering},
+    Arc,
 };
 
 use bytes::Bytes;
 use kafka_protocol::messages::TopicName;
 
-use crate::{client::Kafka, error::Result, executor::Executor};
+use crate::{error::Result, metadata::Cluster};
 
-pub trait PartitionSelector<Exe: Executor> {
-    type SelectFuture<'a>: Future<Output = Result<i32>> + Send + 'a
-    where
-        Self: 'a;
-
+pub trait PartitionSelector {
     fn select<'a>(
         &'a self,
         topic: &'a TopicName,
         key: Option<&'a Bytes>,
         value: Option<&'a Bytes>,
-        client: Arc<Kafka<Exe>>,
-    ) -> Self::SelectFuture<'a>;
+        cluster: Arc<Cluster>,
+    ) -> Result<i32>;
 }
 
 #[derive(Debug, Clone)]
@@ -39,18 +32,18 @@ pub enum PartitionerSelector {
     // UniformSticky(UniformStickyPartitioner),
 }
 
-impl<Exe: Executor> PartitionSelector<Exe> for PartitionerSelector {
-    type SelectFuture<'a> = impl Future<Output = Result<i32>> + Send + 'a;
-
+impl PartitionSelector for PartitionerSelector {
     fn select<'a>(
         &'a self,
         topic: &'a TopicName,
         key: Option<&'a Bytes>,
         value: Option<&'a Bytes>,
-        client: Arc<Kafka<Exe>>,
-    ) -> Self::SelectFuture<'a> {
+        cluster: Arc<Cluster>,
+    ) -> Result<i32> {
         match self {
-            PartitionerSelector::RoundRobin(roundbin) => roundbin.select(topic, key, value, client),
+            PartitionerSelector::RoundRobin(roundbin) => {
+                roundbin.select(topic, key, value, cluster)
+            }
         }
     }
 }
@@ -94,28 +87,24 @@ impl RoundRobinPartitioner {
     }
 }
 
-impl<Exe: Executor> PartitionSelector<Exe> for RoundRobinPartitioner {
-    type SelectFuture<'a> = impl Future<Output = Result<i32>> + Send + 'a;
-
+impl PartitionSelector for RoundRobinPartitioner {
     fn select<'a>(
         &'a self,
         topic: &'a TopicName,
         _key: Option<&'a Bytes>,
         _value: Option<&'a Bytes>,
-        client: Arc<Kafka<Exe>>,
-    ) -> Self::SelectFuture<'a> {
-        async move {
-            let partitions = client.partitions(topic).await?;
-            let num_partitions = partitions.len();
-            let next_value = self.next_value();
-            let available_partitions = client.cluster_meta.available_partitions(topic)?;
-            let num_available_partitions = available_partitions.len();
-            if num_available_partitions != 0 {
-                let part = (next_value & 0x7fffffff) % num_available_partitions as i32;
-                Ok(available_partitions[part as usize])
-            } else {
-                Ok((next_value & 0x7fffffff) % num_partitions as i32)
-            }
+        cluster: Arc<Cluster>,
+    ) -> Result<i32> {
+        let partitions = cluster.partitions(topic)?;
+        let num_partitions = partitions.len();
+        let next_value = self.next_value();
+        let available_partitions = cluster.available_partitions(topic)?;
+        let num_available_partitions = available_partitions.len();
+        if num_available_partitions != 0 {
+            let part = (next_value & 0x7fffffff) % num_available_partitions as i32;
+            Ok(available_partitions[part as usize])
+        } else {
+            Ok((next_value & 0x7fffffff) % num_partitions as i32)
         }
     }
 }

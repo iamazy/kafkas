@@ -1,4 +1,3 @@
-#![feature(type_alias_impl_trait)]
 #![allow(clippy::mutable_key_type)]
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -27,10 +26,11 @@ pub use kafka_protocol::records::{
 };
 pub use producer::ProducerRecord;
 
-const DEFAULT_SERVER_PORT: u16 = 9092;
+pub type NodeId = i32;
+pub type PartitionId = i32;
 
-pub type PartitionRef<'a> = Ref<'a, TopicName, Vec<i32>>;
-pub type NodeRef<'a> = Ref<'a, i32, Vec<(TopicName, Vec<i32>)>>;
+pub type PartitionRef<'a> = Ref<'a, TopicName, Vec<PartitionId>>;
+pub type NodeRef<'a> = Ref<'a, NodeId, Vec<(TopicName, Vec<PartitionId>)>>;
 
 pub trait ToStrBytes {
     fn to_str_bytes(self) -> StrBytes;
@@ -43,7 +43,7 @@ impl ToStrBytes for String {
 }
 
 // bytes utils
-pub fn to_version_prefixed_bytes<M: Encodable>(version: i16, message: M) -> Result<Bytes> {
+pub(crate) fn to_version_prefixed_bytes<M: Encodable>(version: i16, message: M) -> Result<Bytes> {
     let message_size = message.compute_size(version)?;
     let mut bytes = BytesMut::with_capacity(message_size + 2);
     bytes.put_i16(version);

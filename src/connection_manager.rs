@@ -328,3 +328,9 @@ impl<Exe: Executor> ConnectionManager<Exe> {
             })
     }
 }
+
+impl<Exe: Executor> ConnectionManager<Exe> {
+    pub fn options(&self) -> &KafkaOptions {
+        &self.options
+    }
+}

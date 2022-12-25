@@ -250,19 +250,11 @@ impl<Exe: Executor> Producer<Exe> {
     where
         T: SerializeMessage + Sized,
     {
-        let mut partition = record.partition().unwrap_or(-1);
-        if partition < 0 {
-            partition = self
-                .partitioner
-                .select(topic, record.key(), record.value(), self.client.clone())
-                .await?;
-        }
-
         let fut = if let Some(producer) = self.producers.get(topic) {
-            producer.try_push(partition, record).await
+            producer.try_push(&self.partitioner, record).await
         } else {
             let producer = TopicProducer::new(self.client.clone(), topic.clone()).await?;
-            let fut = producer.try_push(partition, record).await;
+            let fut = producer.try_push(&self.partitioner, record).await;
             self.producers.insert(topic.clone(), producer);
             fut
         };
@@ -272,7 +264,7 @@ impl<Exe: Executor> Producer<Exe> {
                 self.num_records.fetch_add(1, Ordering::Relaxed);
                 Ok(fut)
             }
-            Err(Error::Produce(ProduceError::NoCapacity(record))) => {
+            Err(Error::Produce(ProduceError::NoCapacity((partition, record)))) => {
                 self.send_raw(&self.options, &self.encode_options).await?;
                 let producer = self.producers.get(topic).unwrap();
                 let fut = producer.try_push_raw(partition, record).await;
@@ -284,10 +276,7 @@ impl<Exe: Executor> Producer<Exe> {
                 }
             }
             Err(err) => {
-                error!(
-                    "failed to push record, topic: {:?}, partition: {partition}, err: {err}",
-                    topic,
-                );
+                error!("failed to push record, topic: {:?}, err: {err}", topic,);
                 Err(err)
             }
         };
@@ -300,6 +289,7 @@ impl<Exe: Executor> Producer<Exe> {
     ) -> Result<()> {
         if self.num_records.load(Ordering::Relaxed) == 0 {
             debug!("no records to send.");
+            self.client.executor.delay(Duration::from_secs(1)).await;
             return Ok(());
         }
         if let Ok(flush_list) = self.flush(encode_options).await {
@@ -307,7 +297,7 @@ impl<Exe: Executor> Producer<Exe> {
                 let request = ProduceRequest {
                     topic_data: result.data,
                     acks: options.acks,
-                    timeout_ms: self.client.options.request_timeout_ms,
+                    timeout_ms: self.client.manager.options().request_timeout_ms,
                     ..Default::default()
                 };
                 if let Ok(res) = self.client.produce(&node, request).await {
@@ -345,7 +335,7 @@ impl<Exe: Executor> Producer<Exe> {
     ) -> Result<Vec<(Node, FlushResult)>> {
         let mut result = Vec::new();
         for node_entry in self.client.cluster_meta.nodes.iter() {
-            if let Ok(node_topology) = self.client.cluster_meta.drain_node(node_entry.value()) {
+            if let Ok(node_topology) = self.client.cluster_meta.drain_node(node_entry.value().id) {
                 let node_topology = node_topology.value();
                 let mut topic_data = IndexMap::new();
                 let mut topics_thunks = BTreeMap::new();
@@ -449,12 +439,14 @@ struct TopicProducer<Exe: Executor> {
 
 impl<Exe: Executor> TopicProducer<Exe> {
     pub async fn new(client: Arc<Kafka<Exe>>, topic: TopicName) -> Result<Arc<TopicProducer<Exe>>> {
-        let partitions = client.partitions(&topic).await?;
+        client.topics_metadata(vec![topic.clone()]).await?;
+
+        let partitions = client.cluster_meta.partitions(&topic)?;
         let partitions = partitions.value();
         let num_partitions = partitions.len();
         let batches = DashMap::with_capacity_and_hasher(num_partitions, FxBuildHasher::default());
         for partition in partitions {
-            batches.insert(*partition, ProducerBatch::new(1024 * 1024));
+            batches.insert(*partition, ProducerBatch::new(1024 * 1024, *partition));
         }
 
         let producer = Self {
@@ -468,9 +460,18 @@ impl<Exe: Executor> TopicProducer<Exe> {
 
     pub async fn try_push<T: SerializeMessage + Sized>(
         &self,
-        partition: i32,
+        partitioner: &PartitionerSelector,
         record: T,
     ) -> Result<SendFuture> {
+        let mut partition = record.partition().unwrap_or(-1);
+        if partition < 0 {
+            partition = partitioner.select(
+                &self.topic,
+                record.key(),
+                record.value(),
+                self.client.cluster_meta.clone(),
+            )?;
+        }
         return match self.batches.get_mut(&partition) {
             Some(mut batch) => batch.try_push(T::serialize_message(record)?),
             None => Err(Error::PartitionNotAvailable {

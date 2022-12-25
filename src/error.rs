@@ -1,25 +1,19 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex, PoisonError,
+use std::{
+    string::FromUtf8Error,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, PoisonError,
+    },
 };
 
 use kafka_protocol::{
-    messages::{
-        consumer_protocol_assignment::ConsumerProtocolAssignmentBuilderError,
-        describe_groups_request::DescribeGroupsRequestBuilderError,
-        heartbeat_request::HeartbeatRequestBuilderError,
-        join_group_request::JoinGroupRequestBuilderError,
-        leave_group_request::LeaveGroupRequestBuilderError,
-        offset_commit_request::OffsetCommitRequestBuilderError,
-        offset_fetch_request::OffsetFetchRequestBuilderError,
-        sync_group_request::SyncGroupRequestBuilderError, TopicName,
-    },
-    protocol::{DecodeError, EncodeError},
+    messages::{ApiKey, TopicName},
+    protocol::{buf::NotEnoughBytesError, DecodeError, EncodeError},
     records::Record,
     ResponseError,
 };
 
-use crate::{metadata::Node, producer::SendFuture};
+use crate::{producer::SendFuture, NodeId, PartitionId};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -28,6 +22,7 @@ pub enum Error {
     Custom(String),
     Connection(ConnectionError),
     InvalidVersion(i16),
+    InvalidApiRequest(ApiKey),
     TopicNotAvailable {
         topic: TopicName,
     },
@@ -36,7 +31,7 @@ pub enum Error {
         partition: i32,
     },
     NodeNotAvailable {
-        node: Node,
+        node: NodeId,
     },
     Produce(ProduceError),
     Consume(ConsumeError),
@@ -44,6 +39,12 @@ pub enum Error {
         error: ResponseError,
         msg: Option<String>,
     },
+}
+
+impl From<FromUtf8Error> for Error {
+    fn from(value: FromUtf8Error) -> Self {
+        Error::Custom(value.to_string())
+    }
 }
 
 impl<T> From<PoisonError<T>> for Error {
@@ -88,53 +89,11 @@ impl From<DecodeError> for Error {
     }
 }
 
-impl From<DescribeGroupsRequestBuilderError> for Error {
-    fn from(value: DescribeGroupsRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<LeaveGroupRequestBuilderError> for Error {
-    fn from(value: LeaveGroupRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<HeartbeatRequestBuilderError> for Error {
-    fn from(value: HeartbeatRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<OffsetCommitRequestBuilderError> for Error {
-    fn from(value: OffsetCommitRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<OffsetFetchRequestBuilderError> for Error {
-    fn from(value: OffsetFetchRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<JoinGroupRequestBuilderError> for Error {
-    fn from(value: JoinGroupRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<SyncGroupRequestBuilderError> for Error {
-    fn from(value: SyncGroupRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<ConsumerProtocolAssignmentBuilderError> for Error {
-    fn from(value: ConsumerProtocolAssignmentBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
+// impl From<ConsumerProtocolAssignmentBuilderError> for Error {
+//     fn from(value: ConsumerProtocolAssignmentBuilderError) -> Self {
+//         Error::Custom(value.to_string())
+//     }
+// }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -142,6 +101,7 @@ impl std::fmt::Display for Error {
             Error::Custom(e) => write!(f, "{e}"),
             Error::Connection(e) => write!(f, "Connection error: {e}"),
             Error::InvalidVersion(v) => write!(f, "Invalid version: {v}"),
+            Error::InvalidApiRequest(v) => write!(f, "Invalid Api Request: {v:?}"),
             Error::Produce(e) => write!(f, "Produce error: {e}"),
             Error::Consume(e) => write!(f, "Consume error: {e}"),
             Error::PartitionNotAvailable { topic, partition } => {
@@ -172,6 +132,12 @@ pub enum ConnectionError {
     Canceled,
     Shutdown,
     Timeout,
+}
+
+impl From<NotEnoughBytesError> for ConnectionError {
+    fn from(_: NotEnoughBytesError) -> Self {
+        Self::Decoding("Not enough bytes remaining".into())
+    }
 }
 
 impl From<EncodeError> for ConnectionError {
@@ -229,7 +195,7 @@ pub enum ProduceError {
     /// Indicates this producer has lost exclusive access to the topic. Client can decided whether
     /// to recreate or not
     Fenced,
-    NoCapacity(Record),
+    NoCapacity((PartitionId, Record)),
     MessageTooLarge,
 }
 
@@ -238,7 +204,7 @@ impl std::fmt::Display for ProduceError {
         match self {
             ProduceError::Connection(e) => write!(f, "Connection error: {e}"),
             ProduceError::Io(e) => write!(f, "Compression error: {e}"),
-            ProduceError::Custom(e) => write!(f, "Custom error: {e}"),
+            ProduceError::Custom(e) => write!(f, "{e}"),
             ProduceError::Batch(e) => write!(f, "Batch error: {e}"),
             ProduceError::PartialSend(e) => {
                 let (successes, failures) = e.iter().fold((0, 0), |(s, f), r| match r {
@@ -312,6 +278,7 @@ pub enum ConsumeError {
     Connection(ConnectionError),
     Custom(String),
     Io(std::io::Error),
+    CoordinatorNotAvailable,
     PartitionAssignorNotAvailable(String),
 }
 
@@ -320,7 +287,8 @@ impl std::fmt::Display for ConsumeError {
         match self {
             ConsumeError::Connection(e) => write!(f, "Connection error: {e}"),
             ConsumeError::Io(e) => write!(f, "Decompression error: {e}"),
-            ConsumeError::Custom(e) => write!(f, "Custom error: {e}"),
+            ConsumeError::Custom(e) => write!(f, "{e}"),
+            ConsumeError::CoordinatorNotAvailable => write!(f, "Coordinator not available"),
             ConsumeError::PartitionAssignorNotAvailable(name) => {
                 write!(f, "PartitionAssignor: {name} not available")
             }
@@ -334,6 +302,7 @@ impl std::fmt::Debug for ConsumeError {
             ConsumeError::Connection(e) => write!(f, "Connection({e})"),
             ConsumeError::Custom(msg) => write!(f, "Custom({msg})"),
             ConsumeError::Io(e) => write!(f, "Io({e})"),
+            ConsumeError::CoordinatorNotAvailable => write!(f, "CoordinatorNotAvailable"),
             ConsumeError::PartitionAssignorNotAvailable(name) => {
                 write!(f, "PartitionAssignorNotAvailable({name})")
             }

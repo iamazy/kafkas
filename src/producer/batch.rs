@@ -11,6 +11,7 @@ use super::{
 use crate::{
     error::{Error, ProduceError, Result},
     producer::SendFuture,
+    PartitionId,
 };
 
 #[derive(Debug)]
@@ -41,6 +42,8 @@ impl Thunk {
             })
         } else if let Some(ref err) = res.error_message {
             Err(ProduceError::Custom(err.to_string()).into())
+        } else if let Some(err) = res.error_code.err() {
+            Err(ProduceError::Custom(err.to_string()).into())
         } else {
             Err(ProduceError::Custom("unknown error".to_string()).into())
         };
@@ -50,13 +53,15 @@ impl Thunk {
 
 #[derive(Debug)]
 pub struct ProducerBatch {
+    partition: PartitionId,
     aggregator: RecordAggregator,
     thunks: Vec<Thunk>,
 }
 
 impl ProducerBatch {
-    pub fn new(max_batch_size: usize) -> Self {
+    pub fn new(max_batch_size: usize, partition: PartitionId) -> Self {
         Self {
+            partition,
             aggregator: RecordAggregator::new(max_batch_size),
             thunks: Vec::with_capacity(1024),
         }
@@ -69,7 +74,7 @@ impl ProducerBatch {
         let relative_offset = match self.aggregator.try_push(record)? {
             TryPush::Aggregated(size) => size as i64,
             TryPush::NoCapacity(record) => {
-                return Err(ProduceError::NoCapacity(record).into());
+                return Err(ProduceError::NoCapacity((self.partition, record)).into());
             }
         };
         let (sender, receiver) = channel();
