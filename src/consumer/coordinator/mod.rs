@@ -4,29 +4,23 @@ use std::{
     sync::Arc,
 };
 
-use chrono::Local;
 use indexmap::IndexMap;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
-        consumer_protocol_assignment::{
-            ConsumerProtocolAssignmentBuilder, TopicPartition as CpaTopicPartition,
-        },
+        consumer_protocol_assignment::TopicPartition as CpaTopicPartition,
         join_group_request::JoinGroupRequestProtocol,
         join_group_response::JoinGroupResponseMember,
-        leave_group_request::LeaveGroupRequestBuilder,
-        list_offsets_request::{ListOffsetsPartition, ListOffsetsRequestBuilder, ListOffsetsTopic},
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
         offset_fetch_request::{
             OffsetFetchRequestGroup, OffsetFetchRequestTopic, OffsetFetchRequestTopics,
         },
         sync_group_request::SyncGroupRequestAssignment,
-        ApiKey, BrokerId, ConsumerProtocolAssignment, DescribeGroupsRequest,
-        FindCoordinatorRequest, HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest,
-        ListOffsetsRequest, OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest, TopicName,
+        ApiKey, ConsumerProtocolAssignment, DescribeGroupsRequest, FindCoordinatorRequest,
+        HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest, OffsetCommitRequest,
+        OffsetFetchRequest, SyncGroupRequest, TopicName,
     },
     protocol::{Message, StrBytes},
-    records::NO_PARTITION_LEADER_EPOCH,
     ResponseError,
 };
 use tracing::{debug, error, info, warn};
@@ -38,8 +32,7 @@ use crate::{
             Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, RangeAssignor,
             Subscription,
         },
-        ConsumerGroupMetadata, IsolationLevel, RebalanceOptions, SubscriptionState,
-        TopicPartitionState,
+        ConsumerGroupMetadata, RebalanceOptions, SubscriptionState, TopicPartitionState,
     },
     error::{ConsumeError, Result},
     executor::Executor,
@@ -365,44 +358,6 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         }
     }
 
-    // pub async fn list_offsets(&mut self) -> Result<()> {
-    //     let list_offsets_response = self
-    //         .client
-    //         .list_offsets(&self.node, self.list_offsets_builder()?)
-    //         .await?;
-    //     for topic in list_offsets_response.topics {
-    //         if let Some(partition_states) = self
-    //             .subscriptions
-    //             .borrow_mut()
-    //             .assignments
-    //             .get_mut(&topic.name)
-    //         {
-    //             for partition in topic.partitions {
-    //                 if partition.error_code.is_ok() {
-    //                     if let Some(partition_state) = partition_states
-    //                         .iter_mut()
-    //                         .find(|p| p.partition == partition.partition_index)
-    //                     {
-    //                         partition_state.position.offset = partition.offset;
-    //                         partition_state.position.offset_epoch = Some(partition.leader_epoch);
-    //                         debug!(
-    //                             "list offsets for partition {}, offset: {}, leader_epoch: {}",
-    //                             partition.partition_index, partition.offset,
-    // partition.leader_epoch                         );
-    //                     }
-    //                 } else {
-    //                     error!(
-    //                         "list offsets failed, partition {}, error: {}",
-    //                         partition.partition_index,
-    //                         partition.error_code.err().unwrap()
-    //                     );
-    //                 }
-    //             }
-    //         }
-    //     }
-    //     Ok(())
-    // }
-
     pub async fn heartbeat(&self) -> Result<()> {
         if let Some(version_range) = self.client.version_range(ApiKey::HeartbeatKey) {
             let heartbeat_response = self
@@ -511,12 +466,11 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     }
 
     fn leave_group_builder(&self) -> Result<LeaveGroupRequest> {
-        let mut builder = LeaveGroupRequestBuilder::default();
-        builder
-            .group_id(self.group_meta.group_id.clone())
-            .member_id(self.group_meta.member_id.clone())
-            .members(Default::default())
-            .unknown_tagged_fields(Default::default());
+        let request = LeaveGroupRequest {
+            group_id: self.group_meta.group_id.clone(),
+            member_id: self.group_meta.member_id.clone(),
+            ..Default::default()
+        };
 
         // let mut members = Vec::new();
         // let member = MemberIdentity {
@@ -527,7 +481,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         // members.push(member);
         // builder.members(members);
 
-        Ok(builder.build()?)
+        Ok(request)
     }
 
     fn sync_group_builder(&self, version: i16) -> Result<SyncGroupRequest> {
@@ -641,37 +595,6 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         Ok(request)
     }
 
-    pub fn list_offsets_builder(&self) -> Result<ListOffsetsRequest> {
-        let mut builder = ListOffsetsRequestBuilder::default();
-        builder
-            .replica_id(BrokerId(-1))
-            .isolation_level(IsolationLevel::ReadUncommitted.into())
-            .unknown_tagged_fields(Default::default());
-
-        let mut topics = Vec::new();
-        let timestamp = Local::now().timestamp();
-        for (topic_name, partition_list) in self.subscriptions.borrow().assignments.iter() {
-            let mut partitions = Vec::new();
-            for partition in partition_list {
-                let partition = ListOffsetsPartition {
-                    partition_index: partition.partition,
-                    current_leader_epoch: NO_PARTITION_LEADER_EPOCH,
-                    timestamp,
-                    ..Default::default()
-                };
-                partitions.push(partition);
-            }
-            let topic = ListOffsetsTopic {
-                name: topic_name.clone(),
-                partitions,
-                ..Default::default()
-            };
-            topics.push(topic);
-        }
-        builder.topics(topics);
-        Ok(builder.build()?)
-    }
-
     pub fn heartbeat_builder(&self, version: i16) -> Result<HeartbeatRequest> {
         let mut request = HeartbeatRequest::default();
         if version <= 4 {
@@ -704,14 +627,13 @@ fn serialize_assignments(
     let version = ConsumerProtocolAssignment::VERSIONS.max;
     let mut sync_group_assignments = Vec::with_capacity(assignments.len());
     for (member_id, assignment) in assignments {
-        let mut builder = ConsumerProtocolAssignmentBuilder::default();
+        let mut consumer_protocol_assignment = ConsumerProtocolAssignment::default();
         let mut assigned_partitions = IndexMap::with_capacity(assignment.partitions.len());
         for (topic, partitions) in assignment.partitions {
             assigned_partitions.insert(topic, CpaTopicPartition { partitions });
         }
-        builder.assigned_partitions(assigned_partitions);
-        builder.user_data(assignment.user_data);
-        let consumer_protocol_assignment = builder.build()?;
+        consumer_protocol_assignment.assigned_partitions = assigned_partitions;
+        consumer_protocol_assignment.user_data = assignment.user_data;
         let assignment = to_version_prefixed_bytes(version, consumer_protocol_assignment)?;
 
         sync_group_assignments.push(SyncGroupRequestAssignment {

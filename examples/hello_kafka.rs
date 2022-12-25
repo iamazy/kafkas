@@ -16,7 +16,14 @@ use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<Error>> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        // Configure formatting settings.
+        .with_target(true)
+        .with_level(true)
+        .with_file(true)
+        .with_line_number(true)
+        // Set the subscriber as the default.
+        .init();
 
     let mut options = KafkaOptions::new();
     options.client_id("app");

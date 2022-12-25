@@ -1,20 +1,20 @@
 # kafkas
 
-async kafka client in pure Rust.
+Async kafka client in pure Rust.
 
 ## Features
 
-- multiple async runtime (`tokio`, `async-std`, etc.)
-- all kafka versions
-- compression (`gzip`, `snappy`, `lz4`)
+- Multiple async runtime (`tokio`, `async-std`, etc.)
+- All versions of kafka are supported
+- Compression (`gzip`, `snappy`, `lz4`)
 
 ## APIs
 
-- [x] producer
-- [ ] consumer
-- [ ] streams
-- [ ] connect
-- [ ] admin client
+- [x] Producer
+- [ ] Consumer
+- [ ] Streams
+- [ ] Connect
+- [ ] Admin client
 
 ## Usage
 

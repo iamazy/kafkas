@@ -139,7 +139,7 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    pub fn empty() -> Cluster {
+    pub fn new() -> Cluster {
         Default::default()
     }
 
@@ -199,6 +199,13 @@ impl Cluster {
         self.partitions_by_nodes.clear();
 
         Ok(())
+    }
+
+    pub fn topic_id(&self, topic: &TopicName) -> Option<Uuid> {
+        if let Some(topic) = self.topics.get(topic) {
+            return Some(topic.id);
+        }
+        None
     }
 
     pub fn num_partitions(&self, topic: &TopicName) -> Result<i32> {

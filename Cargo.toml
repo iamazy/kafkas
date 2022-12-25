@@ -26,7 +26,7 @@ futures-timer = "3.0"
 futures = "0.3"
 fxhash = "0.2"
 indexmap = "1"
-kafka-protocol = "0.4"
+kafka-protocol = { git = "https://github.com/iamazy/kafka-protocol-rs", branch = "trunk" }
 native-tls = "0.2"
 pin-project-lite = "0.2"
 rand = "0.8"

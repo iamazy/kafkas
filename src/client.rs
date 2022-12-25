@@ -5,9 +5,9 @@ use chrono::Local;
 use futures::StreamExt;
 use kafka_protocol::{
     messages::{
-        api_versions_request::{ApiVersionsRequest, ApiVersionsRequestBuilder},
+        api_versions_request::ApiVersionsRequest,
         api_versions_response::ApiVersionsResponse,
-        list_offsets_request::{ListOffsetsPartition, ListOffsetsRequestBuilder, ListOffsetsTopic},
+        list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
         metadata_request::MetadataRequestTopic,
         ApiKey, BrokerId, DescribeGroupsRequest, DescribeGroupsResponse, FetchRequest,
         FetchResponse, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest,
@@ -141,7 +141,7 @@ impl<Exe: Executor> Kafka<Exe> {
             manager,
             operation_retry_options,
             executor,
-            cluster_meta: Arc::new(Cluster::empty()),
+            cluster_meta: Arc::new(Cluster::new()),
             supported_versions,
         })
     }
@@ -364,23 +364,23 @@ impl<Exe: Executor> Kafka<Exe> {
     const PKG_NAME: &'static str = env!("CARGO_PKG_NAME");
 
     pub fn api_version_builder() -> Result<ApiVersionsRequest> {
-        let mut builder = ApiVersionsRequestBuilder::default();
-        builder
-            .client_software_name(Self::PKG_NAME.to_string().to_str_bytes())
-            .client_software_version(Self::PKG_VERSION.to_string().to_str_bytes())
-            .unknown_tagged_fields(Default::default());
-        Ok(builder.build()?)
+        let request = ApiVersionsRequest {
+            client_software_name: Self::PKG_NAME.to_string().to_str_bytes(),
+            client_software_version: Self::PKG_VERSION.to_string().to_str_bytes(),
+            ..Default::default()
+        };
+        Ok(request)
     }
 
     pub fn list_offsets_builder(
         &self,
         assignments: &HashMap<TopicName, Vec<TopicPartitionState>>,
     ) -> Result<ListOffsetsRequest> {
-        let mut builder = ListOffsetsRequestBuilder::default();
-        builder
-            .replica_id(BrokerId(-1))
-            .isolation_level(IsolationLevel::ReadUncommitted.into())
-            .unknown_tagged_fields(Default::default());
+        let mut request = ListOffsetsRequest {
+            replica_id: BrokerId(-1),
+            isolation_level: IsolationLevel::ReadUncommitted.into(),
+            ..Default::default()
+        };
 
         let mut topics = Vec::new();
         let timestamp = Local::now().timestamp();
@@ -402,8 +402,8 @@ impl<Exe: Executor> Kafka<Exe> {
             };
             topics.push(topic);
         }
-        builder.topics(topics);
-        Ok(builder.build()?)
+        request.topics = topics;
+        Ok(request)
     }
 }
 

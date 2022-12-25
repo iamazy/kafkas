@@ -43,7 +43,7 @@ impl ToStrBytes for String {
 }
 
 // bytes utils
-pub fn to_version_prefixed_bytes<M: Encodable>(version: i16, message: M) -> Result<Bytes> {
+pub(crate) fn to_version_prefixed_bytes<M: Encodable>(version: i16, message: M) -> Result<Bytes> {
     let message_size = message.compute_size(version)?;
     let mut bytes = BytesMut::with_capacity(message_size + 2);
     bytes.put_i16(version);

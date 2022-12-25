@@ -1,15 +1,20 @@
-use std::{cell::RefCell, collections::VecDeque, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use dashmap::DashMap;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
         fetch_request::{FetchPartition, FetchTopic},
-        ApiKey, BrokerId, FetchRequest,
+        ApiKey, BrokerId, FetchRequest, TopicName,
     },
     records::{Record, RecordBatchDecoder},
 };
 use tracing::{debug, error};
+use uuid::Uuid;
 
 use crate::{
     client::Kafka,
@@ -77,11 +82,16 @@ impl<Exe: Executor> Fetcher<Exe> {
                         .await?;
 
                     for fetchable_topic in fetch_response.responses {
-                        if let Some(partition_states) = self
-                            .subscription
-                            .borrow_mut()
-                            .assignments
-                            .get_mut(&fetchable_topic.topic)
+                        let topic = if let Some(topic_name) =
+                            session.topic_names.get(&fetchable_topic.topic_id)
+                        {
+                            topic_name
+                        } else {
+                            &fetchable_topic.topic
+                        };
+
+                        if let Some(partition_states) =
+                            self.subscription.borrow_mut().assignments.get_mut(topic)
                         {
                             for partition in fetchable_topic.partitions {
                                 if partition.error_code.is_ok() {
@@ -94,6 +104,8 @@ impl<Exe: Executor> Fetcher<Exe> {
                                         partition_state.log_start_offset =
                                             partition.log_start_offset;
                                         partition_state.high_water_mark = partition.high_watermark;
+
+                                        // decode record batch
                                         if let Some(mut records) = partition.records {
                                             let records = RecordBatchDecoder::decode(&mut records)?;
                                             if let Some(record) =
@@ -146,10 +158,78 @@ impl<Exe: Executor> Fetcher<Exe> {
 }
 
 impl<Exe: Executor> Fetcher<Exe> {
+    fn topic_id(&self, topic_name: &TopicName, session: &mut FetchSession) -> Uuid {
+        if let Some(topic_id) = self.client.cluster_meta.topic_id(topic_name) {
+            if !session.topic_names.contains_key(&topic_id) {
+                session.add_topic(topic_id, topic_name.clone());
+            }
+            topic_id
+        } else {
+            Uuid::nil()
+        }
+    }
+
+    fn fetch_topic_builder(
+        &self,
+        node: NodeId,
+        session: &mut FetchSession,
+        version: i16,
+    ) -> Result<Vec<FetchTopic>> {
+        let mut topics = Vec::new();
+        let node_ref = self.client.cluster_meta.drain_node(node)?;
+        for (topic_name, partition_states) in self.subscription.borrow().assignments.iter() {
+            let mut partitions = Vec::new();
+            if let Some((_, all_partitions_in_node)) = node_ref
+                .value()
+                .iter()
+                .find(|(topic, _)| topic == topic_name)
+            {
+                for partition_state in partition_states
+                    .iter()
+                    .filter(|p| all_partitions_in_node.contains(&p.partition))
+                {
+                    let mut partition = FetchPartition::default();
+                    partition.partition = partition_state.partition;
+                    partition.fetch_offset = partition_state.position.offset;
+                    partition.partition_max_bytes = self.max_bytes;
+
+                    if version >= 5 {
+                        partition.log_start_offset = partition_state.last_stable_offset;
+                    }
+
+                    if version >= 9 {
+                        partition.current_leader_epoch =
+                            partition_state.position.current_leader.epoch.unwrap_or(-1);
+                    }
+
+                    if version >= 12 {
+                        partition.last_fetched_epoch =
+                            partition_state.position.offset_epoch.unwrap_or(-1);
+                    }
+
+                    debug!(
+                        "fetch partition {} for records with offset: {}, log_start_offset: {}",
+                        partition.partition, partition.fetch_offset, partition.log_start_offset
+                    );
+                    partitions.push(partition);
+                }
+
+                let topic = FetchTopic {
+                    topic: topic_name.clone(),
+                    topic_id: self.topic_id(topic_name, session),
+                    partitions,
+                    ..Default::default()
+                };
+                topics.push(topic);
+            }
+        }
+        Ok(topics)
+    }
+
     fn fetch_builder(
         &self,
         node: NodeId,
-        session: &FetchSession,
+        session: &mut FetchSession,
         version: i16,
     ) -> Result<FetchRequest> {
         let mut request = FetchRequest::default();
@@ -157,51 +237,7 @@ impl<Exe: Executor> Fetcher<Exe> {
             request.replica_id = BrokerId(-1);
             request.max_wait_ms = self.max_wait_ms;
             request.max_bytes = self.max_bytes;
-
-            let mut topics = Vec::new();
-            let node_ref = self.client.cluster_meta.drain_node(node)?;
-            for (topic_name, partition_states) in self.subscription.borrow().assignments.iter() {
-                let mut partitions = Vec::new();
-                if let Some((_, all_partitions_in_node)) = node_ref
-                    .value()
-                    .iter()
-                    .find(|(topic, _)| topic == topic_name)
-                {
-                    for partition_state in partition_states
-                        .iter()
-                        .filter(|p| all_partitions_in_node.contains(&p.partition))
-                    {
-                        let partition = FetchPartition {
-                            partition: partition_state.partition,
-                            current_leader_epoch: partition_state
-                                .position
-                                .current_leader
-                                .epoch
-                                .unwrap_or(-1),
-                            fetch_offset: partition_state.position.offset,
-                            log_start_offset: partition_state.log_start_offset,
-                            last_fetched_epoch: partition_state.position.offset_epoch.unwrap_or(-1),
-                            partition_max_bytes: self.max_bytes,
-                            ..Default::default()
-                        };
-                        debug!(
-                            "fetch partition {} for records with offset: {}, log_start_offset: {}",
-                            partition.partition, partition.fetch_offset, partition.log_start_offset
-                        );
-                        partitions.push(partition);
-                    }
-
-                    let topic = FetchTopic {
-                        topic: topic_name.clone(),
-                        partitions,
-                        ..Default::default()
-                    };
-                    topics.push(topic);
-                    break;
-                }
-            }
-
-            request.topics = topics;
+            request.topics = self.fetch_topic_builder(node, session, version)?;
 
             if version >= 3 {
                 request.max_bytes = self.max_bytes;
@@ -269,6 +305,7 @@ fn next_epoch(prev_epoch: i32) -> i32 {
 pub struct FetchSession {
     node: i32,
     next_metadata: FetchMetadata,
+    topic_names: HashMap<Uuid, TopicName>,
 }
 
 impl FetchSession {
@@ -279,6 +316,13 @@ impl FetchSession {
                 session_id: INVALID_SESSION_ID,
                 epoch: INITIAL_EPOCH,
             },
+            topic_names: HashMap::new(),
+        }
+    }
+
+    pub fn add_topic(&mut self, topic_id: Uuid, topic: TopicName) {
+        if topic_id != Uuid::nil() && !topic.is_empty() {
+            self.topic_names.insert(topic_id, topic);
         }
     }
 }

@@ -1,23 +1,13 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex, PoisonError,
+use std::{
+    string::FromUtf8Error,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, PoisonError,
+    },
 };
 
 use kafka_protocol::{
-    messages::{
-        api_versions_request::ApiVersionsRequestBuilderError,
-        consumer_protocol_assignment::ConsumerProtocolAssignmentBuilderError,
-        describe_groups_request::DescribeGroupsRequestBuilderError,
-        fetch_request::FetchRequestBuilderError,
-        find_coordinator_request::FindCoordinatorRequestBuilderError,
-        heartbeat_request::HeartbeatRequestBuilderError,
-        join_group_request::JoinGroupRequestBuilderError,
-        leave_group_request::LeaveGroupRequestBuilderError,
-        list_offsets_request::ListOffsetsRequestBuilderError,
-        offset_commit_request::OffsetCommitRequestBuilderError,
-        offset_fetch_request::OffsetFetchRequestBuilderError,
-        sync_group_request::SyncGroupRequestBuilderError, ApiKey, TopicName,
-    },
+    messages::{ApiKey, TopicName},
     protocol::{buf::NotEnoughBytesError, DecodeError, EncodeError},
     records::Record,
     ResponseError,
@@ -49,6 +39,12 @@ pub enum Error {
         error: ResponseError,
         msg: Option<String>,
     },
+}
+
+impl From<FromUtf8Error> for Error {
+    fn from(value: FromUtf8Error) -> Self {
+        Error::Custom(value.to_string())
+    }
 }
 
 impl<T> From<PoisonError<T>> for Error {
@@ -93,77 +89,11 @@ impl From<DecodeError> for Error {
     }
 }
 
-impl From<ApiVersionsRequestBuilderError> for Error {
-    fn from(value: ApiVersionsRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<FindCoordinatorRequestBuilderError> for Error {
-    fn from(value: FindCoordinatorRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<ListOffsetsRequestBuilderError> for Error {
-    fn from(value: ListOffsetsRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<FetchRequestBuilderError> for Error {
-    fn from(value: FetchRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<DescribeGroupsRequestBuilderError> for Error {
-    fn from(value: DescribeGroupsRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<LeaveGroupRequestBuilderError> for Error {
-    fn from(value: LeaveGroupRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<HeartbeatRequestBuilderError> for Error {
-    fn from(value: HeartbeatRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<OffsetCommitRequestBuilderError> for Error {
-    fn from(value: OffsetCommitRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<OffsetFetchRequestBuilderError> for Error {
-    fn from(value: OffsetFetchRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<JoinGroupRequestBuilderError> for Error {
-    fn from(value: JoinGroupRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<SyncGroupRequestBuilderError> for Error {
-    fn from(value: SyncGroupRequestBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
-
-impl From<ConsumerProtocolAssignmentBuilderError> for Error {
-    fn from(value: ConsumerProtocolAssignmentBuilderError) -> Self {
-        Error::Custom(value.to_string())
-    }
-}
+// impl From<ConsumerProtocolAssignmentBuilderError> for Error {
+//     fn from(value: ConsumerProtocolAssignmentBuilderError) -> Self {
+//         Error::Custom(value.to_string())
+//     }
+// }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -206,7 +136,7 @@ pub enum ConnectionError {
 
 impl From<NotEnoughBytesError> for ConnectionError {
     fn from(_: NotEnoughBytesError) -> Self {
-        Self::Decoding("Not Enough Bytes".into())
+        Self::Decoding("Not enough bytes remaining".into())
     }
 }
 
