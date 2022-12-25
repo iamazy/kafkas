@@ -20,6 +20,8 @@ async fn main() -> Result<(), Box<Error>> {
         // Configure formatting settings.
         .with_target(true)
         .with_level(true)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(true)
         .with_file(true)
         .with_line_number(true)
         // Set the subscriber as the default.

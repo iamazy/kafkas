@@ -116,6 +116,14 @@ impl<Exe: Executor> Fetcher<Exe> {
                                                     Some(record.partition_leader_epoch);
                                             }
 
+                                            debug!(
+                                                "fetch records of topic [{}] in partition {} \
+                                                 success, records size: {}",
+                                                topic.0,
+                                                partition.partition_index,
+                                                records.len()
+                                            );
+
                                             let fetched_records = FetchedRecords {
                                                 partition: partition.partition_index,
                                                 records,
