@@ -4,8 +4,8 @@ use dashmap::DashMap;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
-        fetch_request::{FetchPartition, FetchRequestBuilder, FetchTopic},
-        BrokerId,
+        fetch_request::{FetchPartition, FetchTopic},
+        ApiKey, BrokerId, FetchRequest,
     },
     records::{Record, RecordBatchDecoder},
 };
@@ -16,7 +16,7 @@ use crate::{
     consumer::{IsolationLevel, SubscriptionState},
     error::Result,
     executor::Executor,
-    NodeId, PartitionId,
+    Error, NodeId, PartitionId,
 };
 
 const INITIAL_EPOCH: i32 = 0;
@@ -64,16 +64,18 @@ impl<Exe: Executor> Fetcher<Exe> {
     }
 
     pub async fn fetch(&mut self) -> Result<()> {
-        for mut entry in self.sessions.iter_mut() {
-            let node_id = entry.node;
-            let session = entry.value_mut();
-            if let Some(node) = self.client.cluster_meta.nodes.get(&node_id) {
-                let fetch_response = self
-                    .client
-                    .fetch(node.value(), self.fetch_builder(node.id, session)?.build()?)
-                    .await?;
-                if fetch_response.error_code.is_ok() {
-                    session.next_metadata.session_id = fetch_response.session_id;
+        if let Some(version_range) = self.client.version_range(ApiKey::FetchKey) {
+            let version = version_range.max;
+
+            for mut entry in self.sessions.iter_mut() {
+                let node_id = entry.node;
+                let session = entry.value_mut();
+                if let Some(node) = self.client.cluster_meta.nodes.get(&node_id) {
+                    let fetch_response = self
+                        .client
+                        .fetch(node.value(), self.fetch_builder(node.id, session, version)?)
+                        .await?;
+
                     for fetchable_topic in fetch_response.responses {
                         if let Some(partition_states) = self
                             .subscription
@@ -119,79 +121,107 @@ impl<Exe: Executor> Fetcher<Exe> {
                             }
                         }
                     }
-                } else {
-                    error!(
-                        "fetch records error: {}",
-                        fetch_response.error_code.err().unwrap()
-                    );
+
+                    if (7..=13).contains(&version) {
+                        if fetch_response.error_code.is_ok() {
+                            session.next_metadata.session_id = fetch_response.session_id;
+                        } else {
+                            error!(
+                                "fetch records error: {}",
+                                fetch_response.error_code.err().unwrap()
+                            );
+                            return Err(Error::Response {
+                                error: fetch_response.error_code.err().unwrap(),
+                                msg: None,
+                            });
+                        }
+                    }
                 }
             }
+            Ok(())
+        } else {
+            Err(Error::InvalidApiRequest(ApiKey::FetchKey))
         }
-        Ok(())
     }
 }
 
 impl<Exe: Executor> Fetcher<Exe> {
-    fn fetch_builder(&self, node: NodeId, session: &FetchSession) -> Result<FetchRequestBuilder> {
-        let mut builder = FetchRequestBuilder::default();
-        builder
-            .cluster_id(None)
-            .session_id(session.next_metadata.session_id)
-            .session_epoch(session.next_metadata.epoch)
-            .replica_id(BrokerId(-1))
-            .max_wait_ms(self.max_wait_ms)
-            .min_bytes(self.min_bytes)
-            .max_bytes(self.max_bytes)
-            .isolation_level(IsolationLevel::ReadUncommitted.into())
-            .rack_id(Default::default())
-            .forgotten_topics_data(Default::default())
-            .unknown_tagged_fields(Default::default());
+    fn fetch_builder(
+        &self,
+        node: NodeId,
+        session: &FetchSession,
+        version: i16,
+    ) -> Result<FetchRequest> {
+        let mut request = FetchRequest::default();
+        if version <= 13 {
+            request.replica_id = BrokerId(-1);
+            request.max_wait_ms = self.max_wait_ms;
+            request.max_bytes = self.max_bytes;
 
-        let mut topics = Vec::new();
-        let node_ref = self.client.cluster_meta.drain_node(node)?;
-        for (topic_name, partition_states) in self.subscription.borrow().assignments.iter() {
-            let mut partitions = Vec::new();
-            if let Some((_, all_partitions_in_node)) = node_ref
-                .value()
-                .iter()
-                .find(|(topic, _)| topic == topic_name)
-            {
-                for partition_state in partition_states
+            let mut topics = Vec::new();
+            let node_ref = self.client.cluster_meta.drain_node(node)?;
+            for (topic_name, partition_states) in self.subscription.borrow().assignments.iter() {
+                let mut partitions = Vec::new();
+                if let Some((_, all_partitions_in_node)) = node_ref
+                    .value()
                     .iter()
-                    .filter(|p| all_partitions_in_node.contains(&p.partition))
+                    .find(|(topic, _)| topic == topic_name)
                 {
-                    let partition = FetchPartition {
-                        partition: partition_state.partition,
-                        current_leader_epoch: partition_state
-                            .position
-                            .current_leader
-                            .epoch
-                            .unwrap_or(-1),
-                        fetch_offset: partition_state.position.offset,
-                        log_start_offset: partition_state.log_start_offset,
-                        last_fetched_epoch: partition_state.position.offset_epoch.unwrap_or(-1),
-                        partition_max_bytes: self.max_bytes,
+                    for partition_state in partition_states
+                        .iter()
+                        .filter(|p| all_partitions_in_node.contains(&p.partition))
+                    {
+                        let partition = FetchPartition {
+                            partition: partition_state.partition,
+                            current_leader_epoch: partition_state
+                                .position
+                                .current_leader
+                                .epoch
+                                .unwrap_or(-1),
+                            fetch_offset: partition_state.position.offset,
+                            log_start_offset: partition_state.log_start_offset,
+                            last_fetched_epoch: partition_state.position.offset_epoch.unwrap_or(-1),
+                            partition_max_bytes: self.max_bytes,
+                            ..Default::default()
+                        };
+                        debug!(
+                            "fetch partition {} for records with offset: {}, log_start_offset: {}",
+                            partition.partition, partition.fetch_offset, partition.log_start_offset
+                        );
+                        partitions.push(partition);
+                    }
+
+                    let topic = FetchTopic {
+                        topic: topic_name.clone(),
+                        partitions,
                         ..Default::default()
                     };
-                    debug!(
-                        "fetch partition {} for records with offset: {}, log_start_offset: {}",
-                        partition.partition, partition.fetch_offset, partition.log_start_offset
-                    );
-                    partitions.push(partition);
+                    topics.push(topic);
+                    break;
                 }
+            }
 
-                let topic = FetchTopic {
-                    topic: topic_name.clone(),
-                    partitions,
-                    ..Default::default()
-                };
-                topics.push(topic);
-                break;
+            request.topics = topics;
+
+            if version >= 3 {
+                request.max_bytes = self.max_bytes;
+            }
+            if version >= 4 {
+                request.isolation_level = IsolationLevel::ReadUncommitted.into();
+            }
+            if version >= 7 {
+                request.session_id = session.next_metadata.session_id;
+                request.session_epoch = session.next_metadata.epoch;
+                request.forgotten_topics_data = Default::default();
+            }
+            if version >= 11 {
+                request.rack_id = Default::default();
+            }
+            if version >= 12 {
+                request.cluster_id = None;
             }
         }
-
-        builder.topics(topics);
-        Ok(builder)
+        Ok(request)
     }
 }
 

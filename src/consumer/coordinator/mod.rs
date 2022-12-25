@@ -49,6 +49,43 @@ use crate::{
 
 const PROTOCOL_TYPE: &str = "consumer";
 
+macro_rules! offset_fetch_block {
+    ($self:ident, $source:ident) => {
+        for topic in $source.topics {
+            if let Some(partition_states) = $self
+                .subscriptions
+                .borrow_mut()
+                .assignments
+                .get_mut(&topic.name)
+            {
+                for partition in topic.partitions {
+                    if partition.error_code.is_ok() {
+                        if let Some(partition_state) = partition_states
+                            .iter_mut()
+                            .find(|p| p.partition == partition.partition_index)
+                        {
+                            partition_state.position.offset = partition.committed_offset;
+                            partition_state.position.offset_epoch =
+                                Some(partition.committed_leader_epoch);
+
+                            debug!(
+                                "fetch partition {} offset success, offset: {}",
+                                partition.partition_index, partition.committed_offset
+                            );
+                        }
+                    } else {
+                        error!(
+                            "failed to fetch offset for partition {}, error: {}",
+                            partition.partition_index,
+                            partition.error_code.err().unwrap()
+                        );
+                    }
+                }
+            }
+        }
+    };
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CoordinatorType {
     Group,
@@ -156,7 +193,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         }
     }
 
-    #[async_recursion::async_recursion(?Send)]
+    #[async_recursion::async_recursion(? Send)]
     pub async fn join_group(&mut self) -> Result<()> {
         if let Some(version_range) = self.client.version_range(ApiKey::JoinGroupKey) {
             let join_group_response = self
@@ -290,73 +327,9 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 .await?;
             if offset_fetch_response.error_code.is_ok() {
                 if let Some(group) = offset_fetch_response.groups.pop() {
-                    for topic in group.topics {
-                        if let Some(partition_states) = self
-                            .subscriptions
-                            .borrow_mut()
-                            .assignments
-                            .get_mut(&topic.name)
-                        {
-                            for partition in topic.partitions {
-                                if partition.error_code.is_ok() {
-                                    if let Some(partition_state) = partition_states
-                                        .iter_mut()
-                                        .find(|p| p.partition == partition.partition_index)
-                                    {
-                                        partition_state.position.offset =
-                                            partition.committed_offset;
-                                        partition_state.position.offset_epoch =
-                                            Some(partition.committed_leader_epoch);
-
-                                        debug!(
-                                            "fetch partition {} offset success, offset: {}",
-                                            partition.partition_index, partition.committed_offset
-                                        );
-                                    }
-                                } else {
-                                    error!(
-                                        "failed to fetch offset for partition {}, error: {}",
-                                        partition.partition_index,
-                                        partition.error_code.err().unwrap()
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    offset_fetch_block!(self, group);
                 } else {
-                    for topic in offset_fetch_response.topics {
-                        if let Some(partition_states) = self
-                            .subscriptions
-                            .borrow_mut()
-                            .assignments
-                            .get_mut(&topic.name)
-                        {
-                            for partition in topic.partitions {
-                                if partition.error_code.is_ok() {
-                                    if let Some(partition_state) = partition_states
-                                        .iter_mut()
-                                        .find(|p| p.partition == partition.partition_index)
-                                    {
-                                        partition_state.position.offset =
-                                            partition.committed_offset;
-                                        partition_state.position.offset_epoch =
-                                            Some(partition.committed_leader_epoch);
-
-                                        debug!(
-                                            "fetch partition {} offset success, offset: {}",
-                                            partition.partition_index, partition.committed_offset
-                                        );
-                                    }
-                                } else {
-                                    error!(
-                                        "failed to fetch offset for partition {}, error: {}",
-                                        partition.partition_index,
-                                        partition.error_code.err().unwrap()
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    offset_fetch_block!(self, offset_fetch_response);
                 }
                 Ok(())
             } else {
@@ -438,8 +411,8 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 .await?;
             if heartbeat_response.error_code.is_ok() {
                 debug!(
-                    "heartbeat success, group: {:?}, member: {}",
-                    self.group_meta.group_id, self.group_meta.member_id
+                    "heartbeat success, group: {}, member: {}",
+                    self.group_meta.group_id.0, self.group_meta.member_id
                 );
                 Ok(())
             } else {

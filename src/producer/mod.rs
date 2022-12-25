@@ -289,6 +289,7 @@ impl<Exe: Executor> Producer<Exe> {
     ) -> Result<()> {
         if self.num_records.load(Ordering::Relaxed) == 0 {
             debug!("no records to send.");
+            self.client.executor.delay(Duration::from_secs(1)).await;
             return Ok(());
         }
         if let Ok(flush_list) = self.flush(encode_options).await {

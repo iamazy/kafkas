@@ -175,8 +175,7 @@ impl KafkaCodec {
             let supported_range = server_range.intersect(&Req::VERSIONS);
             if supported_range.is_empty() {
                 return Err(ConnectionError::Encoding(format!(
-                    "apiKey {} is not support.",
-                    api_key
+                    "apiKey {api_key} is not support."
                 )));
             }
             api_version = supported_range.max;
@@ -211,7 +210,7 @@ impl KafkaCodec {
             .active_requests
             .remove(&correlation_id)
             .ok_or_else(|| {
-                ConnectionError::UnexpectedResponse(format!("correlation_id: {}", correlation_id))
+                ConnectionError::UnexpectedResponse(format!("correlation_id: {correlation_id}"))
             })?;
 
         let response_header_version = self.response_header_version(
