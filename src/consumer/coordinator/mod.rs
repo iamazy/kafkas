@@ -627,14 +627,14 @@ fn serialize_assignments(
     let version = ConsumerProtocolAssignment::VERSIONS.max;
     let mut sync_group_assignments = Vec::with_capacity(assignments.len());
     for (member_id, assignment) in assignments {
-        let mut consumer_protocol_assignment = ConsumerProtocolAssignment::default();
         let mut assigned_partitions = IndexMap::with_capacity(assignment.partitions.len());
         for (topic, partitions) in assignment.partitions {
             assigned_partitions.insert(topic, CpaTopicPartition { partitions });
         }
-        consumer_protocol_assignment.assigned_partitions = assigned_partitions;
-        consumer_protocol_assignment.user_data = assignment.user_data;
-        let assignment = to_version_prefixed_bytes(version, consumer_protocol_assignment)?;
+        let assignment = to_version_prefixed_bytes(version, ConsumerProtocolAssignment {
+            assigned_partitions,
+            user_data: assignment.user_data,
+        })?;
 
         sync_group_assignments.push(SyncGroupRequestAssignment {
             member_id,

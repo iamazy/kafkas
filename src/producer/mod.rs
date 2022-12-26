@@ -469,7 +469,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
                 &self.topic,
                 record.key(),
                 record.value(),
-                self.client.cluster_meta.clone(),
+                &self.client.cluster_meta,
             )?;
         }
         return match self.batches.get_mut(&partition) {

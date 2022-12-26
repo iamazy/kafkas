@@ -216,8 +216,8 @@ impl<Exe: Executor> Fetcher<Exe> {
                     }
 
                     debug!(
-                        "fetch partition {} for records with offset: {}, log_start_offset: {}",
-                        partition.partition, partition.fetch_offset, partition.log_start_offset
+                        "fetch topic [{}] partition {} for records with offset: {}, log_start_offset: {}",
+                        topic_name.0, partition.partition, partition.fetch_offset, partition.log_start_offset
                     );
                     partitions.push(partition);
                 }
