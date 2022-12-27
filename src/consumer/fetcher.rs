@@ -244,7 +244,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         if version <= 13 {
             request.replica_id = BrokerId(-1);
             request.max_wait_ms = self.max_wait_ms;
-            request.max_bytes = self.max_bytes;
+            request.min_bytes = self.min_bytes;
             request.topics = self.fetch_topic_builder(node, session, version)?;
 
             if version >= 3 {
