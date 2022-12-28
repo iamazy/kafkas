@@ -631,10 +631,13 @@ fn serialize_assignments(
         for (topic, partitions) in assignment.partitions {
             assigned_partitions.insert(topic, CpaTopicPartition { partitions });
         }
-        let assignment = to_version_prefixed_bytes(version, ConsumerProtocolAssignment {
-            assigned_partitions,
-            user_data: assignment.user_data,
-        })?;
+        let assignment = to_version_prefixed_bytes(
+            version,
+            ConsumerProtocolAssignment {
+                assigned_partitions,
+                user_data: assignment.user_data,
+            },
+        )?;
 
         sync_group_assignments.push(SyncGroupRequestAssignment {
             member_id,

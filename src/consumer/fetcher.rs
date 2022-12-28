@@ -9,9 +9,10 @@ use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
         fetch_request::{FetchPartition, FetchTopic},
-        ApiKey, BrokerId, FetchRequest, TopicName,
+        list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
+        ApiKey, BrokerId, FetchRequest, ListOffsetsRequest, TopicName,
     },
-    records::{Record, RecordBatchDecoder},
+    records::{Record, RecordBatchDecoder, NO_PARTITION_LEADER_EPOCH},
 };
 use tracing::{debug, error};
 use uuid::Uuid;
@@ -30,6 +31,7 @@ const INVALID_SESSION_ID: i32 = 0;
 
 pub struct Fetcher<Exe: Executor> {
     client: Kafka<Exe>,
+    timestamp: i64,
     min_bytes: i32,
     max_bytes: i32,
     max_wait_ms: i32,
@@ -45,7 +47,11 @@ pub struct Fetcher<Exe: Executor> {
 }
 
 impl<Exe: Executor> Fetcher<Exe> {
-    pub fn new(client: Kafka<Exe>, subscription: Arc<RefCell<SubscriptionState>>) -> Self {
+    pub fn new(
+        client: Kafka<Exe>,
+        timestamp: i64,
+        subscription: Arc<RefCell<SubscriptionState>>,
+    ) -> Self {
         let sessions = DashMap::new();
         for node in client.cluster_meta.nodes.iter() {
             sessions.insert(node.id, FetchSession::new(node.id));
@@ -53,6 +59,7 @@ impl<Exe: Executor> Fetcher<Exe> {
 
         Self {
             client,
+            timestamp,
             min_bytes: 1,
             max_bytes: 52428800, // 50 * 1024 * 1024,
             max_wait_ms: 500,
@@ -163,6 +170,13 @@ impl<Exe: Executor> Fetcher<Exe> {
             Err(Error::InvalidApiRequest(ApiKey::FetchKey))
         }
     }
+
+    // pub async fn list_offsets(&self) -> Result<()> {
+    //     if let Some(version_range) = self.client.version_range(ApiKey::ListOffsetsKey) {
+    //     } else {
+    //         Err(Error::InvalidApiRequest(ApiKey::ListOffsetsKey))
+    //     }
+    // }
 }
 
 impl<Exe: Executor> Fetcher<Exe> {
@@ -175,6 +189,83 @@ impl<Exe: Executor> Fetcher<Exe> {
         } else {
             Uuid::nil()
         }
+    }
+
+    async fn reset_offset_if_needed(&self, version: u16) -> Result<()> {
+        let topics = self
+            .subscription
+            .borrow()
+            .partitions_need_reset(self.timestamp);
+        if topics.is_empty() {
+            return Ok(());
+        }
+
+        let mut offset_reset_timestamps = HashMap::new();
+        for (topic, partitions) in topics {
+            let timestamps = self.offset_reset_strategy_timestamp(&topic, partitions);
+            offset_reset_timestamps.insert(topic, timestamps);
+        }
+
+        let requests = self.group_list_offsets_request(offset_reset_timestamps, version)?;
+        for (node, request) in requests {
+            if let Some(node) = self.client.cluster_meta.nodes.get(&node) {
+                let _response = self.client.list_offsets(node.value(), request).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn group_list_offsets_request(
+        &self,
+        mut offset_reset_timestamps: HashMap<TopicName, Vec<(PartitionId, i64)>>,
+        version: u16,
+    ) -> Result<HashMap<NodeId, ListOffsetsRequest>> {
+        let mut node_request = HashMap::new();
+        for node_entry in self.client.cluster_meta.nodes.iter() {
+            if let Ok(node_topology) = self.client.cluster_meta.drain_node(node_entry.value().id) {
+                let node_topology = node_topology.value();
+
+                let mut topics = HashMap::new();
+                for (topic, partitions) in node_topology {
+                    if let Some(partition_timestamps) = offset_reset_timestamps.get_mut(topic) {
+                        let timestamps = partition_timestamps
+                            .iter()
+                            .filter(|(p, _)| partitions.contains(p))
+                            .copied()
+                            .collect::<Vec<(PartitionId, i64)>>();
+
+                        topics.insert(topic, timestamps);
+                    }
+                }
+
+                self.subscription
+                    .borrow_mut()
+                    .set_next_allowed_retry(&topics, self.timestamp + self.request_timeout_ms);
+                let request = self.list_offsets_builder(topics, version)?;
+                node_request.insert(*node_entry.key(), request);
+            }
+        }
+        Ok(node_request)
+    }
+
+    fn offset_reset_strategy_timestamp(
+        &self,
+        topic: &TopicName,
+        partitions: Vec<PartitionId>,
+    ) -> Vec<(PartitionId, i64)> {
+        let reset_strategies = self
+            .subscription
+            .borrow()
+            .offset_reset_strategy(topic, partitions);
+        let mut timestamps = Vec::with_capacity(reset_strategies.len());
+        for (partition, strategy) in reset_strategies {
+            let timestamp = strategy.strategy_timestamp();
+            if timestamp != 0 {
+                timestamps.push((partition, timestamp));
+            }
+        }
+        timestamps
     }
 
     fn fetch_topic_builder(
@@ -216,8 +307,12 @@ impl<Exe: Executor> Fetcher<Exe> {
                     }
 
                     debug!(
-                        "fetch topic [{}] partition {} for records with offset: {}, log_start_offset: {}",
-                        topic_name.0, partition.partition, partition.fetch_offset, partition.log_start_offset
+                        "fetch topic [{}] partition {} for records with offset: {}, \
+                         log_start_offset: {}",
+                        topic_name.0,
+                        partition.partition,
+                        partition.fetch_offset,
+                        partition.log_start_offset
                     );
                     partitions.push(partition);
                 }
@@ -264,6 +359,42 @@ impl<Exe: Executor> Fetcher<Exe> {
             if version >= 12 {
                 request.cluster_id = None;
             }
+        }
+        Ok(request)
+    }
+
+    pub fn list_offsets_builder(
+        &self,
+        assignments: HashMap<&TopicName, Vec<(PartitionId, i64)>>,
+        version: u16,
+    ) -> Result<ListOffsetsRequest> {
+        let mut topics = Vec::new();
+        for (topic_name, partition_list) in assignments {
+            let mut partitions = Vec::new();
+            for (partition, timestamp) in partition_list {
+                let partition = ListOffsetsPartition {
+                    partition_index: partition,
+                    current_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                    timestamp,
+                    ..Default::default()
+                };
+                partitions.push(partition);
+            }
+            let topic = ListOffsetsTopic {
+                name: topic_name.clone(),
+                partitions,
+                ..Default::default()
+            };
+            topics.push(topic);
+        }
+        let mut request = ListOffsetsRequest {
+            replica_id: BrokerId(-1),
+            topics,
+            ..Default::default()
+        };
+
+        if version >= 2 {
+            request.isolation_level = IsolationLevel::ReadUncommitted.into();
         }
         Ok(request)
     }

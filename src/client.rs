@@ -1,31 +1,27 @@
 use std::{collections::HashMap, sync::Arc};
 
 use bytes::Bytes;
-use chrono::Local;
 use futures::StreamExt;
 use kafka_protocol::{
     messages::{
-        api_versions_request::ApiVersionsRequest,
-        api_versions_response::ApiVersionsResponse,
-        list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
-        metadata_request::MetadataRequestTopic,
-        ApiKey, BrokerId, DescribeGroupsRequest, DescribeGroupsResponse, FetchRequest,
-        FetchResponse, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest,
-        HeartbeatResponse, JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest,
-        LeaveGroupResponse, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest,
-        OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse,
-        ProduceRequest, ProduceResponse, RequestKind, ResponseKind, SyncGroupRequest,
-        SyncGroupResponse, TopicName,
+        api_versions_request::ApiVersionsRequest, api_versions_response::ApiVersionsResponse,
+        metadata_request::MetadataRequestTopic, ApiKey, DescribeGroupsRequest,
+        DescribeGroupsResponse, FetchRequest, FetchResponse, FindCoordinatorRequest,
+        FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse, JoinGroupRequest,
+        JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsRequest,
+        ListOffsetsResponse, MetadataRequest, OffsetCommitRequest, OffsetCommitResponse,
+        OffsetFetchRequest, OffsetFetchResponse, ProduceRequest, ProduceResponse, RequestKind,
+        ResponseKind, SyncGroupRequest, SyncGroupResponse, TopicName,
     },
     protocol::VersionRange,
-    records::{Record, NO_PARTITION_LEADER_EPOCH},
+    records::Record,
 };
 use tracing::error;
 
 use crate::{
     connection::Connection,
     connection_manager::{ConnectionManager, ConnectionRetryOptions, OperationRetryOptions},
-    consumer::{ConsumerRecord, IsolationLevel, TopicPartitionState},
+    consumer::ConsumerRecord,
     error::{ConnectionError, Error, Result},
     executor::Executor,
     metadata::{Cluster, Node},
@@ -369,40 +365,6 @@ impl<Exe: Executor> Kafka<Exe> {
             client_software_version: Self::PKG_VERSION.to_string().to_str_bytes(),
             ..Default::default()
         };
-        Ok(request)
-    }
-
-    pub fn list_offsets_builder(
-        &self,
-        assignments: &HashMap<TopicName, Vec<TopicPartitionState>>,
-    ) -> Result<ListOffsetsRequest> {
-        let mut request = ListOffsetsRequest {
-            replica_id: BrokerId(-1),
-            isolation_level: IsolationLevel::ReadUncommitted.into(),
-            ..Default::default()
-        };
-
-        let mut topics = Vec::new();
-        let timestamp = Local::now().timestamp();
-        for (topic_name, partition_list) in assignments.iter() {
-            let mut partitions = Vec::new();
-            for partition in partition_list {
-                let partition = ListOffsetsPartition {
-                    partition_index: partition.partition(),
-                    current_leader_epoch: NO_PARTITION_LEADER_EPOCH,
-                    timestamp,
-                    ..Default::default()
-                };
-                partitions.push(partition);
-            }
-            let topic = ListOffsetsTopic {
-                name: topic_name.clone(),
-                partitions,
-                ..Default::default()
-            };
-            topics.push(topic);
-        }
-        request.topics = topics;
         Ok(request)
     }
 }

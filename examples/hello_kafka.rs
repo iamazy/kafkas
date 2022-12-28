@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use chrono::Local;
 use futures::{SinkExt, StreamExt};
 use kafka_protocol::records::TimestampType;
 use kafkas::{
@@ -43,7 +44,11 @@ async fn main() -> Result<(), Box<Error>> {
     // coordinator.heartbeat().await?;
     // coordinator.leave_group().await?;
 
-    let mut fetcher = Fetcher::new(kafka_client.clone(), coordinator.subscriptions.clone());
+    let mut fetcher = Fetcher::new(
+        kafka_client.clone(),
+        Local::now().timestamp(),
+        coordinator.subscriptions.clone(),
+    );
     fetcher.fetch().await?;
     Ok(())
 }

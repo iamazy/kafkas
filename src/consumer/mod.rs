@@ -23,16 +23,26 @@ pub struct ConsumerRecord {
     pub timestamp: i64,
 }
 
-#[derive(Debug, Clone)]
-pub enum OffsetStrategy {
+#[derive(Debug, Clone, Copy)]
+pub enum OffsetResetStrategy {
     Latest,
     Earliest,
-    At(u64),
+    None,
 }
 
-impl Default for OffsetStrategy {
+impl OffsetResetStrategy {
+    pub fn strategy_timestamp(&self) -> i64 {
+        match self {
+            Self::Earliest => -2,
+            Self::Latest => -1,
+            _ => 0,
+        }
+    }
+}
+
+impl Default for OffsetResetStrategy {
     fn default() -> Self {
-        OffsetStrategy::Earliest
+        OffsetResetStrategy::Earliest
     }
 }
 
@@ -65,7 +75,7 @@ impl Default for RebalanceOptions {
 pub struct SubscriptionState {
     subscription_type: SubscriptionType,
     topics: HashSet<TopicName>,
-    offset_strategy: OffsetStrategy,
+    default_offset_strategy: OffsetResetStrategy,
     assignments: HashMap<TopicName, Vec<TopicPartitionState>>,
 }
 
@@ -79,6 +89,63 @@ impl SubscriptionState {
             );
         }
         partitions
+    }
+
+    fn partitions_need_reset(&self, now: i64) -> HashMap<TopicName, Vec<PartitionId>> {
+        let mut topics = HashMap::new();
+        for (topic, partition_states) in self.assignments.iter() {
+            let mut partitions = Vec::new();
+            for partition_state in partition_states {
+                if matches!(partition_state.fetch_state, FetchState::AwaitReset)
+                    && !partition_state.awaiting_retry_backoff(now)
+                {
+                    partitions.push(partition_state.partition);
+                }
+            }
+            if !partitions.is_empty() {
+                topics.insert(topic.clone(), partitions);
+            }
+        }
+        topics
+    }
+
+    pub fn offset_reset_strategy(
+        &self,
+        topic: &TopicName,
+        partitions: Vec<PartitionId>,
+    ) -> Vec<(PartitionId, OffsetResetStrategy)> {
+        let mut strategies = Vec::new();
+        if let Some((_, partition_states)) = self
+            .assignments
+            .iter()
+            .find(|(topic_name, _)| *topic_name == topic)
+        {
+            for partition_state in partition_states {
+                if partitions.contains(&partition_state.partition) {
+                    strategies.push((partition_state.partition, partition_state.offset_strategy));
+                }
+            }
+        }
+        strategies
+    }
+
+    pub fn set_next_allowed_retry(
+        &mut self,
+        topic: &HashMap<&TopicName, Vec<(PartitionId, i64)>>,
+        next_allowed_reset_ms: i64,
+    ) {
+        for (topic, partitions) in topic {
+            if let Some(partition_states) = self.assignments.get_mut(*topic) {
+                for partition_state in partition_states.iter_mut() {
+                    for (p, _) in partitions {
+                        if *p == partition_state.partition {
+                            partition_state.next_retry_time_ms = Some(next_allowed_reset_ms);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -112,8 +179,8 @@ pub struct TopicPartitionState {
     log_start_offset: i64,
     last_stable_offset: i64,
     paused: bool,
-    offset_strategy: OffsetStrategy,
-    next_allowed_retry_time_ms: i64,
+    next_retry_time_ms: Option<i64>,
+    offset_strategy: OffsetResetStrategy,
 }
 
 impl TopicPartitionState {
@@ -126,6 +193,13 @@ impl TopicPartitionState {
 
     pub fn partition(&self) -> PartitionId {
         self.partition
+    }
+
+    fn awaiting_retry_backoff(&self, now: i64) -> bool {
+        if let Some(next_retry_time) = self.next_retry_time_ms {
+            return now < next_retry_time;
+        }
+        false
     }
 }
 
