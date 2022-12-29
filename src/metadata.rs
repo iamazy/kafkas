@@ -15,8 +15,9 @@ use kafka_protocol::{
 use uuid::Uuid;
 
 use crate::{
+    consumer::LeaderAndEpoch,
     error::{Error, Result},
-    NodeId, NodeRef, PartitionRef,
+    NodeId, NodeRef, PartitionId, PartitionRef,
 };
 
 pub(crate) const GROUP_METADATA_TOPIC_NAME: &str = "__consumer_offsets";
@@ -65,11 +66,12 @@ impl From<(&TopicName, &MetadataResponseTopic)> for Topic {
 
 #[derive(Debug, Clone, Default, Hash)]
 pub struct Partition {
-    pub partition: i32,
-    pub leader: i32,
-    pub replicas: Vec<i32>,
-    pub in_sync_replicas: Vec<i32>,
-    pub offline_replicas: Vec<i32>,
+    pub partition: PartitionId,
+    pub leader: NodeId,
+    pub leader_epoch: i32,
+    pub replicas: Vec<NodeId>,
+    pub in_sync_replicas: Vec<NodeId>,
+    pub offline_replicas: Vec<NodeId>,
 }
 
 impl From<&MetadataResponsePartition> for Partition {
@@ -78,6 +80,7 @@ impl From<&MetadataResponsePartition> for Partition {
         Self {
             partition: partition_index,
             leader: partition.leader_id.0,
+            leader_epoch: partition.leader_epoch,
             replicas: partition.replica_nodes.iter().map(|node| node.0).collect(),
             in_sync_replicas: partition.isr_nodes.iter().map(|node| node.0).collect(),
             offline_replicas: partition
@@ -92,7 +95,7 @@ impl From<&MetadataResponsePartition> for Partition {
 #[derive(Debug, Clone, Default, Eq, PartialEq, Hash)]
 pub struct TopicPartition {
     pub topic: TopicName,
-    pub partition: i32,
+    pub partition: PartitionId,
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Hash)]
@@ -239,6 +242,26 @@ impl Cluster {
         Err(Error::TopicNotAvailable {
             topic: topic.clone(),
         })
+    }
+
+    pub(crate) fn current_leader(
+        &self,
+        topic: &TopicName,
+        partition: PartitionId,
+    ) -> LeaderAndEpoch {
+        let mut leader_epoch = LeaderAndEpoch::default();
+        if let Some(entry) = self.topics.get(topic) {
+            if let Some(partition) = entry
+                .value()
+                .partitions
+                .iter()
+                .find(|p| p.partition == partition)
+            {
+                leader_epoch.leader = Some(partition.leader);
+                leader_epoch.epoch = Some(partition.leader_epoch);
+            }
+        }
+        leader_epoch
     }
 
     pub fn drain_node(&self, node: NodeId) -> Result<NodeRef> {

@@ -8,8 +8,9 @@ use kafka_protocol::{
     messages::{GroupId, TopicName},
     protocol::StrBytes,
 };
+use tracing::{debug, info};
 
-use crate::{metadata::Node, PartitionId};
+use crate::{Error, NodeId, PartitionId, Result};
 
 /// High-level consumer record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +24,7 @@ pub struct ConsumerRecord {
     pub timestamp: i64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum OffsetResetStrategy {
     Latest,
     Earliest,
@@ -31,6 +32,14 @@ pub enum OffsetResetStrategy {
 }
 
 impl OffsetResetStrategy {
+    pub fn from_timestamp(timestamp: i64) -> Self {
+        match timestamp {
+            -2 => Self::Earliest,
+            -1 => Self::Latest,
+            _ => Self::None,
+        }
+    }
+
     pub fn strategy_timestamp(&self) -> i64 {
         match self {
             Self::Earliest => -2,
@@ -147,6 +156,67 @@ impl SubscriptionState {
             }
         }
     }
+
+    pub fn request_failed(
+        &mut self,
+        topics: HashMap<TopicName, Vec<PartitionId>>,
+        next_retry_time_ms: i64,
+    ) {
+        for (topic, partitions) in topics {
+            if let Some(partition_states) = self.assignments.get_mut(&topic) {
+                for partition_state in partition_states {
+                    if partitions.contains(&partition_state.partition) {
+                        partition_state.request_failed(next_retry_time_ms);
+                    }
+                }
+            }
+        }
+    }
+
+    fn assigned_state_or_none(
+        &mut self,
+        topic: &TopicName,
+        partition: PartitionId,
+    ) -> Option<&mut TopicPartitionState> {
+        if let Some(partition_states) = self.assignments.get_mut(topic) {
+            if let Some(partition_state) = partition_states
+                .iter_mut()
+                .find(|state| state.partition == partition)
+            {
+                return Some(partition_state);
+            }
+        }
+        None
+    }
+
+    fn maybe_seek_unvalidated(
+        &mut self,
+        topic: &TopicName,
+        partition: PartitionId,
+        position: FetchPosition,
+        offset_strategy: OffsetResetStrategy,
+    ) -> Result<()> {
+        if let Some(partition_state) = self.assigned_state_or_none(topic, partition) {
+            if !matches!(partition_state.fetch_state, FetchState::AwaitReset) {
+                debug!("Skipping reset of [{topic:?} - {partition}] since it is no longer needed");
+            } else if partition_state.offset_strategy != offset_strategy {
+                debug!(
+                    "Skipping reset of partition [{topic:?} - {partition}] since an alternative \
+                     reset has been requested"
+                );
+            } else {
+                info!(
+                    "Resetting offset for partition [{topic:?} - {partition}] to position {}.",
+                    position.offset
+                );
+                partition_state.seek_unvalidated(position)?;
+            }
+        } else {
+            debug!("Skipping reset of [{topic:?} - {partition}] since it is no longer assigned");
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -201,14 +271,117 @@ impl TopicPartitionState {
         }
         false
     }
+
+    fn request_failed(&mut self, next_allowed_retry_time_ms: i64) {
+        self.next_retry_time_ms = Some(next_allowed_retry_time_ms);
+    }
+
+    fn seek_unvalidated(&mut self, position: FetchPosition) -> Result<()> {
+        self.seek_validated(position)?;
+        self.validate_position(position)
+    }
+
+    fn seek_validated(&mut self, position: FetchPosition) -> Result<()> {
+        self.transition_state(FetchState::Fetching, |state| {
+            state.position = position;
+            state.offset_strategy = OffsetResetStrategy::None;
+            state.next_retry_time_ms = None;
+        })
+    }
+
+    fn validate_position(&mut self, position: FetchPosition) -> Result<()> {
+        if position.offset_epoch.is_some() && position.current_leader.epoch.is_some() {
+            self.transition_state(FetchState::AwaitValidation, |state| {
+                state.position = position;
+                state.next_retry_time_ms = None;
+            })
+        } else {
+            // If we have no epoch information for the current position, then we can skip validation
+            self.transition_state(FetchState::Fetching, |state| {
+                state.position = position;
+                state.next_retry_time_ms = None;
+            })
+        }
+    }
+
+    fn transition_state<F>(&mut self, new_state: FetchState, mut func: F) -> Result<()>
+    where
+        F: FnMut(&mut Self),
+    {
+        let next_state = self.fetch_state.transition_to(new_state);
+        if next_state == new_state {
+            self.fetch_state = next_state;
+            func(self);
+            if self.position.is_nil() && next_state.requires_position() {
+                return Err(Error::Custom(format!(
+                    "Transitioned subscription state to {next_state:?}, but position is nil"
+                )));
+            } else if !next_state.requires_position() {
+                self.position.clear();
+            }
+        }
+        Ok(())
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum FetchState {
     Initializing,
     Fetching,
     AwaitReset,
     AwaitValidation,
+}
+
+impl FetchState {
+    fn transition_to(self, new_state: FetchState) -> Self {
+        if self.valid_transitions().contains(&new_state) {
+            new_state
+        } else {
+            self
+        }
+    }
+
+    #[inline]
+    fn requires_position(&self) -> bool {
+        match self {
+            FetchState::Initializing => false,
+            FetchState::Fetching => true,
+            FetchState::AwaitReset => false,
+            FetchState::AwaitValidation => true,
+        }
+    }
+
+    #[inline]
+    fn has_valid_position(&self) -> bool {
+        match self {
+            FetchState::Initializing => false,
+            FetchState::Fetching => true,
+            FetchState::AwaitReset => false,
+            FetchState::AwaitValidation => false,
+        }
+    }
+
+    #[inline]
+    fn valid_transitions(&self) -> Vec<FetchState> {
+        match self {
+            FetchState::Initializing => vec![
+                FetchState::Fetching,
+                FetchState::AwaitReset,
+                FetchState::AwaitValidation,
+            ],
+            FetchState::Fetching => vec![
+                FetchState::Fetching,
+                FetchState::AwaitReset,
+                FetchState::AwaitValidation,
+            ],
+            FetchState::AwaitReset => vec![FetchState::Fetching, FetchState::AwaitReset],
+            FetchState::AwaitValidation => vec![
+                FetchState::Fetching,
+                FetchState::AwaitReset,
+                FetchState::AwaitValidation,
+            ],
+        }
+    }
 }
 
 impl Default for FetchState {
@@ -217,7 +390,7 @@ impl Default for FetchState {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct FetchPosition {
     offset: i64,
     offset_epoch: Option<i32>,
@@ -232,12 +405,23 @@ impl FetchPosition {
             ..Default::default()
         }
     }
+
+    pub fn clear(&mut self) {
+        self.offset = i64::MIN;
+        self.offset_epoch = None;
+        self.current_leader.leader = None;
+        self.current_leader.epoch = None;
+    }
+
+    pub fn is_nil(&self) -> bool {
+        self.offset == i64::MIN
+    }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct LeaderAndEpoch {
-    leader: Option<Node>,
-    epoch: Option<i32>,
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LeaderAndEpoch {
+    pub(crate) leader: Option<NodeId>,
+    pub(crate) epoch: Option<i32>,
 }
 
 #[derive(Debug, Clone)]

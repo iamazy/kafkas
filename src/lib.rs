@@ -29,6 +29,10 @@ pub use producer::ProducerRecord;
 pub type NodeId = i32;
 pub type PartitionId = i32;
 
+const UNKNOWN_OFFSET: i64 = -1;
+const UNKNOWN_TIMESTAMP: i64 = -1;
+const UNKNOWN_EPOCH: i32 = NO_PARTITION_LEADER_EPOCH;
+
 pub type PartitionRef<'a> = Ref<'a, TopicName, Vec<PartitionId>>;
 pub type NodeRef<'a> = Ref<'a, NodeId, Vec<(TopicName, Vec<PartitionId>)>>;
 

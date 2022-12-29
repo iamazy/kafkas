@@ -26,6 +26,9 @@ pub enum Error {
     TopicNotAvailable {
         topic: TopicName,
     },
+    TopicAuthorizationError {
+        topics: Vec<TopicName>,
+    },
     PartitionNotAvailable {
         topic: TopicName,
         partition: i32,
@@ -109,6 +112,9 @@ impl std::fmt::Display for Error {
             }
             Error::TopicNotAvailable { topic } => {
                 write!(f, "Topic not available, topic: {topic:?}")
+            }
+            Error::TopicAuthorizationError { topics } => {
+                write!(f, "Topic Authorization Error, topics: {:?}", topics)
             }
             Error::NodeNotAvailable { node } => {
                 write!(f, "Node not available, node: {node:?}")

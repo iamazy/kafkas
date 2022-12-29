@@ -10,19 +10,21 @@ use kafka_protocol::{
     messages::{
         fetch_request::{FetchPartition, FetchTopic},
         list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
-        ApiKey, BrokerId, FetchRequest, ListOffsetsRequest, TopicName,
+        ApiKey, BrokerId, FetchRequest, ListOffsetsRequest, ListOffsetsResponse, TopicName,
     },
     records::{Record, RecordBatchDecoder, NO_PARTITION_LEADER_EPOCH},
+    ResponseError,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
     client::Kafka,
-    consumer::{IsolationLevel, SubscriptionState},
+    consumer::{FetchPosition, IsolationLevel, OffsetResetStrategy, SubscriptionState},
     error::Result,
     executor::Executor,
-    Error, NodeId, PartitionId,
+    metadata::Node,
+    Error, NodeId, PartitionId, UNKNOWN_EPOCH, UNKNOWN_OFFSET,
 };
 
 const INITIAL_EPOCH: i32 = 0;
@@ -191,7 +193,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         }
     }
 
-    async fn reset_offset_if_needed(&self, version: u16) -> Result<()> {
+    async fn reset_offset(&mut self, version: u16) -> Result<()> {
         let topics = self
             .subscription
             .borrow()
@@ -206,21 +208,194 @@ impl<Exe: Executor> Fetcher<Exe> {
             offset_reset_timestamps.insert(topic, timestamps);
         }
 
-        let requests = self.group_list_offsets_request(offset_reset_timestamps, version)?;
+        let requests = self.group_list_offsets_request(&mut offset_reset_timestamps, version)?;
         for (node, request) in requests {
-            if let Some(node) = self.client.cluster_meta.nodes.get(&node) {
-                let _response = self.client.list_offsets(node.value(), request).await?;
+            let response = self.client.list_offsets(&node, request).await?;
+            let list_offset_result = self.handle_list_offsets_response(response)?;
+            if !list_offset_result.partitions_to_retry.is_empty() {
+                self.subscription.borrow_mut().request_failed(
+                    list_offset_result.partitions_to_retry,
+                    self.timestamp + self.retry_backoff_ms,
+                );
+                // TODO: metadata request update
+            }
+
+            for (topic, offsets) in list_offset_result.fetched_offsets {
+                if let Some(partition_timestamp) = offset_reset_timestamps.get(&topic) {
+                    for offset in offsets {
+                        if let Some(timestamp) = partition_timestamp.get(&offset.partition) {
+                            self.reset_offset_if_needed(
+                                &topic,
+                                offset.partition,
+                                OffsetResetStrategy::from_timestamp(*timestamp),
+                                offset,
+                            )?;
+                        }
+                    }
+                }
             }
         }
 
         Ok(())
     }
 
+    fn reset_offset_if_needed(
+        &mut self,
+        topic: &TopicName,
+        partition: PartitionId,
+        offset_strategy: OffsetResetStrategy,
+        offset_data: ListOffsetData,
+    ) -> Result<()> {
+        let position = FetchPosition {
+            offset: offset_data.offset,
+            offset_epoch: None,
+            current_leader: self.client.cluster_meta.current_leader(topic, partition),
+        };
+        // TODO: metadata update last seen epoch if newer
+        self.subscription.borrow_mut().maybe_seek_unvalidated(
+            topic,
+            partition,
+            position,
+            offset_strategy,
+        )
+    }
+
+    fn handle_list_offsets_response(
+        &mut self,
+        response: ListOffsetsResponse,
+    ) -> Result<ListOffsetResult> {
+        let mut fetched_offsets = HashMap::new();
+        let mut partitions_to_retry = HashMap::new();
+        let mut unauthorized_topics = Vec::new();
+
+        for topic in response.topics {
+            let mut list_offset_data = Vec::new();
+            let mut partitions_retry = Vec::new();
+            for partition_response in topic.partitions {
+                let partition = partition_response.partition_index;
+                match partition_response.error_code.err() {
+                    None => {
+                        if !partition_response.old_style_offsets.is_empty() {
+                            // Handle v0 response with offsets
+                            let offset = if partition_response.old_style_offsets.len() > 1 {
+                                let len = partition_response.old_style_offsets.len();
+                                error!("Unexpected partition {partition} response of length {len}");
+                                return Err(Error::Custom(format!(
+                                    "Unexpected partition {partition} response of length {len}"
+                                )));
+                            } else {
+                                partition_response.old_style_offsets[0]
+                            };
+                            debug!(
+                                "Handing v0 ListOffsetResponse response for [{:?} - {}]. Fetched \
+                                 offset {offset}",
+                                &topic.name, partition
+                            );
+                            if offset != UNKNOWN_OFFSET {
+                                list_offset_data.push(ListOffsetData {
+                                    partition,
+                                    offset,
+                                    timestamp: None,
+                                    leader_epoch: None,
+                                });
+                            }
+                        } else {
+                            // Handle v1 and later response or v0 without offsets
+                            debug!(
+                                "Handling ListOffsetResponse response for [{:?} - {}], Fetched \
+                                 offset {}, timestamp {}",
+                                &topic.name,
+                                partition,
+                                partition_response.offset,
+                                partition_response.timestamp
+                            );
+                            if partition_response.offset != UNKNOWN_OFFSET {
+                                let leader_epoch =
+                                    if partition_response.leader_epoch == UNKNOWN_EPOCH {
+                                        None
+                                    } else {
+                                        Some(partition_response.leader_epoch)
+                                    };
+                                list_offset_data.push(ListOffsetData {
+                                    partition,
+                                    offset: partition_response.offset,
+                                    timestamp: Some(partition_response.timestamp),
+                                    leader_epoch,
+                                });
+                            }
+                        }
+                        fetched_offsets.insert(topic.name.clone(), list_offset_data);
+                        break;
+                    }
+                    Some(ResponseError::UnsupportedForMessageFormat) => {
+                        // The message format on the broker side is before 0.10.0, which means it
+                        // does not support timestamps. We treat this case
+                        // the same as if we weren't able to find an
+                        // offset corresponding to the requested timestamp and leave it out of the
+                        // result.
+                        debug!(
+                            "Cannot search by timestamp for [{:?} - {}] because the message \
+                             format version is before 0.10.0",
+                            &topic.name, partition
+                        );
+                        break;
+                    }
+                    Some(
+                        error @ ResponseError::NotLeaderOrFollower
+                        | error @ ResponseError::ReplicaNotAvailable
+                        | error @ ResponseError::OffsetNotAvailable
+                        | error @ ResponseError::KafkaStorageError
+                        | error @ ResponseError::LeaderNotAvailable
+                        | error @ ResponseError::FencedLeaderEpoch
+                        | error @ ResponseError::UnknownLeaderEpoch,
+                    ) => {
+                        debug!(
+                            "Attempt to fetch offsets for [{:?} - {}] failed due to {}, retrying.",
+                            &topic.name, partition, error
+                        );
+                        partitions_retry.push(partition);
+                    }
+                    Some(ResponseError::UnknownTopicOrPartition) => {
+                        warn!(
+                            "Received unknown topic or partition error in ListOffset request for \
+                             partition [{:?} - {}]",
+                            &topic.name, partition
+                        );
+                        partitions_retry.push(partition);
+                    }
+                    Some(ResponseError::TopicAuthorizationFailed) => {
+                        unauthorized_topics.push(topic.name.clone());
+                    }
+                    Some(error) => {
+                        warn!(
+                            "Attempt to fetch offsets for [{:?} - {}] failed due to unexpected \
+                             exception: {}, retrying.",
+                            &topic.name, partition, error
+                        );
+                        partitions_retry.push(partition);
+                    }
+                }
+            }
+            partitions_to_retry.insert(topic.name, partitions_retry);
+        }
+
+        if !unauthorized_topics.is_empty() {
+            Err(Error::TopicAuthorizationError {
+                topics: unauthorized_topics,
+            })
+        } else {
+            Ok(ListOffsetResult {
+                fetched_offsets,
+                partitions_to_retry,
+            })
+        }
+    }
+
     fn group_list_offsets_request(
         &self,
-        mut offset_reset_timestamps: HashMap<TopicName, Vec<(PartitionId, i64)>>,
+        offset_reset_timestamps: &mut HashMap<TopicName, HashMap<PartitionId, i64>>,
         version: u16,
-    ) -> Result<HashMap<NodeId, ListOffsetsRequest>> {
+    ) -> Result<HashMap<Node, ListOffsetsRequest>> {
         let mut node_request = HashMap::new();
         for node_entry in self.client.cluster_meta.nodes.iter() {
             if let Ok(node_topology) = self.client.cluster_meta.drain_node(node_entry.value().id) {
@@ -232,7 +407,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                         let timestamps = partition_timestamps
                             .iter()
                             .filter(|(p, _)| partitions.contains(p))
-                            .copied()
+                            .map(|(p, t)| (*p, *t))
                             .collect::<Vec<(PartitionId, i64)>>();
 
                         topics.insert(topic, timestamps);
@@ -243,7 +418,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                     .borrow_mut()
                     .set_next_allowed_retry(&topics, self.timestamp + self.request_timeout_ms);
                 let request = self.list_offsets_builder(topics, version)?;
-                node_request.insert(*node_entry.key(), request);
+                node_request.insert(node_entry.value().clone(), request);
             }
         }
         Ok(node_request)
@@ -253,16 +428,16 @@ impl<Exe: Executor> Fetcher<Exe> {
         &self,
         topic: &TopicName,
         partitions: Vec<PartitionId>,
-    ) -> Vec<(PartitionId, i64)> {
+    ) -> HashMap<PartitionId, i64> {
         let reset_strategies = self
             .subscription
             .borrow()
             .offset_reset_strategy(topic, partitions);
-        let mut timestamps = Vec::with_capacity(reset_strategies.len());
+        let mut timestamps = HashMap::with_capacity(reset_strategies.len());
         for (partition, strategy) in reset_strategies {
             let timestamp = strategy.strategy_timestamp();
             if timestamp != 0 {
-                timestamps.push((partition, timestamp));
+                timestamps.insert(partition, timestamp);
             }
         }
         timestamps
@@ -470,4 +645,18 @@ impl FetchSession {
 pub struct FetchedRecords {
     partition: PartitionId,
     records: Vec<Record>,
+}
+
+struct ListOffsetResult {
+    fetched_offsets: HashMap<TopicName, Vec<ListOffsetData>>,
+    partitions_to_retry: HashMap<TopicName, Vec<PartitionId>>,
+}
+
+/// Represents data about an offset returned by a broker.
+struct ListOffsetData {
+    partition: i32,
+    offset: i64,
+    // None if the broker does not support returning timestamps
+    timestamp: Option<i64>,
+    leader_epoch: Option<i32>,
 }
