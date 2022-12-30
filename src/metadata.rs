@@ -98,20 +98,22 @@ pub struct TopicPartition {
     pub partition: PartitionId,
 }
 
+impl TopicPartition {
+    pub fn new(topic: TopicName, partition: PartitionId) -> Self {
+        Self { topic, partition }
+    }
+}
+
 #[derive(Debug, Clone, Default, Eq, PartialEq, Hash)]
 pub struct Node {
     pub id: NodeId,
-    pub host: String,
-    pub port: u16,
     address: String,
 }
 
 impl Node {
-    pub fn new(id: NodeId, host: String, port: u16) -> Self {
+    pub fn new(id: BrokerId, host: StrBytes, port: i32) -> Self {
         Self {
-            id,
-            host: host.clone(),
-            port,
+            id: id.0,
             address: format!("{host}:{port}"),
         }
     }
@@ -123,7 +125,7 @@ impl Node {
 
 impl From<(&BrokerId, &MetadataResponseBroker)> for Node {
     fn from((id, broker): (&BrokerId, &MetadataResponseBroker)) -> Self {
-        Node::new(id.0, broker.host.to_string(), broker.port as u16)
+        Node::new(id.clone(), broker.host.clone(), broker.port)
     }
 }
 

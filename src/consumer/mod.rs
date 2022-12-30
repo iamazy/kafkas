@@ -101,13 +101,28 @@ impl SubscriptionState {
     }
 
     fn partitions_need_reset(&self, now: i64) -> HashMap<TopicName, Vec<PartitionId>> {
+        self.collection_partitions(|state| {
+            matches!(state.fetch_state, FetchState::AwaitReset)
+                && !state.awaiting_retry_backoff(now)
+        })
+    }
+
+    fn partitions_need_validation(&self, now: i64) -> HashMap<TopicName, Vec<PartitionId>> {
+        self.collection_partitions(|state| {
+            matches!(state.fetch_state, FetchState::AwaitValidation)
+                && !state.awaiting_retry_backoff(now)
+        })
+    }
+
+    fn collection_partitions<F>(&self, func: F) -> HashMap<TopicName, Vec<PartitionId>>
+    where
+        F: Fn(&TopicPartitionState) -> bool,
+    {
         let mut topics = HashMap::new();
         for (topic, partition_states) in self.assignments.iter() {
             let mut partitions = Vec::new();
             for partition_state in partition_states {
-                if matches!(partition_state.fetch_state, FetchState::AwaitReset)
-                    && !partition_state.awaiting_retry_backoff(now)
-                {
+                if func(partition_state) {
                     partitions.push(partition_state.partition);
                 }
             }
@@ -201,13 +216,13 @@ impl SubscriptionState {
                 debug!("Skipping reset of [{topic:?} - {partition}] since it is no longer needed");
             } else if partition_state.offset_strategy != offset_strategy {
                 debug!(
-                    "Skipping reset of partition [{topic:?} - {partition}] since an alternative \
-                     reset has been requested"
+                    "Skipping reset of topic [{topic:?} - {partition}] since an alternative reset \
+                     has been requested"
                 );
             } else {
                 info!(
-                    "Resetting offset for partition [{topic:?} - {partition}] to position {}.",
-                    position.offset
+                    "Resetting offset for topic [{} - {partition}] to position {}.",
+                    topic.0, position.offset
                 );
                 partition_state.seek_unvalidated(position)?;
             }
@@ -285,6 +300,13 @@ impl TopicPartitionState {
         self.transition_state(FetchState::Fetching, |state| {
             state.position = position;
             state.offset_strategy = OffsetResetStrategy::None;
+            state.next_retry_time_ms = None;
+        })
+    }
+
+    fn reset(&mut self, strategy: OffsetResetStrategy) -> Result<()> {
+        self.transition_state(FetchState::AwaitReset, |state| {
+            state.offset_strategy = strategy;
             state.next_retry_time_ms = None;
         })
     }

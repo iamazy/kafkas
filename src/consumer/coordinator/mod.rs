@@ -62,13 +62,13 @@ macro_rules! offset_fetch_block {
                                 Some(partition.committed_leader_epoch);
 
                             debug!(
-                                "fetch partition {} offset success, offset: {}",
+                                "Fetch partition {} offset success, offset: {}",
                                 partition.partition_index, partition.committed_offset
                             );
                         }
                     } else {
                         error!(
-                            "failed to fetch offset for partition {}, error: {}",
+                            "Failed to fetch offset for partition {}, error: {}",
                             partition.partition_index,
                             partition.error_code.err().unwrap()
                         );
@@ -113,7 +113,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         let node = Self::find_coordinator(&client, group_id.clone()).await?;
 
         info!(
-            "find coordinator success, group {:?}, node: {:?}",
+            "Find coordinator success, group {:?}, node: {:?}",
             group_id, node
         );
 
@@ -139,20 +139,20 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             if find_coordinator_response.error_code.is_ok() {
                 if let Some(coordinator) = find_coordinator_response.coordinators.pop() {
                     Ok(Node::new(
-                        coordinator.node_id.0,
-                        coordinator.host.to_string(),
-                        coordinator.port as u16,
+                        coordinator.node_id,
+                        coordinator.host,
+                        coordinator.port,
                     ))
                 } else {
                     Ok(Node::new(
-                        find_coordinator_response.node_id.0,
-                        find_coordinator_response.host.to_string(),
-                        find_coordinator_response.port as u16,
+                        find_coordinator_response.node_id,
+                        find_coordinator_response.host,
+                        find_coordinator_response.port,
                     ))
                 }
             } else {
                 error!(
-                    "find coordinator error: {}, message: {:?}",
+                    "Find coordinator error: {}, message: {:?}",
                     find_coordinator_response.error_code.err().unwrap(),
                     find_coordinator_response.error_message
                 );
@@ -177,7 +177,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 .await?;
             for group in describe_groups_response.groups {
                 if group.error_code.is_err() {
-                    error!("describe group {:?} failed", group.group_id);
+                    error!("Describe group {:?} failed", group.group_id);
                 }
             }
             Ok(())
@@ -198,7 +198,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 Some(ResponseError::MemberIdRequired) => {
                     self.group_meta.member_id = join_group_response.member_id;
                     warn!(
-                        "join group with unknown member id, will rejoin group [{}] with member \
+                        "Join group with unknown member id, will rejoin group [{}] with member \
                          id: {}",
                         self.group_meta.group_id.0, self.group_meta.member_id
                     );
@@ -216,7 +216,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                     self.group_subscription = group_subscription;
 
                     info!(
-                        "join group [{}] success, leader = {}, member_id = {}, generation_id = {}",
+                        "Join group [{}] success, leader = {}, member_id = {}, generation_id = {}",
                         self.group_meta.group_id.0,
                         self.group_meta.leader,
                         self.group_meta.member_id,
@@ -240,18 +240,18 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             for member in leave_group_response.members {
                 if member.error_code.is_ok() {
                     debug!(
-                        "member {} leave group {:?} success.",
+                        "Member {} leave group {:?} success.",
                         member.member_id, self.group_meta.group_id
                     );
                 } else {
                     error!(
-                        "member {} leave group {:?} failed.",
+                        "Member {} leave group {:?} failed.",
                         member.member_id, self.group_meta.group_id
                     );
                 }
             }
             info!(
-                "leave group {:?} success, member: {}",
+                "Leave group {:?} success, member: {}",
                 self.group_meta.group_id, self.group_meta.member_id
             );
             Ok(())
@@ -291,7 +291,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                         .insert(topic, partition_states);
                 }
                 info!(
-                    "sync group [{}] success, leader = {}, member_id = {}, generation_id = {}, \
+                    "Sync group [{}] success, leader = {}, member_id = {}, generation_id = {}, \
                      protocol_type = {:?}, protocol_name = {:?}",
                     self.group_meta.group_id.0,
                     self.group_meta.leader,
@@ -346,7 +346,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 for partition in topic.partitions {
                     if !partition.error_code.is_ok() {
                         error!(
-                            "failed to commit offset for partition {}",
+                            "Failed to commit offset for partition {}",
                             partition.partition_index
                         );
                     }
@@ -366,7 +366,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 .await?;
             if heartbeat_response.error_code.is_ok() {
                 debug!(
-                    "heartbeat success, group: {}, member: {}",
+                    "Heartbeat success, group: {}, member: {}",
                     self.group_meta.group_id.0, self.group_meta.member_id
                 );
                 Ok(())

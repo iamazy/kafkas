@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<Error>> {
     options.client_id("app");
     let kafka_client = Kafka::new("127.0.0.1:9092", options, None, None, TokioExecutor).await?;
 
-    // produce(kafka_client).await?;
+    produce(kafka_client.clone()).await?;
 
     let mut coordinator = ConsumerCoordinator::new(kafka_client.clone(), "app").await?;
     coordinator.subscribe(topic_name("kafka")).await?;
@@ -49,6 +49,8 @@ async fn main() -> Result<(), Box<Error>> {
         Local::now().timestamp(),
         coordinator.subscriptions.clone(),
     );
+    fetcher.fetch().await?;
+    fetcher.reset_offset().await?;
     fetcher.fetch().await?;
     Ok(())
 }
@@ -110,7 +112,7 @@ async fn produce<Exe: Executor>(client: Kafka<Exe>) -> Result<(), Box<Error>> {
 
     let now = Instant::now();
     let topic = topic_name("kafka");
-    for _ in 0..10000_0000 {
+    for _ in 0..10 {
         let record = TestData::new("hello kafka");
         let ret = producer.send(&topic, record).await?;
         let _ = tx.send(ret).await;

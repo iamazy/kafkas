@@ -99,15 +99,17 @@ impl<Exe: Executor> Fetcher<Exe> {
                             &fetchable_topic.topic
                         };
 
+                        let default_offset_strategy =
+                            self.subscription.borrow().default_offset_strategy;
                         if let Some(partition_states) =
                             self.subscription.borrow_mut().assignments.get_mut(topic)
                         {
                             for partition in fetchable_topic.partitions {
-                                if partition.error_code.is_ok() {
-                                    if let Some(partition_state) = partition_states
-                                        .iter_mut()
-                                        .find(|p| p.partition == partition.partition_index)
-                                    {
+                                if let Some(partition_state) = partition_states
+                                    .iter_mut()
+                                    .find(|p| p.partition == partition.partition_index)
+                                {
+                                    if partition.error_code.is_ok() {
                                         partition_state.last_stable_offset =
                                             partition.last_stable_offset;
                                         partition_state.log_start_offset =
@@ -139,13 +141,15 @@ impl<Exe: Executor> Fetcher<Exe> {
                                             };
                                             self.completed_fetch.push_back(fetched_records);
                                         }
+                                    } else {
+                                        error!(
+                                            "Fetch topic [{} - {}] error: {}",
+                                            topic.0,
+                                            partition.partition_index,
+                                            partition.error_code.err().unwrap()
+                                        );
+                                        partition_state.reset(default_offset_strategy)?;
                                     }
-                                } else {
-                                    error!(
-                                        "fetch partition {} error: {}",
-                                        partition.partition_index,
-                                        partition.error_code.err().unwrap()
-                                    );
                                 }
                             }
                         }
@@ -173,12 +177,57 @@ impl<Exe: Executor> Fetcher<Exe> {
         }
     }
 
-    // pub async fn list_offsets(&self) -> Result<()> {
-    //     if let Some(version_range) = self.client.version_range(ApiKey::ListOffsetsKey) {
-    //     } else {
-    //         Err(Error::InvalidApiRequest(ApiKey::ListOffsetsKey))
-    //     }
-    // }
+    pub async fn reset_offset(&mut self) -> Result<()> {
+        if let Some(version_range) = self.client.version_range(ApiKey::ListOffsetsKey) {
+            let version = version_range.max;
+            let topics = self
+                .subscription
+                .borrow()
+                .partitions_need_reset(self.timestamp);
+            if topics.is_empty() {
+                return Ok(());
+            }
+
+            let mut offset_reset_timestamps = HashMap::new();
+            for (topic, partitions) in topics {
+                let timestamps = self.offset_reset_strategy_timestamp(&topic, partitions);
+                offset_reset_timestamps.insert(topic, timestamps);
+            }
+
+            let requests =
+                self.group_list_offsets_request(&mut offset_reset_timestamps, version)?;
+            for (node, request) in requests {
+                let response = self.client.list_offsets(&node, request).await?;
+                let list_offset_result = self.handle_list_offsets_response(response)?;
+                if !list_offset_result.partitions_to_retry.is_empty() {
+                    self.subscription.borrow_mut().request_failed(
+                        list_offset_result.partitions_to_retry,
+                        self.timestamp + self.retry_backoff_ms,
+                    );
+                    // TODO: metadata request update
+                }
+
+                for (topic, offsets) in list_offset_result.fetched_offsets {
+                    if let Some(partition_timestamp) = offset_reset_timestamps.get(&topic) {
+                        for offset in offsets {
+                            if let Some(timestamp) = partition_timestamp.get(&offset.partition) {
+                                self.reset_offset_if_needed(
+                                    &topic,
+                                    offset.partition,
+                                    OffsetResetStrategy::from_timestamp(*timestamp),
+                                    offset,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        } else {
+            Err(Error::InvalidApiRequest(ApiKey::ListOffsetsKey))
+        }
+    }
 }
 
 impl<Exe: Executor> Fetcher<Exe> {
@@ -191,52 +240,6 @@ impl<Exe: Executor> Fetcher<Exe> {
         } else {
             Uuid::nil()
         }
-    }
-
-    async fn reset_offset(&mut self, version: u16) -> Result<()> {
-        let topics = self
-            .subscription
-            .borrow()
-            .partitions_need_reset(self.timestamp);
-        if topics.is_empty() {
-            return Ok(());
-        }
-
-        let mut offset_reset_timestamps = HashMap::new();
-        for (topic, partitions) in topics {
-            let timestamps = self.offset_reset_strategy_timestamp(&topic, partitions);
-            offset_reset_timestamps.insert(topic, timestamps);
-        }
-
-        let requests = self.group_list_offsets_request(&mut offset_reset_timestamps, version)?;
-        for (node, request) in requests {
-            let response = self.client.list_offsets(&node, request).await?;
-            let list_offset_result = self.handle_list_offsets_response(response)?;
-            if !list_offset_result.partitions_to_retry.is_empty() {
-                self.subscription.borrow_mut().request_failed(
-                    list_offset_result.partitions_to_retry,
-                    self.timestamp + self.retry_backoff_ms,
-                );
-                // TODO: metadata request update
-            }
-
-            for (topic, offsets) in list_offset_result.fetched_offsets {
-                if let Some(partition_timestamp) = offset_reset_timestamps.get(&topic) {
-                    for offset in offsets {
-                        if let Some(timestamp) = partition_timestamp.get(&offset.partition) {
-                            self.reset_offset_if_needed(
-                                &topic,
-                                offset.partition,
-                                OffsetResetStrategy::from_timestamp(*timestamp),
-                                offset,
-                            )?;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     fn reset_offset_if_needed(
@@ -302,9 +305,9 @@ impl<Exe: Executor> Fetcher<Exe> {
                         } else {
                             // Handle v1 and later response or v0 without offsets
                             debug!(
-                                "Handling ListOffsetResponse response for [{:?} - {}], Fetched \
+                                "Handling ListOffsetResponse response for [{} - {}], Fetched \
                                  offset {}, timestamp {}",
-                                &topic.name,
+                                topic.name.0,
                                 partition,
                                 partition_response.offset,
                                 partition_response.timestamp
@@ -334,9 +337,9 @@ impl<Exe: Executor> Fetcher<Exe> {
                         // offset corresponding to the requested timestamp and leave it out of the
                         // result.
                         debug!(
-                            "Cannot search by timestamp for [{:?} - {}] because the message \
-                             format version is before 0.10.0",
-                            &topic.name, partition
+                            "Cannot search by timestamp for [{} - {}] because the message format \
+                             version is before 0.10.0",
+                            topic.name.0, partition
                         );
                         break;
                     }
@@ -350,16 +353,16 @@ impl<Exe: Executor> Fetcher<Exe> {
                         | error @ ResponseError::UnknownLeaderEpoch,
                     ) => {
                         debug!(
-                            "Attempt to fetch offsets for [{:?} - {}] failed due to {}, retrying.",
-                            &topic.name, partition, error
+                            "Attempt to fetch offsets for [{} - {}] failed due to {}, retrying.",
+                            topic.name.0, partition, error
                         );
                         partitions_retry.push(partition);
                     }
                     Some(ResponseError::UnknownTopicOrPartition) => {
                         warn!(
                             "Received unknown topic or partition error in ListOffset request for \
-                             partition [{:?} - {}]",
-                            &topic.name, partition
+                             partition [{} - {}]",
+                            topic.name.0, partition
                         );
                         partitions_retry.push(partition);
                     }
@@ -368,9 +371,9 @@ impl<Exe: Executor> Fetcher<Exe> {
                     }
                     Some(error) => {
                         warn!(
-                            "Attempt to fetch offsets for [{:?} - {}] failed due to unexpected \
+                            "Attempt to fetch offsets for [{} - {}] failed due to unexpected \
                              exception: {}, retrying.",
-                            &topic.name, partition, error
+                            topic.name.0, partition, error
                         );
                         partitions_retry.push(partition);
                     }
@@ -394,7 +397,7 @@ impl<Exe: Executor> Fetcher<Exe> {
     fn group_list_offsets_request(
         &self,
         offset_reset_timestamps: &mut HashMap<TopicName, HashMap<PartitionId, i64>>,
-        version: u16,
+        version: i16,
     ) -> Result<HashMap<Node, ListOffsetsRequest>> {
         let mut node_request = HashMap::new();
         for node_entry in self.client.cluster_meta.nodes.iter() {
@@ -482,8 +485,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                     }
 
                     debug!(
-                        "fetch topic [{}] partition {} for records with offset: {}, \
-                         log_start_offset: {}",
+                        "Fetch topic [{} - {}] for records with offset: {}, log_start_offset: {}",
                         topic_name.0,
                         partition.partition,
                         partition.fetch_offset,
@@ -541,7 +543,7 @@ impl<Exe: Executor> Fetcher<Exe> {
     pub fn list_offsets_builder(
         &self,
         assignments: HashMap<&TopicName, Vec<(PartitionId, i64)>>,
-        version: u16,
+        version: i16,
     ) -> Result<ListOffsetsRequest> {
         let mut topics = Vec::new();
         for (topic_name, partition_list) in assignments {
