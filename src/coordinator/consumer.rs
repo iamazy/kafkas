@@ -16,25 +16,32 @@ use kafka_protocol::{
             OffsetFetchRequestGroup, OffsetFetchRequestTopic, OffsetFetchRequestTopics,
         },
         sync_group_request::SyncGroupRequestAssignment,
-        ApiKey, ConsumerProtocolAssignment, DescribeGroupsRequest,
-        HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest, OffsetCommitRequest,
-        OffsetFetchRequest, SyncGroupRequest, TopicName,
+        ApiKey, ConsumerProtocolAssignment, DescribeGroupsRequest, HeartbeatRequest,
+        JoinGroupRequest, LeaveGroupRequest, OffsetCommitRequest, OffsetFetchRequest,
+        SyncGroupRequest, TopicName,
     },
     protocol::{Message, StrBytes},
     ResponseError,
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{client::Kafka, consumer::{
-    partition_assignor::{
-        Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, RangeAssignor,
-        Subscription,
+use crate::{
+    client::Kafka,
+    consumer::{
+        partition_assignor::{
+            Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, RangeAssignor,
+            Subscription,
+        },
+        ConsumerGroupMetadata, RebalanceOptions, SubscriptionState, TopicPartitionState,
     },
-    ConsumerGroupMetadata, RebalanceOptions, SubscriptionState, TopicPartitionState,
-}, error::{ConsumeError, Result}, executor::Executor, metadata::Node, to_version_prefixed_bytes, Error, ToStrBytes, MemberId};
-use crate::coordinator::{CoordinatorType, find_coordinator};
+    coordinator::{find_coordinator, CoordinatorType},
+    error::{ConsumeError, Result},
+    executor::Executor,
+    metadata::Node,
+    to_version_prefixed_bytes, Error, MemberId, ToStrBytes,
+};
 
-const PROTOCOL_TYPE: &str = "consumer";
+const CONSUMER_PROTOCOL_TYPE: &str = "consumer";
 
 macro_rules! offset_fetch_block {
     ($self:ident, $source:ident) => {
@@ -56,8 +63,8 @@ macro_rules! offset_fetch_block {
                                 Some(partition.committed_leader_epoch);
 
                             debug!(
-                                "Fetch partition {} offset success, offset: {}",
-                                partition.partition_index, partition.committed_offset
+                                "Fetch topic [{} - {}] offset success, offset: {}",
+                                topic.name.0, partition.partition_index, partition.committed_offset
                             );
                         }
                     } else {
@@ -89,7 +96,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     pub async fn new<S: AsRef<str>>(client: Kafka<Exe>, group_id: S) -> Result<Self> {
         let group_id = group_id.as_ref().to_string().to_str_bytes();
 
-        let node = find_coordinator(&client,group_id.clone(), CoordinatorType::Group).await?;
+        let node = find_coordinator(&client, group_id.clone(), CoordinatorType::Group).await?;
 
         info!(
             "Find coordinator success, group {:?}, node: {:?}",
@@ -132,7 +139,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         }
     }
 
-    #[async_recursion::async_recursion(? Send)]
+    #[async_recursion::async_recursion(?Send)]
     pub async fn join_group(&mut self) -> Result<()> {
         if let Some(version_range) = self.client.version_range(ApiKey::JoinGroupKey) {
             let join_group_response = self
@@ -330,7 +337,6 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 
 /// for request builder and response handler
 impl<Exe: Executor> ConsumerCoordinator<Exe> {
-
     fn join_group_protocol(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
         let mut topics = HashSet::with_capacity(self.subscriptions.borrow().topics.len());
         self.subscriptions
@@ -385,7 +391,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         if version <= 9 {
             request.group_id = self.group_meta.group_id.clone();
             request.member_id = self.group_meta.member_id.clone();
-            request.protocol_type = PROTOCOL_TYPE.to_string().to_str_bytes();
+            request.protocol_type = StrBytes::from_str(CONSUMER_PROTOCOL_TYPE);
             request.protocols = self.join_group_protocol()?;
             request.session_timeout_ms = self.rebalance_options.session_timeout_ms;
             if version >= 1 {

@@ -20,9 +20,6 @@ use crate::{
     NodeId, NodeRef, PartitionId, PartitionRef,
 };
 
-pub(crate) const GROUP_METADATA_TOPIC_NAME: &str = "__consumer_offsets";
-pub(crate) const TRANSACTION_STATE_TOPIC_NAME: &str = "__transaction_state";
-
 #[derive(Debug, Clone, Default)]
 pub struct Topic {
     pub id: Uuid,
@@ -125,7 +122,7 @@ impl Node {
 
 impl From<(&BrokerId, &MetadataResponseBroker)> for Node {
     fn from((id, broker): (&BrokerId, &MetadataResponseBroker)) -> Self {
-        Node::new(id.clone(), broker.host.clone(), broker.port)
+        Node::new(*id, broker.host.clone(), broker.port)
     }
 }
 

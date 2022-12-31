@@ -108,7 +108,7 @@ impl std::fmt::Display for Error {
                 write!(f, "Topic not available, topic: {topic:?}")
             }
             Error::TopicAuthorizationError { topics } => {
-                write!(f, "Topic Authorization Error, topics: {:?}", topics)
+                write!(f, "Topic Authorization Error, topics: {topics:?}")
             }
             Error::NodeNotAvailable { node } => {
                 write!(f, "Node not available, node: {node:?}")

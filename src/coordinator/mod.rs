@@ -1,15 +1,20 @@
 mod consumer;
 
-use kafka_protocol::error::ParseResponseErrorCode;
-use kafka_protocol::messages::{ApiKey, FindCoordinatorRequest};
-use kafka_protocol::protocol::StrBytes;
-use tracing::error;
 pub use consumer::ConsumerCoordinator;
-use crate::client::Kafka;
-use crate::Error;
-use crate::error::{ConsumeError, Result};
-use crate::executor::Executor;
-use crate::metadata::Node;
+use kafka_protocol::{
+    error::ParseResponseErrorCode,
+    messages::{ApiKey, FindCoordinatorRequest},
+    protocol::StrBytes,
+};
+use tracing::error;
+
+use crate::{
+    client::Kafka,
+    error::{ConsumeError, Result},
+    executor::Executor,
+    metadata::Node,
+    Error,
+};
 
 pub mod transaction;
 
@@ -28,7 +33,11 @@ impl From<CoordinatorType> for i8 {
     }
 }
 
-async fn find_coordinator<Exe: Executor>(client: &Kafka<Exe>, key: StrBytes, key_type: CoordinatorType) -> Result<Node> {
+async fn find_coordinator<Exe: Executor>(
+    client: &Kafka<Exe>,
+    key: StrBytes,
+    key_type: CoordinatorType,
+) -> Result<Node> {
     if let Some(version_range) = client.version_range(ApiKey::FindCoordinatorKey) {
         let mut find_coordinator_response = client
             .find_coordinator(find_coordinator_builder(key, key_type, version_range.max)?)
@@ -50,10 +59,10 @@ async fn find_coordinator<Exe: Executor>(client: &Kafka<Exe>, key: StrBytes, key
             }
         } else {
             error!(
-                    "Find coordinator error: {}, message: {:?}",
-                    find_coordinator_response.error_code.err().unwrap(),
-                    find_coordinator_response.error_message
-                );
+                "Find coordinator error: {}, message: {:?}",
+                find_coordinator_response.error_code.err().unwrap(),
+                find_coordinator_response.error_message
+            );
             Err(ConsumeError::CoordinatorNotAvailable.into())
         }
     } else {
@@ -61,7 +70,11 @@ async fn find_coordinator<Exe: Executor>(client: &Kafka<Exe>, key: StrBytes, key
     }
 }
 
-fn find_coordinator_builder(key: StrBytes, key_type: CoordinatorType, version: i16) -> Result<FindCoordinatorRequest> {
+fn find_coordinator_builder(
+    key: StrBytes,
+    key_type: CoordinatorType,
+    version: i16,
+) -> Result<FindCoordinatorRequest> {
     let mut request = FindCoordinatorRequest::default();
     if version <= 3 {
         request.key = key;

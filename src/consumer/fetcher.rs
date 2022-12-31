@@ -116,6 +116,16 @@ impl<Exe: Executor> Fetcher<Exe> {
                                             partition.log_start_offset;
                                         partition_state.high_water_mark = partition.high_watermark;
 
+                                        debug!(
+                                            "Fetch topic [{} - {}] success, last stable offset: \
+                                             {}, log start offset: {}, high_water_mark: {}",
+                                            topic.0,
+                                            partition.partition_index,
+                                            partition.last_stable_offset,
+                                            partition.log_start_offset,
+                                            partition.high_watermark
+                                        );
+
                                         // decode record batch
                                         if let Some(mut records) = partition.records {
                                             let records = RecordBatchDecoder::decode(&mut records)?;
@@ -128,8 +138,8 @@ impl<Exe: Executor> Fetcher<Exe> {
                                             }
 
                                             debug!(
-                                                "fetch records of topic [{}] in partition {} \
-                                                 success, records size: {}",
+                                                "Fetch topic [{} - {}] records success, records \
+                                                 size: {}",
                                                 topic.0,
                                                 partition.partition_index,
                                                 records.len()
@@ -485,11 +495,14 @@ impl<Exe: Executor> Fetcher<Exe> {
                     }
 
                     debug!(
-                        "Fetch topic [{} - {}] for records with offset: {}, log_start_offset: {}",
+                        "Fetch topic [{} - {}] records with offset: {}, log_start_offset: {}, \
+                         current leader epoch: {}, last fetched epoch: {}",
                         topic_name.0,
                         partition.partition,
                         partition.fetch_offset,
-                        partition.log_start_offset
+                        partition.log_start_offset,
+                        partition.current_leader_epoch,
+                        partition.last_fetched_epoch
                     );
                     partitions.push(partition);
                 }
