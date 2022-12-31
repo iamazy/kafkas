@@ -45,7 +45,7 @@ pub mod aggregator;
 pub mod batch;
 pub mod partitioner;
 
-pub struct SendFuture(pub(crate) oneshot::Receiver<Result<RecordMetadata>>);
+pub struct SendFuture(pub oneshot::Receiver<Result<RecordMetadata>>);
 
 impl Future for SendFuture {
     type Output = Result<RecordMetadata>;

@@ -517,10 +517,7 @@ pub struct KafkaRequest {
 }
 
 impl KafkaRequest {
-    pub(crate) fn new(
-        serial_id: i32,
-        request: RequestKind,
-    ) -> Result<KafkaRequest, ConnectionError> {
+    pub fn new(serial_id: i32, request: RequestKind) -> Result<KafkaRequest, ConnectionError> {
         let key = request_key(&request);
         let header = RequestHeader {
             request_api_key: key,

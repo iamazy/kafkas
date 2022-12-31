@@ -9,7 +9,10 @@ use kafka_protocol::{
 };
 use tracing::{debug, info};
 
-use crate::{Error, NodeId, PartitionId, Result};
+use crate::{
+    client::Kafka, consumer::fetcher::Fetcher, coordinator::ConsumerCoordinator,
+    executor::Executor, Error, NodeId, PartitionId, Result,
+};
 
 /// High-level consumer record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -483,4 +486,10 @@ impl From<IsolationLevel> for i8 {
             IsolationLevel::ReadUncommitted => 0,
         }
     }
+}
+
+pub struct Consumer<Exe: Executor> {
+    client: Kafka<Exe>,
+    coordinator: ConsumerCoordinator<Exe>,
+    fetcher: Fetcher<Exe>,
 }

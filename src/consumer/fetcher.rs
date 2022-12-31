@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
 };
+use std::fmt::{Display, Formatter};
 
 use dashmap::DashMap;
 use kafka_protocol::{
@@ -15,7 +16,8 @@ use kafka_protocol::{
     records::{Record, RecordBatchDecoder, NO_PARTITION_LEADER_EPOCH},
     ResponseError,
 };
-use tracing::{debug, error, warn};
+use kafka_protocol::messages::FetchResponse;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -590,15 +592,38 @@ impl<Exe: Executor> Fetcher<Exe> {
     }
 }
 
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, Copy, Hash)]
 pub struct FetchMetadata {
     session_id: i32,
     epoch: i32,
 }
 
+impl Display for FetchMetadata {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.session_id == INVALID_SESSION_ID {
+            write!(f, "(session_id=INVALID, ")?;
+        } else {
+            write!(f, "(session_id={}, ", self.session_id)?;
+        }
+
+        if self.epoch == INITIAL_EPOCH {
+            write!(f, "epoch=INITIAL)")
+        } else if self.epoch == FINAL_EPOCH {
+            write!(f, "epoch=FINAL)")
+        } else {
+            write!(f, "epoch={})", self.epoch)
+        }
+    }
+}
+
 impl FetchMetadata {
-    pub fn new(session_id: i32, epoch: i32) -> FetchMetadata {
+
+    pub fn new(session_id: i32, epoch: i32) -> Self {
         Self { session_id, epoch }
+    }
+
+    pub fn initial() -> Self {
+        Self::new(INVALID_SESSION_ID, INITIAL_EPOCH)
     }
 
     pub fn is_full(&self) -> bool {
@@ -606,17 +631,15 @@ impl FetchMetadata {
     }
 
     pub fn new_incremental(session_id: i32) -> Self {
-        FetchMetadata {
-            session_id,
-            epoch: next_epoch(INITIAL_EPOCH),
-        }
+        Self::new(session_id, next_epoch(INITIAL_EPOCH))
     }
 
     pub fn next_incremental(self) -> Self {
-        FetchMetadata {
-            session_id: self.session_id,
-            epoch: next_epoch(self.epoch),
-        }
+        Self::new(self.session_id, next_epoch(self.epoch))
+    }
+
+    pub fn next_close_existing(self) -> Self {
+        Self::new(self.session_id, INITIAL_EPOCH)
     }
 }
 
@@ -632,13 +655,13 @@ fn next_epoch(prev_epoch: i32) -> i32 {
 
 #[derive(Debug, Clone)]
 pub struct FetchSession {
-    node: i32,
+    node: NodeId,
     next_metadata: FetchMetadata,
     topic_names: HashMap<Uuid, TopicName>,
 }
 
 impl FetchSession {
-    pub fn new(node: i32) -> Self {
+    pub fn new(node: NodeId) -> Self {
         Self {
             node,
             next_metadata: FetchMetadata {
@@ -653,6 +676,21 @@ impl FetchSession {
         if topic_id != Uuid::nil() && !topic.is_empty() {
             self.topic_names.insert(topic_id, topic);
         }
+    }
+
+    fn handle_fetch_response(&mut self, response: FetchResponse, version: u16) -> bool {
+        if response.error_code.is_err() {
+            let error = response.error_code.err().unwrap();
+            info!("Node {} was unable to process the fetch request with {}:{}.", self.node, self.next_metadata, error);
+            if error == ResponseError::FetchSessionIdNotFound {
+                self.next_metadata = FetchMetadata::initial();
+            } else {
+                self.next_metadata = self.next_metadata.next_close_existing();
+            }
+            return false;
+        }
+
+        false
     }
 }
 

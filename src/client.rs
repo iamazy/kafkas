@@ -47,9 +47,9 @@ pub trait SerializeMessage {
 
 #[derive(Clone)]
 pub struct Kafka<Exe: Executor> {
-    pub(crate) manager: Arc<ConnectionManager<Exe>>,
-    pub(crate) operation_retry_options: OperationRetryOptions,
-    pub(crate) executor: Arc<Exe>,
+    pub manager: Arc<ConnectionManager<Exe>>,
+    pub operation_retry_options: OperationRetryOptions,
+    pub executor: Arc<Exe>,
     pub cluster_meta: Arc<Cluster>,
     supported_versions: HashMap<i16, VersionRange>,
 }

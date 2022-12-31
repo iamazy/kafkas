@@ -132,12 +132,12 @@ pub struct Cluster {
     pub unauthorized_topics: DashSet<TopicName>,
     pub invalid_topics: DashSet<TopicName>,
     pub internal_topics: DashSet<TopicName>,
-    pub controller: Arc<Mutex<i32>>,
+    pub controller: Arc<Mutex<NodeId>>,
     pub topics: DashMap<TopicName, Topic>,
-    pub nodes: DashMap<i32, Node>,
-    pub available_partitions: DashMap<TopicName, Vec<i32>>,
-    pub partitions: DashMap<TopicName, Vec<i32>>,
-    pub partitions_by_nodes: DashMap<i32, Vec<(TopicName, Vec<i32>)>>,
+    pub nodes: DashMap<NodeId, Node>,
+    pub available_partitions: DashMap<TopicName, Vec<PartitionId>>,
+    pub partitions: DashMap<TopicName, Vec<PartitionId>>,
+    pub partitions_by_nodes: DashMap<NodeId, Vec<(TopicName, Vec<PartitionId>)>>,
 }
 
 impl Cluster {
@@ -243,11 +243,7 @@ impl Cluster {
         })
     }
 
-    pub(crate) fn current_leader(
-        &self,
-        topic: &TopicName,
-        partition: PartitionId,
-    ) -> LeaderAndEpoch {
+    pub fn current_leader(&self, topic: &TopicName, partition: PartitionId) -> LeaderAndEpoch {
         let mut leader_epoch = LeaderAndEpoch::default();
         if let Some(entry) = self.topics.get(topic) {
             if let Some(partition) = entry
