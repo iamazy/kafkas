@@ -6,7 +6,8 @@ use futures::{SinkExt, StreamExt};
 use kafka_protocol::records::TimestampType;
 use kafkas::{
     client::{Kafka, KafkaOptions, SerializeMessage},
-    consumer::{coordinator::ConsumerCoordinator, fetcher::Fetcher},
+    consumer::fetcher::Fetcher,
+    coordinator::ConsumerCoordinator,
     executor::{Executor, TokioExecutor},
     producer::{Producer, ProducerOptions},
     topic_name, Error, Record, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,

@@ -16,7 +16,7 @@ use kafka_protocol::{
             OffsetFetchRequestGroup, OffsetFetchRequestTopic, OffsetFetchRequestTopics,
         },
         sync_group_request::SyncGroupRequestAssignment,
-        ApiKey, ConsumerProtocolAssignment, DescribeGroupsRequest, FindCoordinatorRequest,
+        ApiKey, ConsumerProtocolAssignment, DescribeGroupsRequest,
         HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest, OffsetCommitRequest,
         OffsetFetchRequest, SyncGroupRequest, TopicName,
     },
@@ -25,20 +25,14 @@ use kafka_protocol::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    client::Kafka,
-    consumer::{
-        partition_assignor::{
-            Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, RangeAssignor,
-            Subscription,
-        },
-        ConsumerGroupMetadata, RebalanceOptions, SubscriptionState, TopicPartitionState,
+use crate::{client::Kafka, consumer::{
+    partition_assignor::{
+        Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, RangeAssignor,
+        Subscription,
     },
-    error::{ConsumeError, Result},
-    executor::Executor,
-    metadata::Node,
-    to_version_prefixed_bytes, Error, ToStrBytes,
-};
+    ConsumerGroupMetadata, RebalanceOptions, SubscriptionState, TopicPartitionState,
+}, error::{ConsumeError, Result}, executor::Executor, metadata::Node, to_version_prefixed_bytes, Error, ToStrBytes, MemberId};
+use crate::coordinator::{CoordinatorType, find_coordinator};
 
 const PROTOCOL_TYPE: &str = "consumer";
 
@@ -79,21 +73,6 @@ macro_rules! offset_fetch_block {
     };
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum CoordinatorType {
-    Group,
-    Transaction,
-}
-
-impl From<CoordinatorType> for i8 {
-    fn from(value: CoordinatorType) -> Self {
-        match value {
-            CoordinatorType::Group => 0,
-            CoordinatorType::Transaction => 1,
-        }
-    }
-}
-
 pub struct ConsumerCoordinator<Exe: Executor> {
     client: Kafka<Exe>,
     node: Node,
@@ -110,7 +89,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     pub async fn new<S: AsRef<str>>(client: Kafka<Exe>, group_id: S) -> Result<Self> {
         let group_id = group_id.as_ref().to_string().to_str_bytes();
 
-        let node = Self::find_coordinator(&client, group_id.clone()).await?;
+        let node = find_coordinator(&client,group_id.clone(), CoordinatorType::Group).await?;
 
         info!(
             "Find coordinator success, group {:?}, node: {:?}",
@@ -128,39 +107,6 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             rebalance_options: RebalanceOptions::default(),
             assignors: vec![PartitionAssignor::Range(RangeAssignor)],
         })
-    }
-
-    pub async fn find_coordinator(client: &Kafka<Exe>, key: StrBytes) -> Result<Node> {
-        if let Some(version_range) = client.version_range(ApiKey::FindCoordinatorKey) {
-            let mut find_coordinator_response = client
-                .find_coordinator(Self::find_coordinator_builder(key, version_range.max)?)
-                .await?;
-
-            if find_coordinator_response.error_code.is_ok() {
-                if let Some(coordinator) = find_coordinator_response.coordinators.pop() {
-                    Ok(Node::new(
-                        coordinator.node_id,
-                        coordinator.host,
-                        coordinator.port,
-                    ))
-                } else {
-                    Ok(Node::new(
-                        find_coordinator_response.node_id,
-                        find_coordinator_response.host,
-                        find_coordinator_response.port,
-                    ))
-                }
-            } else {
-                error!(
-                    "Find coordinator error: {}, message: {:?}",
-                    find_coordinator_response.error_code.err().unwrap(),
-                    find_coordinator_response.error_message
-                );
-                Err(ConsumeError::CoordinatorNotAvailable.into())
-            }
-        } else {
-            Err(Error::InvalidApiRequest(ApiKey::FindCoordinatorKey))
-        }
     }
 
     pub async fn subscribe(&self, topic: TopicName) -> Result<()> {
@@ -384,19 +330,6 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 
 /// for request builder and response handler
 impl<Exe: Executor> ConsumerCoordinator<Exe> {
-    fn find_coordinator_builder(key: StrBytes, version: i16) -> Result<FindCoordinatorRequest> {
-        let mut request = FindCoordinatorRequest::default();
-        if version <= 3 {
-            request.key = key;
-        } else {
-            request.coordinator_keys = vec![key];
-        }
-
-        if (1..=4).contains(&version) {
-            request.key_type = CoordinatorType::Group.into();
-        }
-        Ok(request)
-    }
 
     fn join_group_protocol(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
         let mut topics = HashSet::with_capacity(self.subscriptions.borrow().topics.len());
@@ -622,7 +555,7 @@ fn deserialize_member(members: Vec<JoinGroupResponseMember>) -> Result<GroupSubs
 }
 
 fn serialize_assignments(
-    assignments: HashMap<StrBytes, Assignment>,
+    assignments: HashMap<MemberId, Assignment>,
 ) -> Result<Vec<SyncGroupRequestAssignment>> {
     let version = ConsumerProtocolAssignment::VERSIONS.max;
     let mut sync_group_assignments = Vec::with_capacity(assignments.len());

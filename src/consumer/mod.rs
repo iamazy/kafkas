@@ -1,4 +1,3 @@
-pub mod coordinator;
 pub mod fetcher;
 pub mod partition_assignor;
 
@@ -83,9 +82,9 @@ impl Default for RebalanceOptions {
 #[derive(Debug, Clone, Default)]
 pub struct SubscriptionState {
     subscription_type: SubscriptionType,
-    topics: HashSet<TopicName>,
+    pub topics: HashSet<TopicName>,
     default_offset_strategy: OffsetResetStrategy,
-    assignments: HashMap<TopicName, Vec<TopicPartitionState>>,
+    pub assignments: HashMap<TopicName, Vec<TopicPartitionState>>,
 }
 
 impl SubscriptionState {
@@ -257,15 +256,15 @@ pub struct OffsetMetadata {
 
 #[derive(Debug, Clone, Default)]
 pub struct TopicPartitionState {
-    partition: PartitionId,
-    fetch_state: FetchState,
-    position: FetchPosition,
-    high_water_mark: i64,
-    log_start_offset: i64,
-    last_stable_offset: i64,
-    paused: bool,
-    next_retry_time_ms: Option<i64>,
-    offset_strategy: OffsetResetStrategy,
+    pub partition: PartitionId,
+    pub fetch_state: FetchState,
+    pub position: FetchPosition,
+    pub high_water_mark: i64,
+    pub log_start_offset: i64,
+    pub last_stable_offset: i64,
+    pub paused: bool,
+    pub next_retry_time_ms: Option<i64>,
+    pub offset_strategy: OffsetResetStrategy,
 }
 
 impl TopicPartitionState {
@@ -414,9 +413,9 @@ impl Default for FetchState {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FetchPosition {
-    offset: i64,
-    offset_epoch: Option<i32>,
-    current_leader: LeaderAndEpoch,
+    pub offset: i64,
+    pub offset_epoch: Option<i32>,
+    pub current_leader: LeaderAndEpoch,
 }
 
 impl FetchPosition {
@@ -441,20 +440,20 @@ impl FetchPosition {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct LeaderAndEpoch {
-    pub(crate) leader: Option<NodeId>,
-    pub(crate) epoch: Option<i32>,
+pub struct LeaderAndEpoch {
+    pub leader: Option<NodeId>,
+    pub epoch: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConsumerGroupMetadata {
-    group_id: GroupId,
-    generation_id: i32,
-    member_id: StrBytes,
-    leader: StrBytes,
-    group_instance_id: Option<StrBytes>,
-    protocol_name: Option<StrBytes>,
-    protocol_type: Option<StrBytes>,
+    pub group_id: GroupId,
+    pub generation_id: i32,
+    pub member_id: StrBytes,
+    pub leader: StrBytes,
+    pub group_instance_id: Option<StrBytes>,
+    pub protocol_name: Option<StrBytes>,
+    pub protocol_type: Option<StrBytes>,
 }
 
 impl ConsumerGroupMetadata {

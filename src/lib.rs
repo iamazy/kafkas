@@ -11,6 +11,7 @@ pub mod client;
 pub mod connection;
 pub mod connection_manager;
 pub mod consumer;
+pub mod coordinator;
 
 mod error;
 pub use error::{Error, Result};
@@ -28,6 +29,7 @@ pub use producer::ProducerRecord;
 
 pub type NodeId = i32;
 pub type PartitionId = i32;
+pub type MemberId = StrBytes;
 
 const UNKNOWN_OFFSET: i64 = -1;
 const UNKNOWN_TIMESTAMP: i64 = -1;
