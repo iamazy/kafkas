@@ -27,6 +27,8 @@ pub use kafka_protocol::records::{
 };
 pub use producer::ProducerRecord;
 
+use crate::metadata::TopicPartition;
+
 pub type NodeId = i32;
 pub type PartitionId = i32;
 pub type MemberId = StrBytes;
@@ -36,7 +38,7 @@ const UNKNOWN_TIMESTAMP: i64 = -1;
 const UNKNOWN_EPOCH: i32 = NO_PARTITION_LEADER_EPOCH;
 
 pub type PartitionRef<'a> = Ref<'a, TopicName, Vec<PartitionId>>;
-pub type NodeRef<'a> = Ref<'a, NodeId, Vec<(TopicName, Vec<PartitionId>)>>;
+pub type NodeRef<'a> = Ref<'a, NodeId, Vec<TopicPartition>>;
 
 pub trait ToStrBytes {
     fn to_str_bytes(self) -> StrBytes;

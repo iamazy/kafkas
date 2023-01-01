@@ -37,7 +37,7 @@ use crate::{
     coordinator::{find_coordinator, CoordinatorType},
     error::{ConsumeError, Result},
     executor::Executor,
-    metadata::Node,
+    metadata::{Node, TopicPartition},
     to_version_prefixed_bytes, Error, MemberId, ToStrBytes,
 };
 
@@ -233,15 +233,12 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                     Assignment::deserialize_from_bytes(&mut sync_group_response.assignment)?;
                 for (topic, partitions) in assignment.partitions {
                     self.subscriptions.borrow_mut().topics.insert(topic.clone());
-                    let mut partition_states = Vec::with_capacity(partitions.len());
                     for partition in partitions.iter() {
-                        partition_states.push(TopicPartitionState::new(*partition))
+                        self.subscriptions.borrow_mut().raw_assignment.insert(
+                            TopicPartition::new(topic.clone(), *partition),
+                            TopicPartitionState::new(*partition),
+                        );
                     }
-
-                    self.subscriptions
-                        .borrow_mut()
-                        .assignments
-                        .insert(topic, partition_states);
                 }
                 info!(
                     "Sync group [{}] success, leader = {}, member_id = {}, generation_id = {}, \
@@ -492,30 +489,35 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         if version <= 8 {
             request.group_id = self.group_meta.group_id.clone();
 
-            let mut topics = Vec::with_capacity(self.subscriptions.borrow().topics.len());
-            for (topic, partitions) in self.subscriptions.borrow().assignments.iter() {
-                let mut offset_metadata = Vec::with_capacity(partitions.len());
-                for partition_state in partitions {
-                    let partition = OffsetCommitRequestPartition {
-                        partition_index: partition_state.partition,
-                        committed_offset: partition_state.position.offset,
-                        committed_leader_epoch: partition_state.position.offset_epoch.unwrap_or(-1),
-                        commit_timestamp: -1,
-                        ..Default::default()
-                    };
-
-                    offset_metadata.push(partition);
-                }
-
-                let topic = OffsetCommitRequestTopic {
-                    name: topic.clone(),
-                    partitions: offset_metadata,
+            let mut topics: HashMap<TopicName, Vec<OffsetCommitRequestPartition>> =
+                HashMap::with_capacity(self.subscriptions.borrow().topics.len());
+            for (tp, tp_state) in self.subscriptions.borrow().raw_assignment.iter() {
+                let partition = OffsetCommitRequestPartition {
+                    partition_index: tp_state.partition,
+                    committed_offset: tp_state.position.offset,
+                    committed_leader_epoch: tp_state.position.offset_epoch.unwrap_or(-1),
+                    commit_timestamp: -1,
                     ..Default::default()
                 };
-                topics.push(topic);
+
+                if let Some(partitions) = topics.get_mut(&tp.topic) {
+                    partitions.push(partition);
+                } else {
+                    let partitions = vec![partition];
+                    topics.insert(tp.topic.clone(), partitions);
+                }
             }
 
-            request.topics = topics;
+            let mut offset_commit_topics = Vec::with_capacity(topics.len());
+            for (topic, partitions) in topics {
+                offset_commit_topics.push(OffsetCommitRequestTopic {
+                    name: topic,
+                    partitions,
+                    ..Default::default()
+                })
+            }
+
+            request.topics = offset_commit_topics;
 
             if version >= 1 {
                 request.generation_id = self.group_meta.generation_id;

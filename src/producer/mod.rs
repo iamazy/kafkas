@@ -13,7 +13,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use chrono::Local;
-use dashmap::{mapref::multiple::RefMutMulti, DashMap};
+use dashmap::DashMap;
 use futures::{channel::oneshot, StreamExt};
 use fxhash::FxBuildHasher;
 use indexmap::IndexMap;
@@ -38,7 +38,7 @@ use crate::{
         batch::{ProducerBatch, Thunk},
         partitioner::{PartitionSelector, Partitioner, PartitionerSelector, RoundRobinPartitioner},
     },
-    ToStrBytes,
+    ToStrBytes, TopicPartition,
 };
 
 pub mod aggregator;
@@ -336,16 +336,15 @@ impl<Exe: Executor> Producer<Exe> {
         let mut result = Vec::new();
         for node_entry in self.client.cluster_meta.nodes.iter() {
             if let Ok(node_topology) = self.client.cluster_meta.drain_node(node_entry.value().id) {
-                let node_topology = node_topology.value();
+                let partitions = node_topology.value();
                 let mut topic_data = IndexMap::new();
                 let mut topics_thunks = BTreeMap::new();
 
-                for (topic, partitions) in node_topology {
+                for partition in partitions {
                     // flush topic produce data
                     if let Err(e) = self
-                        .flush_topics(
-                            topic,
-                            partitions,
+                        .flush_topic_partition(
+                            partition,
                             &mut topics_thunks,
                             &mut topic_data,
                             encode_options,
@@ -353,8 +352,8 @@ impl<Exe: Executor> Producer<Exe> {
                         .await
                     {
                         error!(
-                            "failed to flush topic produce data, topic: {:?}, error: {}",
-                            topic, e
+                            "failed to flush topic produce data, topic: [{} - {}], error: {}",
+                            partition.topic.0, partition.partition, e
                         );
                     }
                 }
@@ -371,49 +370,57 @@ impl<Exe: Executor> Producer<Exe> {
         Ok(result)
     }
 
-    async fn flush_topics(
+    async fn flush_topic_partition(
         &self,
-        topic: &TopicName,
-        partitions: &[i32],
+        partition: &TopicPartition,
         topics_thunks: &mut BTreeMap<TopicName, PartitionsFlush>,
-        topic_data: &mut IndexMap<TopicName, TopicProduceData>,
+        topics_data: &mut IndexMap<TopicName, TopicProduceData>,
         encode_options: &RecordEncodeOptions,
     ) -> Result<()> {
-        if let Some(producer) = self.producers.get(topic) {
-            let mut partitions_data = Vec::new();
-            let mut partitions_thunks = BTreeMap::new();
+        if let Some(producer) = self.producers.get_mut(&partition.topic) {
+            if let Some(mut batch) = producer.batches.get_mut(&partition.partition) {
+                if let Some((thunks, partition_produce_data)) = self
+                    .flush_partition(batch.value_mut(), encode_options)
+                    .await?
+                {
+                    if let Some(topic_data) = topics_data.get_mut(&partition.topic) {
+                        topic_data.partition_data.push(partition_produce_data);
+                    } else {
+                        let topic_data = vec![partition_produce_data];
+                        topics_data.insert(
+                            partition.topic.clone(),
+                            TopicProduceData {
+                                partition_data: topic_data,
+                                ..Default::default()
+                            },
+                        );
+                    }
 
-            for mut entry in producer.batches.iter_mut() {
-                if partitions.contains(entry.key()) {
-                    if let Some((thunks, partition_produce_data)) =
-                        self.flush_partitions(&mut entry, encode_options).await?
-                    {
-                        partitions_thunks.insert(*entry.key(), thunks);
-                        partitions_data.push(partition_produce_data);
+                    if let Some(topic_thunks) = topics_thunks.get_mut(&partition.topic) {
+                        topic_thunks
+                            .partitions_thunks
+                            .insert(batch.partition, thunks);
+                    } else {
+                        let mut partitions_thunks = BTreeMap::new();
+                        partitions_thunks.insert(partition.partition, thunks);
+                        topics_thunks.insert(
+                            partition.topic.clone(),
+                            PartitionsFlush { partitions_thunks },
+                        );
                     }
                 }
-            }
-            if !partitions_data.is_empty() {
-                let data = TopicProduceData {
-                    partition_data: partitions_data,
-                    ..Default::default()
-                };
-
-                topic_data.insert(topic.clone(), data);
-                topics_thunks.insert(topic.clone(), PartitionsFlush { partitions_thunks });
             }
         }
 
         Ok(())
     }
 
-    async fn flush_partitions(
+    async fn flush_partition(
         &self,
-        entry: &mut RefMutMulti<'_, i32, ProducerBatch, FxBuildHasher>,
+        batch: &mut ProducerBatch,
         encode_options: &RecordEncodeOptions,
     ) -> Result<Option<(Vec<Thunk>, PartitionProduceData)>> {
-        let partition = *entry.key();
-        let batch = entry.value_mut();
+        let partition = batch.partition;
         let (thunks, records) = batch.flush()?;
         if !records.is_empty() {
             let mut buf = BytesMut::new();

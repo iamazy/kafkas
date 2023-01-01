@@ -1,7 +1,7 @@
 pub mod fetcher;
 pub mod partition_assignor;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map::Keys, BTreeMap, HashMap, HashSet};
 
 use kafka_protocol::{
     messages::{GroupId, TopicName},
@@ -11,7 +11,7 @@ use tracing::{debug, info};
 
 use crate::{
     client::Kafka, consumer::fetcher::Fetcher, coordinator::ConsumerCoordinator,
-    executor::Executor, Error, NodeId, PartitionId, Result,
+    executor::Executor, metadata::TopicPartition, Error, NodeId, PartitionId, Result,
 };
 
 /// High-level consumer record.
@@ -88,148 +88,100 @@ pub struct SubscriptionState {
     pub topics: HashSet<TopicName>,
     default_offset_strategy: OffsetResetStrategy,
     pub assignments: HashMap<TopicName, Vec<TopicPartitionState>>,
+    pub raw_assignment: HashMap<TopicPartition, TopicPartitionState>,
 }
 
 impl SubscriptionState {
     pub fn partitions(&self) -> HashMap<TopicName, Vec<PartitionId>> {
-        let mut partitions = HashMap::with_capacity(self.assignments.len());
-        for (topic, partition_states) in self.assignments.iter() {
-            partitions.insert(
-                topic.clone(),
-                partition_states.iter().map(|p| p.partition).collect(),
-            );
+        let mut topics: HashMap<TopicName, Vec<PartitionId>> = HashMap::new();
+        for (tp, _tp_state) in self.raw_assignment.iter() {
+            if let Some(partitions) = topics.get_mut(&tp.topic) {
+                partitions.push(tp.partition);
+            } else {
+                let partitions = vec![tp.partition];
+                topics.insert(tp.topic.clone(), partitions);
+            }
         }
-        partitions
+        topics
     }
 
-    fn partitions_need_reset(&self, now: i64) -> HashMap<TopicName, Vec<PartitionId>> {
+    fn partitions_need_reset(&self, now: i64) -> Vec<TopicPartition> {
         self.collection_partitions(|state| {
             matches!(state.fetch_state, FetchState::AwaitReset)
                 && !state.awaiting_retry_backoff(now)
         })
     }
 
-    fn partitions_need_validation(&self, now: i64) -> HashMap<TopicName, Vec<PartitionId>> {
+    fn partitions_need_validation(&self, now: i64) -> Vec<TopicPartition> {
         self.collection_partitions(|state| {
             matches!(state.fetch_state, FetchState::AwaitValidation)
                 && !state.awaiting_retry_backoff(now)
         })
     }
 
-    fn collection_partitions<F>(&self, func: F) -> HashMap<TopicName, Vec<PartitionId>>
+    fn collection_partitions<F>(&self, func: F) -> Vec<TopicPartition>
     where
         F: Fn(&TopicPartitionState) -> bool,
     {
-        let mut topics = HashMap::new();
-        for (topic, partition_states) in self.assignments.iter() {
-            let mut partitions = Vec::new();
-            for partition_state in partition_states {
-                if func(partition_state) {
-                    partitions.push(partition_state.partition);
-                }
-            }
-            if !partitions.is_empty() {
-                topics.insert(topic.clone(), partitions);
+        let mut partitions = Vec::new();
+        for (partition, partition_state) in self.raw_assignment.iter() {
+            if func(partition_state) {
+                partitions.push(partition.clone());
             }
         }
-        topics
-    }
-
-    pub fn offset_reset_strategy(
-        &self,
-        topic: &TopicName,
-        partitions: Vec<PartitionId>,
-    ) -> Vec<(PartitionId, OffsetResetStrategy)> {
-        let mut strategies = Vec::new();
-        if let Some((_, partition_states)) = self
-            .assignments
-            .iter()
-            .find(|(topic_name, _)| *topic_name == topic)
-        {
-            for partition_state in partition_states {
-                if partitions.contains(&partition_state.partition) {
-                    strategies.push((partition_state.partition, partition_state.offset_strategy));
-                }
-            }
-        }
-        strategies
+        partitions
     }
 
     pub fn set_next_allowed_retry(
         &mut self,
-        topic: &HashMap<&TopicName, Vec<(PartitionId, i64)>>,
+        assignments: Keys<&TopicPartition, i64>,
         next_allowed_reset_ms: i64,
     ) {
-        for (topic, partitions) in topic {
-            if let Some(partition_states) = self.assignments.get_mut(*topic) {
-                for partition_state in partition_states.iter_mut() {
-                    for (p, _) in partitions {
-                        if *p == partition_state.partition {
-                            partition_state.next_retry_time_ms = Some(next_allowed_reset_ms);
-                            break;
-                        }
-                    }
-                }
+        for topic in assignments {
+            if let Some(tp_state) = self.raw_assignment.get_mut(*topic) {
+                tp_state.next_retry_time_ms = Some(next_allowed_reset_ms);
             }
         }
     }
 
-    pub fn request_failed(
-        &mut self,
-        topics: HashMap<TopicName, Vec<PartitionId>>,
-        next_retry_time_ms: i64,
-    ) {
-        for (topic, partitions) in topics {
-            if let Some(partition_states) = self.assignments.get_mut(&topic) {
-                for partition_state in partition_states {
-                    if partitions.contains(&partition_state.partition) {
-                        partition_state.request_failed(next_retry_time_ms);
-                    }
-                }
+    pub fn request_failed(&mut self, partitions: Vec<TopicPartition>, next_retry_time_ms: i64) {
+        for tp in partitions {
+            if let Some(partition_state) = self.raw_assignment.get_mut(&tp) {
+                partition_state.request_failed(next_retry_time_ms);
             }
         }
-    }
-
-    fn assigned_state_or_none(
-        &mut self,
-        topic: &TopicName,
-        partition: PartitionId,
-    ) -> Option<&mut TopicPartitionState> {
-        if let Some(partition_states) = self.assignments.get_mut(topic) {
-            if let Some(partition_state) = partition_states
-                .iter_mut()
-                .find(|state| state.partition == partition)
-            {
-                return Some(partition_state);
-            }
-        }
-        None
     }
 
     fn maybe_seek_unvalidated(
         &mut self,
-        topic: &TopicName,
-        partition: PartitionId,
+        partition: TopicPartition,
         position: FetchPosition,
         offset_strategy: OffsetResetStrategy,
     ) -> Result<()> {
-        if let Some(partition_state) = self.assigned_state_or_none(topic, partition) {
+        if let Some(partition_state) = self.raw_assignment.get_mut(&partition) {
             if !matches!(partition_state.fetch_state, FetchState::AwaitReset) {
-                debug!("Skipping reset of [{topic:?} - {partition}] since it is no longer needed");
+                debug!(
+                    "Skipping reset of [{} - {}] since it is no longer needed",
+                    partition.topic.0, partition.partition
+                );
             } else if partition_state.offset_strategy != offset_strategy {
                 debug!(
-                    "Skipping reset of topic [{topic:?} - {partition}] since an alternative reset \
-                     has been requested"
+                    "Skipping reset of topic [{} - {}] since an alternative reset has been \
+                     requested",
+                    partition.topic.0, partition.partition
                 );
             } else {
                 info!(
-                    "Resetting offset for topic [{} - {partition}] to position {}.",
-                    topic.0, position.offset
+                    "Resetting offset for topic [{} - {}] to position {}.",
+                    partition.topic.0, partition.partition, position.offset
                 );
                 partition_state.seek_unvalidated(position)?;
             }
         } else {
-            debug!("Skipping reset of [{topic:?} - {partition}] since it is no longer assigned");
+            debug!(
+                "Skipping reset of [{} - {}] since it is no longer assigned",
+                partition.topic.0, partition.partition
+            );
         }
 
         Ok(())

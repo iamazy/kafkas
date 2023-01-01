@@ -137,7 +137,7 @@ pub struct Cluster {
     pub nodes: DashMap<NodeId, Node>,
     pub available_partitions: DashMap<TopicName, Vec<PartitionId>>,
     pub partitions: DashMap<TopicName, Vec<PartitionId>>,
-    pub partitions_by_nodes: DashMap<NodeId, Vec<(TopicName, Vec<PartitionId>)>>,
+    pub partitions_by_nodes: DashMap<NodeId, Vec<TopicPartition>>,
 }
 
 impl Cluster {
@@ -243,14 +243,14 @@ impl Cluster {
         })
     }
 
-    pub fn current_leader(&self, topic: &TopicName, partition: PartitionId) -> LeaderAndEpoch {
+    pub fn current_leader(&self, partition: &TopicPartition) -> LeaderAndEpoch {
         let mut leader_epoch = LeaderAndEpoch::default();
-        if let Some(entry) = self.topics.get(topic) {
+        if let Some(entry) = self.topics.get(&partition.topic) {
             if let Some(partition) = entry
                 .value()
                 .partitions
                 .iter()
-                .find(|p| p.partition == partition)
+                .find(|p| p.partition == partition.partition)
             {
                 leader_epoch.leader = Some(partition.leader);
                 leader_epoch.epoch = Some(partition.leader_epoch);
@@ -268,14 +268,12 @@ impl Cluster {
         } else {
             let mut topic_partitions = Vec::new();
             for topic_entry in self.topics.iter() {
-                let partitions = topic_entry
-                    .value()
-                    .partitions
-                    .iter()
-                    .filter(|p| p.leader == node)
-                    .map(|p| p.partition)
-                    .collect();
-                topic_partitions.push((topic_entry.name.clone().into(), partitions));
+                for partition in topic_entry.partitions.iter() {
+                    topic_partitions.push(TopicPartition::new(
+                        topic_entry.key().clone(),
+                        partition.partition,
+                    ));
+                }
             }
             self.partitions_by_nodes.insert(node, topic_partitions);
             self.drain_node(node)
