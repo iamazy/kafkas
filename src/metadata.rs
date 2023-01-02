@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    fmt::{Debug, Formatter},
+    sync::{Arc, Mutex},
+};
 
 use dashmap::{DashMap, DashSet};
 use kafka_protocol::{
@@ -89,7 +92,7 @@ impl From<&MetadataResponsePartition> for Partition {
     }
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq, Hash)]
+#[derive(Clone, Default, Eq, PartialEq, Hash)]
 pub struct TopicPartition {
     pub topic: TopicName,
     pub partition: PartitionId,
@@ -98,6 +101,15 @@ pub struct TopicPartition {
 impl TopicPartition {
     pub fn new(topic: TopicName, partition: PartitionId) -> Self {
         Self { topic, partition }
+    }
+}
+
+impl Debug for TopicPartition {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TopicPartition")
+            .field("topic", &self.topic.0)
+            .field("partition", &self.partition)
+            .finish()
     }
 }
 

@@ -102,7 +102,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             auto_commit_interval_ms: 5000,
             auto_commit_enabled: true,
             subscriptions: Arc::new(RefCell::new(SubscriptionState::default())),
-            group_meta: ConsumerGroupMetadata::new(group_id.clone().into()),
+            group_meta: ConsumerGroupMetadata::new(group_id.into()),
             group_subscription: GroupSubscription::default(),
             rebalance_options: RebalanceOptions::default(),
             assignors: vec![PartitionAssignor::Range(RangeAssignor)],
