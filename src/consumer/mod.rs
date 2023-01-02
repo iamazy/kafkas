@@ -87,14 +87,13 @@ pub struct SubscriptionState {
     subscription_type: SubscriptionType,
     pub topics: HashSet<TopicName>,
     default_offset_strategy: OffsetResetStrategy,
-    pub assignments: HashMap<TopicName, Vec<TopicPartitionState>>,
-    pub raw_assignment: HashMap<TopicPartition, TopicPartitionState>,
+    pub assignments: HashMap<TopicPartition, TopicPartitionState>,
 }
 
 impl SubscriptionState {
     pub fn partitions(&self) -> HashMap<TopicName, Vec<PartitionId>> {
         let mut topics: HashMap<TopicName, Vec<PartitionId>> = HashMap::new();
-        for (tp, _tp_state) in self.raw_assignment.iter() {
+        for (tp, _tp_state) in self.assignments.iter() {
             if let Some(partitions) = topics.get_mut(&tp.topic) {
                 partitions.push(tp.partition);
             } else {
@@ -124,7 +123,7 @@ impl SubscriptionState {
         F: Fn(&TopicPartitionState) -> bool,
     {
         let mut partitions = Vec::new();
-        for (partition, partition_state) in self.raw_assignment.iter() {
+        for (partition, partition_state) in self.assignments.iter() {
             if func(partition_state) {
                 partitions.push(partition.clone());
             }
@@ -138,7 +137,7 @@ impl SubscriptionState {
         next_allowed_reset_ms: i64,
     ) {
         for topic in assignments {
-            if let Some(tp_state) = self.raw_assignment.get_mut(*topic) {
+            if let Some(tp_state) = self.assignments.get_mut(*topic) {
                 tp_state.next_retry_time_ms = Some(next_allowed_reset_ms);
             }
         }
@@ -146,7 +145,7 @@ impl SubscriptionState {
 
     pub fn request_failed(&mut self, partitions: Vec<TopicPartition>, next_retry_time_ms: i64) {
         for tp in partitions {
-            if let Some(partition_state) = self.raw_assignment.get_mut(&tp) {
+            if let Some(partition_state) = self.assignments.get_mut(&tp) {
                 partition_state.request_failed(next_retry_time_ms);
             }
         }
@@ -158,7 +157,7 @@ impl SubscriptionState {
         position: FetchPosition,
         offset_strategy: OffsetResetStrategy,
     ) -> Result<()> {
-        if let Some(partition_state) = self.raw_assignment.get_mut(&partition) {
+        if let Some(partition_state) = self.assignments.get_mut(&partition) {
             if !matches!(partition_state.fetch_state, FetchState::AwaitReset) {
                 debug!(
                     "Skipping reset of [{} - {}] since it is no longer needed",

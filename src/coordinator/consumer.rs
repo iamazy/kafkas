@@ -46,34 +46,27 @@ const CONSUMER_PROTOCOL_TYPE: &str = "consumer";
 macro_rules! offset_fetch_block {
     ($self:ident, $source:ident) => {
         for topic in $source.topics {
-            if let Some(partition_states) = $self
-                .subscriptions
-                .borrow_mut()
-                .assignments
-                .get_mut(&topic.name)
-            {
-                for partition in topic.partitions {
-                    if partition.error_code.is_ok() {
-                        if let Some(partition_state) = partition_states
-                            .iter_mut()
-                            .find(|p| p.partition == partition.partition_index)
-                        {
-                            partition_state.position.offset = partition.committed_offset;
-                            partition_state.position.offset_epoch =
-                                Some(partition.committed_leader_epoch);
-
-                            debug!(
-                                "Fetch topic [{} - {}] offset success, offset: {}",
-                                topic.name.0, partition.partition_index, partition.committed_offset
-                            );
-                        }
-                    } else {
-                        error!(
-                            "Failed to fetch offset for partition {}, error: {}",
-                            partition.partition_index,
-                            partition.error_code.err().unwrap()
+            for partition in topic.partitions {
+                if partition.error_code.is_ok() {
+                    let tp = TopicPartition::new(topic.name.clone(), partition.partition_index);
+                    if let Some(partition_state) =
+                        $self.subscriptions.borrow_mut().assignments.get_mut(&tp)
+                    {
+                        partition_state.position.offset = partition.committed_offset;
+                        partition_state.position.offset_epoch =
+                            Some(partition.committed_leader_epoch);
+                        debug!(
+                            "Fetch topic [{} - {}] offset success, offset: {}",
+                            tp.topic.0, partition.partition_index, partition.committed_offset
                         );
                     }
+                } else {
+                    error!(
+                        "Fetch topic [{} - {}] offset error, {}",
+                        topic.name.0,
+                        partition.partition_index,
+                        partition.error_code.err().unwrap()
+                    );
                 }
             }
         }
@@ -139,7 +132,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         }
     }
 
-    #[async_recursion::async_recursion(?Send)]
+    #[async_recursion::async_recursion(? Send)]
     pub async fn join_group(&mut self) -> Result<()> {
         if let Some(version_range) = self.client.version_range(ApiKey::JoinGroupKey) {
             let join_group_response = self
@@ -234,7 +227,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 for (topic, partitions) in assignment.partitions {
                     self.subscriptions.borrow_mut().topics.insert(topic.clone());
                     for partition in partitions.iter() {
-                        self.subscriptions.borrow_mut().raw_assignment.insert(
+                        self.subscriptions.borrow_mut().assignments.insert(
                             TopicPartition::new(topic.clone(), *partition),
                             TopicPartitionState::new(*partition),
                         );
@@ -491,7 +484,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 
             let mut topics: HashMap<TopicName, Vec<OffsetCommitRequestPartition>> =
                 HashMap::with_capacity(self.subscriptions.borrow().topics.len());
-            for (tp, tp_state) in self.subscriptions.borrow().raw_assignment.iter() {
+            for (tp, tp_state) in self.subscriptions.borrow().assignments.iter() {
                 let partition = OffsetCommitRequestPartition {
                     partition_index: tp_state.partition,
                     committed_offset: tp_state.position.offset,

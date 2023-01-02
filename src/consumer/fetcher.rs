@@ -105,7 +105,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                             self.subscription.borrow().default_offset_strategy;
                         for partition in fetchable_topic.partitions {
                             if let Some(partition_state) =
-                                self.subscription.borrow_mut().raw_assignment.get_mut(
+                                self.subscription.borrow_mut().assignments.get_mut(
                                     &TopicPartition::new(topic.clone(), partition.partition_index),
                                 )
                             {
@@ -198,7 +198,7 @@ impl<Exe: Executor> Fetcher<Exe> {
 
             let mut offset_reset_timestamps = HashMap::new();
             for partition in partitions {
-                if let Some(tp_state) = self.subscription.borrow().raw_assignment.get(&partition) {
+                if let Some(tp_state) = self.subscription.borrow().assignments.get(&partition) {
                     let timestamp = tp_state.offset_strategy.strategy_timestamp();
                     if timestamp != 0 {
                         offset_reset_timestamps.insert(partition, timestamp);
@@ -432,7 +432,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         let reset_strategy = self
             .subscription
             .borrow()
-            .raw_assignment
+            .assignments
             .get(partition)
             .map(|tp_state| tp_state.offset_strategy);
         reset_strategy.map(|strategy| strategy.strategy_timestamp())
@@ -447,7 +447,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         let mut topics: HashMap<TopicName, Vec<FetchPartition>> = HashMap::new();
         let tp_in_node = self.client.cluster_meta.drain_node(node)?;
         for tp in tp_in_node.iter() {
-            if let Some(tp_state) = self.subscription.borrow().raw_assignment.get(tp) {
+            if let Some(tp_state) = self.subscription.borrow().assignments.get(tp) {
                 let mut partition = FetchPartition::default();
                 partition.partition = tp_state.partition;
                 partition.fetch_offset = tp_state.position.offset;
