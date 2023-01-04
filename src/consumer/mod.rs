@@ -3,6 +3,7 @@ pub mod partition_assignor;
 
 use std::collections::{hash_map::Keys, BTreeMap, HashMap, HashSet};
 
+use chrono::Local;
 use kafka_protocol::{
     messages::{GroupId, TopicName},
     protocol::StrBytes,
@@ -443,4 +444,20 @@ pub struct Consumer<Exe: Executor> {
     client: Kafka<Exe>,
     coordinator: ConsumerCoordinator<Exe>,
     fetcher: Fetcher<Exe>,
+}
+
+impl<Exe: Executor> Consumer<Exe> {
+    pub async fn new<S: AsRef<str>>(client: Kafka<Exe>, group_id: S) -> Result<Self> {
+        let coordinator = ConsumerCoordinator::new(client.clone(), group_id).await?;
+        let fetcher = Fetcher::new(
+            client.clone(),
+            Local::now().timestamp(),
+            coordinator.subscriptions.clone(),
+        );
+        Ok(Self {
+            client,
+            coordinator,
+            fetcher,
+        })
+    }
 }

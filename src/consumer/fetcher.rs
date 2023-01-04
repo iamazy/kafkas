@@ -11,6 +11,7 @@ use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
         fetch_request::{FetchPartition, FetchTopic},
+        fetch_response::PartitionData,
         list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
         ApiKey, BrokerId, FetchRequest, FetchResponse, ListOffsetsRequest, ListOffsetsResponse,
         TopicName,
@@ -27,7 +28,7 @@ use crate::{
     error::Result,
     executor::Executor,
     metadata::{Node, TopicPartition},
-    Error, NodeId, PartitionId, UNKNOWN_EPOCH, UNKNOWN_OFFSET,
+    Error, NodeId, UNKNOWN_EPOCH, UNKNOWN_OFFSET,
 };
 
 const INITIAL_EPOCH: i32 = 0;
@@ -114,10 +115,9 @@ impl<Exe: Executor> Fetcher<Exe> {
                         let default_offset_strategy =
                             self.subscription.borrow().default_offset_strategy;
                         for partition in fetchable_topic.partitions {
+                            let tp = TopicPartition::new(topic.clone(), partition.partition_index);
                             if let Some(partition_state) =
-                                self.subscription.borrow_mut().assignments.get_mut(
-                                    &TopicPartition::new(topic.clone(), partition.partition_index),
-                                )
+                                self.subscription.borrow_mut().assignments.get_mut(&tp)
                             {
                                 if partition.error_code.is_ok() {
                                     partition_state.last_stable_offset =
@@ -155,7 +155,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                                         );
 
                                         let fetched_records = FetchedRecords {
-                                            partition: partition.partition_index,
+                                            partition: tp,
                                             records,
                                         };
                                         self.completed_fetch.push_back(fetched_records);
@@ -487,6 +487,9 @@ impl<Exe: Executor> Fetcher<Exe> {
                     partition.last_fetched_epoch
                 );
 
+                session
+                    .session_partitions
+                    .insert(tp.clone(), partition.clone());
                 if let Some(partitions) = topics.get_mut(&tp.topic) {
                     partitions.push(partition);
                 } else {
@@ -698,13 +701,40 @@ impl FetchSession {
         partitions
     }
 
+    fn fetch_response_partitions_data(
+        &self,
+        response: FetchResponse,
+        version: i16,
+    ) -> HashMap<TopicPartition, PartitionData> {
+        let mut partitions = HashMap::new();
+        for response in response.responses {
+            let name = if version < 13 {
+                Some(&response.topic)
+            } else {
+                self.session_topic_names.get(&response.topic_id)
+            };
+            if let Some(name) = name {
+                for partition in response.partitions {
+                    partitions.insert(
+                        TopicPartition {
+                            topic: name.clone(),
+                            partition: partition.partition_index,
+                        },
+                        partition,
+                    );
+                }
+            }
+        }
+        partitions
+    }
+
     fn find_missing<'a, T: Eq + Hash>(
         to_find: &HashSet<&'a T>,
         to_search: &HashSet<&'a T>,
     ) -> HashSet<&'a T> {
         let mut ret = HashSet::new();
         for find in to_find {
-            if to_search.contains(*find) {
+            if !to_search.contains(*find) {
                 ret.insert(*find);
             }
         }
@@ -866,7 +896,7 @@ impl FetchSession {
 
 #[derive(Debug, Clone)]
 pub struct FetchedRecords {
-    partition: PartitionId,
+    partition: TopicPartition,
     records: Vec<Record>,
 }
 

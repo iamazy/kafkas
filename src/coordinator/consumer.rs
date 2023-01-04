@@ -225,7 +225,6 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 let assignment =
                     Assignment::deserialize_from_bytes(&mut sync_group_response.assignment)?;
                 for (topic, partitions) in assignment.partitions {
-                    self.subscriptions.borrow_mut().topics.insert(topic.clone());
                     for partition in partitions.iter() {
                         self.subscriptions.borrow_mut().assignments.insert(
                             TopicPartition::new(topic.clone(), *partition),
