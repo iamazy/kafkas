@@ -1,4 +1,5 @@
 pub mod fetcher;
+pub mod fetch_session;
 pub mod partition_assignor;
 
 use std::collections::{hash_map::Keys, BTreeMap, HashMap, HashSet};
@@ -14,6 +15,10 @@ use crate::{
     client::Kafka, consumer::fetcher::Fetcher, coordinator::ConsumerCoordinator,
     executor::Executor, metadata::TopicPartition, Error, NodeId, PartitionId, Result,
 };
+
+const INITIAL_EPOCH: i32 = 0;
+const FINAL_EPOCH: i32 = -1;
+const INVALID_SESSION_ID: i32 = 0;
 
 /// High-level consumer record.
 #[derive(Debug, Clone, PartialEq, Eq)]
