@@ -1,5 +1,5 @@
-pub mod fetcher;
 pub mod fetch_session;
+pub mod fetcher;
 pub mod partition_assignor;
 
 use std::collections::{hash_map::Keys, BTreeMap, HashMap, HashSet};

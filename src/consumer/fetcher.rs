@@ -11,27 +11,26 @@ use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
         fetch_request::{FetchPartition, FetchTopic},
-        fetch_response::PartitionData,
         list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
-        ApiKey, BrokerId, FetchRequest, FetchResponse, ListOffsetsRequest, ListOffsetsResponse,
-        TopicName,
+        ApiKey, BrokerId, FetchRequest, ListOffsetsRequest, ListOffsetsResponse, TopicName,
     },
     records::{Record, RecordBatchDecoder, NO_PARTITION_LEADER_EPOCH},
     ResponseError,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
     client::Kafka,
-    consumer::{FetchPosition, IsolationLevel, OffsetResetStrategy, SubscriptionState},
+    consumer::{
+        fetch_session::FetchSession, FetchPosition, IsolationLevel, OffsetResetStrategy,
+        SubscriptionState, FINAL_EPOCH, INITIAL_EPOCH, INVALID_SESSION_ID,
+    },
     error::Result,
     executor::Executor,
     metadata::{Node, TopicPartition},
     Error, NodeId, UNKNOWN_EPOCH, UNKNOWN_OFFSET,
 };
-use crate::consumer::fetch_session::FetchSession;
-use crate::consumer::{FINAL_EPOCH, INITIAL_EPOCH, INVALID_SESSION_ID};
 
 pub struct Fetcher<Exe: Executor> {
     client: Kafka<Exe>,

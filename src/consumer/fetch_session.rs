@@ -1,16 +1,23 @@
-use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
-use kafka_protocol::ResponseError;
-use kafka_protocol::error::ParseResponseErrorCode;
-use kafka_protocol::messages::fetch_request::FetchPartition;
-use kafka_protocol::messages::{FetchResponse, TopicName};
-use kafka_protocol::messages::fetch_response::PartitionData;
+use std::{
+    collections::{HashMap, HashSet},
+    hash::Hash,
+};
+
+use kafka_protocol::{
+    error::ParseResponseErrorCode,
+    messages::{
+        fetch_request::FetchPartition, fetch_response::PartitionData, FetchResponse, TopicName,
+    },
+    ResponseError,
+};
 use tracing::{debug, info};
 use uuid::Uuid;
-use crate::consumer::fetcher::FetchMetadata;
-use crate::consumer::{INITIAL_EPOCH, INVALID_SESSION_ID};
-use crate::metadata::TopicPartition;
-use crate::NodeId;
+
+use crate::{
+    consumer::{fetcher::FetchMetadata, INITIAL_EPOCH, INVALID_SESSION_ID},
+    metadata::TopicPartition,
+    NodeId,
+};
 
 #[derive(Debug, Clone)]
 pub struct FetchSession {
