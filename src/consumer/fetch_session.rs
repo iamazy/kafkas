@@ -94,19 +94,6 @@ impl FetchSession {
         partitions
     }
 
-    fn find_missing<'a, T: Eq + Hash>(
-        to_find: &HashSet<&'a T>,
-        to_search: &HashSet<&'a T>,
-    ) -> HashSet<&'a T> {
-        let mut ret = HashSet::new();
-        for find in to_find {
-            if !to_search.contains(*find) {
-                ret.insert(*find);
-            }
-        }
-        ret
-    }
-
     fn verify_full_fetched_partitions(
         &self,
         partitions: HashSet<&TopicPartition>,
@@ -114,14 +101,14 @@ impl FetchSession {
         version: i16,
     ) -> Option<String> {
         let session_partitions: HashSet<&TopicPartition> = self.session_partitions.keys().collect();
-        let extra = Self::find_missing(&partitions, &session_partitions);
-        let omitted = Self::find_missing(&session_partitions, &partitions);
+        let extra = find_missing(&partitions, &session_partitions);
+        let omitted = find_missing(&session_partitions, &partitions);
         let mut extra_ids: HashSet<&Uuid> = HashSet::new();
 
         let mut problem = String::new();
         if version >= 13 {
             let session_topic_names = self.session_topic_names.keys().collect();
-            extra_ids.extend(Self::find_missing(&topic_ids, &session_topic_names));
+            extra_ids.extend(find_missing(&topic_ids, &session_topic_names));
         }
 
         if !omitted.is_empty() {
@@ -150,11 +137,11 @@ impl FetchSession {
 
         if version >= 13 {
             let session_topic_names = self.session_topic_names.keys().collect();
-            extra_ids.extend(Self::find_missing(&topic_ids, &session_topic_names));
+            extra_ids.extend(find_missing(&topic_ids, &session_topic_names));
         }
 
         let session_partitions: HashSet<&TopicPartition> = self.session_partitions.keys().collect();
-        let extra = Self::find_missing(&partitions, &session_partitions);
+        let extra = find_missing(&partitions, &session_partitions);
 
         let mut problem = String::new();
         if !extra.is_empty() {
@@ -258,4 +245,17 @@ impl FetchSession {
             true
         };
     }
+}
+
+fn find_missing<'a, T: Eq + Hash>(
+    to_find: &HashSet<&'a T>,
+    to_search: &HashSet<&'a T>,
+) -> HashSet<&'a T> {
+    let mut ret = HashSet::new();
+    for find in to_find {
+        if !to_search.contains(*find) {
+            ret.insert(*find);
+        }
+    }
+    ret
 }

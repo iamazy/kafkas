@@ -21,7 +21,6 @@ use tracing::error;
 use crate::{
     connection::Connection,
     connection_manager::{ConnectionManager, ConnectionRetryOptions, OperationRetryOptions},
-    consumer::ConsumerRecord,
     error::{ConnectionError, Error, Result},
     executor::Executor,
     metadata::{Cluster, Node},
@@ -33,7 +32,7 @@ pub trait DeserializeMessage {
     /// type produced from the message
     type Output: Sized;
     /// deserialize method that will be called by the consumer
-    fn deserialize_message(record: &ConsumerRecord) -> Self::Output;
+    fn deserialize_message(record: Record) -> Self::Output;
 }
 
 /// Helper trait for message serialization

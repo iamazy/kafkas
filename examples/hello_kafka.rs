@@ -53,6 +53,8 @@ async fn main() -> Result<(), Box<Error>> {
     fetcher.fetch().await?;
     fetcher.reset_offset().await?;
     fetcher.fetch().await?;
+    let fetch = fetcher.collect_fetch()?;
+    println!("{}", fetch.num_records);
     Ok(())
 }
 

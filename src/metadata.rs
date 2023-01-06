@@ -1,5 +1,5 @@
 use std::{
-    fmt::{Debug, Formatter},
+    fmt::{Debug, Display, Formatter},
     sync::{Arc, Mutex},
 };
 
@@ -110,6 +110,12 @@ impl Debug for TopicPartition {
             .field("topic", &self.topic.0)
             .field("partition", &self.partition)
             .finish()
+    }
+}
+
+impl Display for TopicPartition {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "partition [{} - {}]", self.topic.0, self.partition)
     }
 }
 

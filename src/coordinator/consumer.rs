@@ -47,24 +47,19 @@ macro_rules! offset_fetch_block {
     ($self:ident, $source:ident) => {
         for topic in $source.topics {
             for partition in topic.partitions {
+                let tp = TopicPartition::new(topic.name.clone(), partition.partition_index);
                 if partition.error_code.is_ok() {
-                    let tp = TopicPartition::new(topic.name.clone(), partition.partition_index);
                     if let Some(partition_state) =
                         $self.subscriptions.borrow_mut().assignments.get_mut(&tp)
                     {
                         partition_state.position.offset = partition.committed_offset;
                         partition_state.position.offset_epoch =
                             Some(partition.committed_leader_epoch);
-                        debug!(
-                            "Fetch topic [{} - {}] offset success, offset: {}",
-                            tp.topic.0, partition.partition_index, partition.committed_offset
-                        );
+                        debug!("Fetch {tp} offset success, offset: {}", partition.committed_offset);
                     }
                 } else {
                     error!(
-                        "Fetch topic [{} - {}] offset error, {}",
-                        topic.name.0,
-                        partition.partition_index,
+                        "Fetch {tp} offset error, {}",
                         partition.error_code.err().unwrap()
                     );
                 }

@@ -24,7 +24,7 @@ const INVALID_SESSION_ID: i32 = 0;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerRecord {
     pub topic: String,
-    pub partition: Option<i32>,
+    pub partition: i32,
     pub offset: i64,
     pub key: Option<Vec<u8>>,
     pub value: Option<Vec<u8>>,
