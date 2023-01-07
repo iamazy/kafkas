@@ -29,6 +29,7 @@ indexmap = "1"
 kafka-protocol = { git = "https://github.com/iamazy/kafka-protocol-rs", branch = "trunk" }
 native-tls = "0.2"
 pin-project-lite = "0.2"
+parking_lot = "0.12"
 rand = "0.8"
 regex = "1.1.7"
 thiserror = "1"

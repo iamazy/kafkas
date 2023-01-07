@@ -13,7 +13,8 @@ use tracing::{debug, info};
 
 use crate::{
     client::Kafka, consumer::fetcher::Fetcher, coordinator::ConsumerCoordinator,
-    executor::Executor, metadata::TopicPartition, Error, NodeId, PartitionId, Result,
+    executor::Executor, metadata::TopicPartition, Error, NodeId, PartitionId, Result, ToStrBytes,
+    DEFAULT_GENERATION_ID,
 };
 
 const INITIAL_EPOCH: i32 = 0;
@@ -420,7 +421,7 @@ impl ConsumerGroupMetadata {
     pub fn new(group_id: GroupId) -> Self {
         Self {
             group_id,
-            generation_id: -1,
+            generation_id: DEFAULT_GENERATION_ID,
             member_id: StrBytes::default(),
             leader: StrBytes::default(),
             group_instance_id: None,
@@ -464,5 +465,14 @@ impl<Exe: Executor> Consumer<Exe> {
             coordinator,
             fetcher,
         })
+    }
+
+    pub async fn subscribe<S: AsRef<str>>(&mut self, topics: Vec<S>) -> Result<()> {
+        for topic in topics {
+            self.coordinator
+                .subscribe(topic.as_ref().to_string().to_str_bytes().into())
+                .await?;
+        }
+        Ok(())
     }
 }

@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     collections::{HashMap, VecDeque},
     fmt::{Display, Formatter},
     hash::Hash,
@@ -17,6 +16,7 @@ use kafka_protocol::{
     records::{Record, RecordBatchDecoder, NO_PARTITION_LEADER_EPOCH},
     ResponseError,
 };
+use parking_lot::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -44,7 +44,7 @@ pub struct Fetcher<Exe: Executor> {
     max_poll_records: i32,
     check_crcs: bool,
     client_rack_id: String,
-    subscription: Arc<RefCell<SubscriptionState>>,
+    subscription: Arc<Mutex<SubscriptionState>>,
     sessions: DashMap<NodeId, FetchSession>,
     completed_fetches: VecDeque<CompletedFetch>,
 }
@@ -53,7 +53,7 @@ impl<Exe: Executor> Fetcher<Exe> {
     pub fn new(
         client: Kafka<Exe>,
         timestamp: i64,
-        subscription: Arc<RefCell<SubscriptionState>>,
+        subscription: Arc<Mutex<SubscriptionState>>,
     ) -> Self {
         let sessions = DashMap::new();
         for node in client.cluster_meta.nodes.iter() {
@@ -131,11 +131,11 @@ impl<Exe: Executor> Fetcher<Exe> {
                         };
 
                         let default_offset_strategy =
-                            self.subscription.borrow().default_offset_strategy;
+                            self.subscription.lock().default_offset_strategy;
                         for partition in fetchable_topic.partitions {
                             let tp = TopicPartition::new(topic.clone(), partition.partition_index);
                             if let Some(partition_state) =
-                                self.subscription.borrow_mut().assignments.get_mut(&tp)
+                                self.subscription.lock().assignments.get_mut(&tp)
                             {
                                 match partition.error_code.err() {
                                     Some(
@@ -221,8 +221,8 @@ impl<Exe: Executor> Fetcher<Exe> {
                                         }
 
                                         debug!(
-                                            "Fetch {tp} success, last stable offset: \
-                                             {}, log start offset: {}, high_water_mark: {}",
+                                            "Fetch {tp} success, last stable offset: {}, log \
+                                             start offset: {}, high_water_mark: {}",
                                             partition.last_stable_offset,
                                             partition.log_start_offset,
                                             partition.high_watermark
@@ -240,8 +240,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                                             }
 
                                             debug!(
-                                                "Fetch {tp} records success, records \
-                                                 size: {}",
+                                                "Fetch {tp} records success, records size: {}",
                                                 records.len()
                                             );
 
@@ -287,7 +286,7 @@ impl<Exe: Executor> Fetcher<Exe> {
             let version = version_range.max;
             let partitions = self
                 .subscription
-                .borrow()
+                .lock()
                 .partitions_need_reset(self.timestamp);
             if partitions.is_empty() {
                 return Ok(());
@@ -295,7 +294,7 @@ impl<Exe: Executor> Fetcher<Exe> {
 
             let mut offset_reset_timestamps = HashMap::new();
             for partition in partitions {
-                if let Some(tp_state) = self.subscription.borrow().assignments.get(&partition) {
+                if let Some(tp_state) = self.subscription.lock().assignments.get(&partition) {
                     let timestamp = tp_state.offset_strategy.strategy_timestamp();
                     if timestamp != 0 {
                         offset_reset_timestamps.insert(partition, timestamp);
@@ -309,7 +308,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                 let response = self.client.list_offsets(&node, request).await?;
                 let list_offset_result = self.handle_list_offsets_response(response)?;
                 if !list_offset_result.partitions_to_retry.is_empty() {
-                    self.subscription.borrow_mut().request_failed(
+                    self.subscription.lock().request_failed(
                         list_offset_result.partitions_to_retry,
                         self.timestamp + self.retry_backoff_ms,
                     );
@@ -359,7 +358,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         };
         // TODO: metadata update last seen epoch if newer
         self.subscription
-            .borrow_mut()
+            .lock()
             .maybe_seek_unvalidated(partition, position, offset_strategy)
     }
 
@@ -514,7 +513,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                     }
                 }
 
-                self.subscription.borrow_mut().set_next_allowed_retry(
+                self.subscription.lock().set_next_allowed_retry(
                     topics.keys(),
                     self.timestamp + self.request_timeout_ms,
                 );
@@ -528,7 +527,7 @@ impl<Exe: Executor> Fetcher<Exe> {
     fn offset_reset_strategy_timestamp(&self, partition: &TopicPartition) -> Option<i64> {
         let reset_strategy = self
             .subscription
-            .borrow()
+            .lock()
             .assignments
             .get(partition)
             .map(|tp_state| tp_state.offset_strategy);
@@ -544,7 +543,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         let mut topics: HashMap<TopicName, Vec<FetchPartition>> = HashMap::new();
         let tp_in_node = self.client.cluster_meta.drain_node(node)?;
         for tp in tp_in_node.iter() {
-            if let Some(tp_state) = self.subscription.borrow().assignments.get(tp) {
+            if let Some(tp_state) = self.subscription.lock().assignments.get(tp) {
                 let mut partition = FetchPartition::default();
                 partition.partition = tp_state.partition;
                 partition.fetch_offset = tp_state.position.offset;
@@ -564,8 +563,8 @@ impl<Exe: Executor> Fetcher<Exe> {
                 }
 
                 debug!(
-                    "Fetch {tp} records with offset: {}, log_start_offset: {}, current \
-                     leader epoch: {}, last fetched epoch: {}",
+                    "Fetch {tp} records with offset: {}, log_start_offset: {}, current leader \
+                     epoch: {}, last fetched epoch: {}",
                     partition.fetch_offset,
                     partition.log_start_offset,
                     partition.current_leader_epoch,

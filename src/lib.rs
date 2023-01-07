@@ -36,6 +36,7 @@ pub type MemberId = StrBytes;
 const UNKNOWN_OFFSET: i64 = -1;
 const UNKNOWN_TIMESTAMP: i64 = -1;
 const UNKNOWN_EPOCH: i32 = NO_PARTITION_LEADER_EPOCH;
+const DEFAULT_GENERATION_ID: i32 = -1;
 
 pub type PartitionRef<'a> = Ref<'a, TopicName, Vec<PartitionId>>;
 pub type NodeRef<'a> = Ref<'a, NodeId, Vec<TopicPartition>>;
