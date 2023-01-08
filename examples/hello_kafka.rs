@@ -37,24 +37,24 @@ async fn main() -> Result<(), Box<Error>> {
 
     let mut coordinator = ConsumerCoordinator::new(kafka_client.clone(), "app").await?;
     coordinator.subscribe(topic_name("kafka")).await?;
-    coordinator.join_group().await?;
-    coordinator.sync_group().await?;
+    coordinator.prepare_fetch().await?;
     coordinator.offset_fetch().await?;
     // coordinator.offset_commit().await?;
     // coordinator.list_offsets().await?;
-    // coordinator.heartbeat().await?;
     // coordinator.leave_group().await?;
 
     let mut fetcher = Fetcher::new(
         kafka_client.clone(),
         Local::now().timestamp(),
-        coordinator.subscriptions.clone(),
+        coordinator.subscriptions().await,
     );
     fetcher.fetch().await?;
     fetcher.reset_offset().await?;
     fetcher.fetch().await?;
     let fetch = fetcher.collect_fetch()?;
     println!("{}", fetch.num_records);
+
+    tokio::time::sleep(Duration::from_secs(100000000)).await;
     Ok(())
 }
 

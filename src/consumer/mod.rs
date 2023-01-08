@@ -458,7 +458,7 @@ impl<Exe: Executor> Consumer<Exe> {
         let fetcher = Fetcher::new(
             client.clone(),
             Local::now().timestamp(),
-            coordinator.subscriptions.clone(),
+            coordinator.subscriptions().await,
         );
         Ok(Self {
             client,
