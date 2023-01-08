@@ -17,17 +17,17 @@ use tracing::debug;
 
 use crate::{
     consumer::ConsumerGroupMetadata, error::Result, metadata::Cluster, to_version_prefixed_bytes,
-    Error,
+    Error, MemberId,
 };
 
 pub trait PartitionAssigner {
     fn name(&self) -> &'static str;
 
-    fn assign0(
+    fn member_assignments(
         &self,
         partitions_per_topic: HashMap<&TopicName, i32>,
         subscriptions: &HashMap<StrBytes, Subscription>,
-    ) -> Result<HashMap<StrBytes, HashMap<TopicName, Vec<i32>>>>;
+    ) -> Result<HashMap<MemberId, Assignment>>;
 
     fn subscription_user_data(&self, _topics: &HashSet<TopicName>) -> Result<Option<Bytes>> {
         Ok(None)
@@ -45,7 +45,7 @@ pub trait PartitionAssigner {
         &self,
         cluster: Arc<Cluster>,
         group_subscription: &GroupSubscription,
-    ) -> Result<HashMap<StrBytes, Assignment>> {
+    ) -> Result<HashMap<MemberId, Assignment>> {
         let mut all_subscribed_topics = HashSet::new();
         for subscription in group_subscription.subscriptions.values() {
             subscription.topics.iter().for_each(|topic| {
@@ -66,12 +66,8 @@ pub trait PartitionAssigner {
             }
         }
 
-        let mut assignments = HashMap::new();
-        let raw_assignments =
-            self.assign0(partitions_per_topic, &group_subscription.subscriptions)?;
-        for (member, partitions) in raw_assignments {
-            assignments.insert(member, Assignment::new(partitions));
-        }
+        let assignments =
+            self.member_assignments(partitions_per_topic, &group_subscription.subscriptions)?;
 
         Ok(assignments)
     }
@@ -163,11 +159,11 @@ impl Subscription {
 
 #[derive(Debug, Clone, Default)]
 pub struct GroupSubscription {
-    subscriptions: HashMap<StrBytes, Subscription>,
+    subscriptions: HashMap<MemberId, Subscription>,
 }
 
 impl GroupSubscription {
-    pub fn new(subscriptions: HashMap<StrBytes, Subscription>) -> Self {
+    pub fn new(subscriptions: HashMap<MemberId, Subscription>) -> Self {
         Self { subscriptions }
     }
 }
@@ -211,10 +207,6 @@ impl Assignment {
             user_data: consumer_protocol_assignment.user_data,
         })
     }
-}
-
-pub struct GroupAssignment {
-    assignments: HashMap<String, Assignment>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,20 +259,22 @@ impl PartitionAssigner for PartitionAssignor {
         &self,
         cluster: Arc<Cluster>,
         group_subscription: &GroupSubscription,
-    ) -> Result<HashMap<StrBytes, Assignment>> {
+    ) -> Result<HashMap<MemberId, Assignment>> {
         match self {
             PartitionAssignor::Range(range) => range.assign(cluster, group_subscription),
             _ => unimplemented!(),
         }
     }
 
-    fn assign0(
+    fn member_assignments(
         &self,
         partitions_per_topic: HashMap<&TopicName, i32>,
         subscriptions: &HashMap<StrBytes, Subscription>,
-    ) -> Result<HashMap<StrBytes, HashMap<TopicName, Vec<i32>>>> {
+    ) -> Result<HashMap<MemberId, Assignment>> {
         match self {
-            PartitionAssignor::Range(range) => range.assign0(partitions_per_topic, subscriptions),
+            PartitionAssignor::Range(range) => {
+                range.member_assignments(partitions_per_topic, subscriptions)
+            }
             _ => unimplemented!(),
         }
     }
@@ -348,20 +342,20 @@ impl PartitionAssigner for RangeAssignor {
         "range"
     }
 
-    fn assign0(
+    fn member_assignments(
         &self,
         partitions_per_topic: HashMap<&TopicName, i32>,
-        subscriptions: &HashMap<StrBytes, Subscription>,
-    ) -> Result<HashMap<StrBytes, HashMap<TopicName, Vec<i32>>>> {
+        subscriptions: &HashMap<MemberId, Subscription>,
+    ) -> Result<HashMap<MemberId, Assignment>> {
         let consumer_per_topic = self.consumers_per_topic(subscriptions);
 
         let mut assignment = HashMap::new();
         for (member_id, subscription) in subscriptions {
-            let mut topics = HashMap::new();
+            let mut partitions = HashMap::new();
             for topic in subscription.topics.iter() {
-                topics.insert(topic.clone(), Vec::new());
+                partitions.insert(topic.clone(), Vec::new());
             }
-            assignment.insert(member_id.clone(), topics);
+            assignment.insert(member_id.clone(), Assignment::new(partitions));
         }
 
         for (topic, mut members) in consumer_per_topic {
@@ -391,7 +385,7 @@ impl PartitionAssigner for RangeAssignor {
                 if let Some(member) = members.get(i as usize) {
                     if let Some(assign) = assignment.get_mut(member.member_id) {
                         let slice = &partitions[start as usize..(start + length) as usize];
-                        if let Some(topic) = assign.get_mut(topic) {
+                        if let Some(topic) = assign.partitions.get_mut(topic) {
                             for item in slice {
                                 topic.push(*item);
                             }

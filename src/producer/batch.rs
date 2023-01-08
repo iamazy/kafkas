@@ -53,7 +53,7 @@ impl Thunk {
 
 #[derive(Debug)]
 pub struct ProducerBatch {
-    partition: PartitionId,
+    pub partition: PartitionId,
     aggregator: RecordAggregator,
     thunks: Vec<Thunk>,
 }

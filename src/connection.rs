@@ -25,7 +25,7 @@ use crate::{
     ToStrBytes,
 };
 
-pub(crate) struct RegisterPair {
+pub struct RegisterPair {
     correlation_id: i32,
     resolver: oneshot::Sender<Command>,
 }
@@ -61,7 +61,7 @@ pub struct ConnectionSender<Exe: Executor> {
 }
 
 impl<Exe: Executor> ConnectionSender<Exe> {
-    pub(crate) fn new(
+    pub fn new(
         tx: mpsc::UnboundedSender<Command>,
         registrations: mpsc::UnboundedSender<RegisterPair>,
         receiver_shutdown: oneshot::Sender<()>,

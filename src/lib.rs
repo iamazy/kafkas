@@ -11,6 +11,7 @@ pub mod client;
 pub mod connection;
 pub mod connection_manager;
 pub mod consumer;
+pub mod coordinator;
 
 mod error;
 pub use error::{Error, Result};
@@ -26,11 +27,19 @@ pub use kafka_protocol::records::{
 };
 pub use producer::ProducerRecord;
 
+use crate::metadata::TopicPartition;
+
 pub type NodeId = i32;
 pub type PartitionId = i32;
+pub type MemberId = StrBytes;
+
+const UNKNOWN_OFFSET: i64 = -1;
+const UNKNOWN_TIMESTAMP: i64 = -1;
+const UNKNOWN_EPOCH: i32 = NO_PARTITION_LEADER_EPOCH;
+const DEFAULT_GENERATION_ID: i32 = -1;
 
 pub type PartitionRef<'a> = Ref<'a, TopicName, Vec<PartitionId>>;
-pub type NodeRef<'a> = Ref<'a, NodeId, Vec<(TopicName, Vec<PartitionId>)>>;
+pub type NodeRef<'a> = Ref<'a, NodeId, Vec<TopicPartition>>;
 
 pub trait ToStrBytes {
     fn to_str_bytes(self) -> StrBytes;
@@ -43,7 +52,7 @@ impl ToStrBytes for String {
 }
 
 // bytes utils
-pub(crate) fn to_version_prefixed_bytes<M: Encodable>(version: i16, message: M) -> Result<Bytes> {
+fn to_version_prefixed_bytes<M: Encodable>(version: i16, message: M) -> Result<Bytes> {
     let message_size = message.compute_size(version)?;
     let mut bytes = BytesMut::with_capacity(message_size + 2);
     bytes.put_i16(version);

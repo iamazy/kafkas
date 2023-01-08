@@ -77,11 +77,11 @@ enum ConnectionStatus<Exe: Executor> {
 #[derive(Clone)]
 pub struct ConnectionManager<Exe: Executor> {
     pub url: String,
-    pub(crate) executor: Arc<Exe>,
+    pub executor: Arc<Exe>,
     connections: Arc<Mutex<HashMap<String, ConnectionStatus<Exe>>>>,
     options: KafkaOptions,
     connection_retry_options: ConnectionRetryOptions,
-    pub(crate) operation_retry_options: OperationRetryOptions,
+    pub operation_retry_options: OperationRetryOptions,
 }
 
 impl<Exe: Executor> ConnectionManager<Exe> {
@@ -309,7 +309,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         Ok(conn)
     }
 
-    pub(crate) async fn check_connections(&self) {
+    pub async fn check_connections(&self) {
         trace!("cleaning invalid or unused connections");
         self.connections
             .lock()

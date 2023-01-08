@@ -14,7 +14,7 @@ pub trait PartitionSelector {
         topic: &'a TopicName,
         key: Option<&'a Bytes>,
         value: Option<&'a Bytes>,
-        cluster: Arc<Cluster>,
+        cluster: &'a Arc<Cluster>,
     ) -> Result<i32>;
 }
 
@@ -38,7 +38,7 @@ impl PartitionSelector for PartitionerSelector {
         topic: &'a TopicName,
         key: Option<&'a Bytes>,
         value: Option<&'a Bytes>,
-        cluster: Arc<Cluster>,
+        cluster: &'a Arc<Cluster>,
     ) -> Result<i32> {
         match self {
             PartitionerSelector::RoundRobin(roundbin) => {
@@ -93,7 +93,7 @@ impl PartitionSelector for RoundRobinPartitioner {
         topic: &'a TopicName,
         _key: Option<&'a Bytes>,
         _value: Option<&'a Bytes>,
-        cluster: Arc<Cluster>,
+        cluster: &'a Arc<Cluster>,
     ) -> Result<i32> {
         let partitions = cluster.partitions(topic)?;
         let num_partitions = partitions.len();
