@@ -108,21 +108,17 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.inner.lock().await.subscriptions.clone()
     }
 
-    async fn join_group(&mut self) -> Result<()> {
-        self.inner.lock().await.join_group().await
-    }
-
-    async fn sync_group(&mut self) -> Result<()> {
-        self.inner.lock().await.sync_group().await
-    }
-
     pub async fn offset_fetch(&mut self) -> Result<()> {
         self.inner.lock().await.offset_fetch().await
     }
 
-    pub async fn prepare_fetch(&mut self) -> Result<()> {
-        self.join_group().await?;
-        self.sync_group().await?;
+    pub async fn offset_commit(&mut self) -> Result<()> {
+        self.inner.lock().await.offset_commit().await
+    }
+
+    pub async fn prepare_fetch(&self) -> Result<()> {
+        self.inner.lock().await.join_group().await?;
+        self.inner.lock().await.sync_group().await?;
 
         let mut heartbeat_interval = self.client.executor.interval(Duration::from_millis(
             self.inner

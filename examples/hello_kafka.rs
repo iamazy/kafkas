@@ -1,13 +1,11 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::Local;
-use futures::{SinkExt, StreamExt};
+use futures::{pin_mut, SinkExt, StreamExt};
 use kafka_protocol::records::TimestampType;
 use kafkas::{
     client::{Kafka, KafkaOptions, SerializeMessage},
-    consumer::fetcher::Fetcher,
-    coordinator::ConsumerCoordinator,
+    consumer::Consumer,
     executor::{Executor, TokioExecutor},
     producer::{Producer, ProducerOptions},
     topic_name, Error, Record, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
@@ -22,7 +20,7 @@ async fn main() -> Result<(), Box<Error>> {
         // Configure formatting settings.
         .with_target(true)
         .with_level(true)
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(tracing::Level::INFO)
         .with_ansi(true)
         .with_file(true)
         .with_line_number(true)
@@ -35,24 +33,17 @@ async fn main() -> Result<(), Box<Error>> {
 
     produce(kafka_client.clone()).await?;
 
-    let mut coordinator = ConsumerCoordinator::new(kafka_client.clone(), "app").await?;
-    coordinator.subscribe(topic_name("kafka")).await?;
-    coordinator.prepare_fetch().await?;
-    coordinator.offset_fetch().await?;
-    // coordinator.offset_commit().await?;
-    // coordinator.list_offsets().await?;
-    // coordinator.leave_group().await?;
+    let mut consumer = Consumer::new(kafka_client.clone(), "app").await?;
+    consumer.subscribe(vec!["kafka"]).await?;
 
-    let mut fetcher = Fetcher::new(
-        kafka_client.clone(),
-        Local::now().timestamp(),
-        coordinator.subscriptions().await,
-    );
-    fetcher.fetch().await?;
-    fetcher.reset_offset().await?;
-    fetcher.fetch().await?;
-    let fetch = fetcher.collect_fetch()?;
-    println!("{}", fetch.num_records);
+    let consume_stream = consumer.into_stream();
+    pin_mut!(consume_stream);
+
+    while let Some(Ok(record)) = consume_stream.next().await {
+        if let Some(record) = record.value {
+            println!("{:?}", String::from_utf8(record.to_vec())?);
+        }
+    }
 
     tokio::time::sleep(Duration::from_secs(100000000)).await;
     Ok(())
@@ -116,12 +107,12 @@ async fn produce<Exe: Executor>(client: Kafka<Exe>) -> Result<(), Box<Error>> {
     let now = Instant::now();
     let topic = topic_name("kafka");
     for _ in 0..10 {
-        let record = TestData::new("hello kafka");
+        let record = TestData::new("hello kafka 123");
         let ret = producer.send(&topic, record).await?;
         let _ = tx.send(ret).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
     info!("elapsed: {:?}", now.elapsed());
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
     Ok(())
 }

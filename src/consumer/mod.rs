@@ -2,19 +2,25 @@ pub mod fetch_session;
 pub mod fetcher;
 pub mod partition_assignor;
 
-use std::collections::{hash_map::Keys, BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{hash_map::Keys, BTreeMap, HashMap, HashSet},
+    time::Duration,
+};
 
+use async_stream::try_stream;
 use chrono::Local;
+use futures::{channel::mpsc, Stream, StreamExt};
 use kafka_protocol::{
     messages::{GroupId, TopicName},
     protocol::StrBytes,
+    records::Record,
 };
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use crate::{
     client::Kafka, consumer::fetcher::Fetcher, coordinator::ConsumerCoordinator,
-    executor::Executor, metadata::TopicPartition, Error, NodeId, PartitionId, Result, ToStrBytes,
-    DEFAULT_GENERATION_ID,
+    error::ConsumeError, executor::Executor, metadata::TopicPartition, Error, NodeId, PartitionId,
+    Result, ToStrBytes, DEFAULT_GENERATION_ID,
 };
 
 const INITIAL_EPOCH: i32 = 0;
@@ -449,21 +455,26 @@ impl From<IsolationLevel> for i8 {
 pub struct Consumer<Exe: Executor> {
     client: Kafka<Exe>,
     coordinator: ConsumerCoordinator<Exe>,
-    fetcher: Fetcher<Exe>,
+    fetcher: Option<Fetcher<Exe>>,
+    records_rx: mpsc::UnboundedReceiver<Vec<Record>>,
 }
 
 impl<Exe: Executor> Consumer<Exe> {
     pub async fn new<S: AsRef<str>>(client: Kafka<Exe>, group_id: S) -> Result<Self> {
         let coordinator = ConsumerCoordinator::new(client.clone(), group_id).await?;
+
+        let (tx, rx) = mpsc::unbounded::<Vec<Record>>();
         let fetcher = Fetcher::new(
             client.clone(),
             Local::now().timestamp(),
             coordinator.subscriptions().await,
+            tx,
         );
         Ok(Self {
             client,
             coordinator,
-            fetcher,
+            fetcher: Some(fetcher),
+            records_rx: rx,
         })
     }
 
@@ -473,6 +484,38 @@ impl<Exe: Executor> Consumer<Exe> {
                 .subscribe(topic.as_ref().to_string().to_str_bytes().into())
                 .await?;
         }
+        self.coordinator.prepare_fetch().await?;
+
+        let mut fetch_interval = self.client.executor.interval(Duration::from_millis(100));
+
+        let mut fetcher = std::mem::replace(&mut self.fetcher, None);
+        let res = self.client.executor.spawn(Box::pin(async move {
+            while fetch_interval.next().await.is_some() {
+                let _ = fetcher.as_mut().unwrap().fetch().await;
+            }
+        }));
+
+        if res.is_err() {
+            error!("the executor could not spawn the fetch task");
+            return Err(ConsumeError::Custom(
+                "the executor could not spawn the fetch task".to_string(),
+            )
+            .into());
+        }
         Ok(())
+    }
+
+    pub async fn commit_ack(&mut self) -> Result<()> {
+        self.coordinator.offset_commit().await
+    }
+
+    pub fn into_stream(mut self) -> impl Stream<Item = Result<Record>> {
+        try_stream! {
+            if let Some(records) = self.records_rx.next().await {
+                for record in records {
+                    yield record
+                }
+            }
+        }
     }
 }

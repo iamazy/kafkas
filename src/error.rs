@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use futures::channel::mpsc::SendError;
 use kafka_protocol::{
     messages::{ApiKey, TopicName},
     protocol::{buf::NotEnoughBytesError, DecodeError, EncodeError},
@@ -50,6 +51,12 @@ impl From<FromUtf8Error> for Error {
     }
 }
 
+impl From<FromUtf8Error> for Box<Error> {
+    fn from(value: FromUtf8Error) -> Self {
+        Box::new(Error::Custom(value.to_string()))
+    }
+}
+
 impl<T> From<PoisonError<T>> for Error {
     fn from(value: PoisonError<T>) -> Self {
         Self::Custom(value.to_string())
@@ -89,6 +96,12 @@ impl From<EncodeError> for Error {
 impl From<DecodeError> for Error {
     fn from(_: DecodeError) -> Self {
         Error::Connection(ConnectionError::Decoding("decode error".into()))
+    }
+}
+
+impl From<SendError> for Error {
+    fn from(value: SendError) -> Self {
+        Error::Custom(value.to_string())
     }
 }
 

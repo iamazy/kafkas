@@ -6,7 +6,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use futures::lock::Mutex;
+use futures::{channel::mpsc, lock::Mutex, SinkExt};
 use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
@@ -47,6 +47,7 @@ pub struct Fetcher<Exe: Executor> {
     subscription: Arc<Mutex<SubscriptionState>>,
     sessions: DashMap<NodeId, FetchSession>,
     completed_fetches: VecDeque<CompletedFetch>,
+    records_tx: mpsc::UnboundedSender<Vec<Record>>,
 }
 
 impl<Exe: Executor> Fetcher<Exe> {
@@ -54,6 +55,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         client: Kafka<Exe>,
         timestamp: i64,
         subscription: Arc<Mutex<SubscriptionState>>,
+        records_tx: mpsc::UnboundedSender<Vec<Record>>,
     ) -> Self {
         let sessions = DashMap::new();
         for node in client.cluster_meta.nodes.iter() {
@@ -75,6 +77,7 @@ impl<Exe: Executor> Fetcher<Exe> {
             subscription,
             sessions,
             completed_fetches: VecDeque::new(),
+            records_tx,
         }
     }
 
@@ -103,6 +106,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         if let Some(version_range) = self.client.version_range(ApiKey::FetchKey) {
             let version = version_range.max;
 
+            let mut need_reset_offset = false;
             for mut entry in self.sessions.iter_mut() {
                 let node_id = entry.node;
                 let session = entry.value_mut();
@@ -180,6 +184,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                                         ) {
                                             info!("{error_msg}, resetting offset");
                                             partition_state.reset(default_offset_strategy)?;
+                                            need_reset_offset = true;
                                         } else {
                                             info!(
                                                 "{error_msg}, raising error to the application \
@@ -247,8 +252,10 @@ impl<Exe: Executor> Fetcher<Exe> {
                                                 records.len()
                                             );
 
-                                            self.completed_fetches
-                                                .push_back(CompletedFetch::new(tp, records));
+                                            self.records_tx.send(records).await?;
+                                            // TODO: support cache records
+                                            // self.completed_fetches
+                                            //     .push_back(CompletedFetch::new(tp, records));
                                         }
                                     }
                                     Some(error) => {
@@ -277,6 +284,9 @@ impl<Exe: Executor> Fetcher<Exe> {
                         }
                     }
                 }
+            }
+            if need_reset_offset {
+                self.reset_offset().await?;
             }
             Ok(())
         } else {
@@ -780,4 +790,14 @@ pub struct Fetch {
     records: HashMap<TopicPartition, Vec<Record>>,
     position_advanced: bool,
     pub num_records: i32,
+}
+
+impl Fetch {
+    pub(crate) fn records(self) -> Vec<Record> {
+        let mut records = Vec::with_capacity(self.num_records as usize);
+        for (_, records_per_tp) in self.records {
+            records.extend(records_per_tp);
+        }
+        records
+    }
 }
