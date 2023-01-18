@@ -95,95 +95,6 @@ impl<Exe: Executor> Fetcher<Exe> {
         }
     }
 
-    pub async fn fetchable_partitions(&self) -> Vec<TopicPartition> {
-        let exclude: HashSet<TopicPartition> = HashSet::new();
-        // for fetch in self.completed_fetches.iter() {
-        //     exclude.insert(fetch.partition.clone());
-        // }
-        self.subscription
-            .lock()
-            .await
-            .fetchable_partitions(|tp| !exclude.contains(tp))
-    }
-
-    pub async fn validate_position_on_metadata_change(&self) {
-        let mut lock = self.subscription.lock().await;
-        let mut tp_list = Vec::with_capacity(lock.assignments.len());
-        for (tp, _) in lock.assignments.iter() {
-            tp_list.push(tp.clone());
-        }
-        for tp in tp_list {
-            let current_leader = self.client.cluster_meta.current_leader(&tp);
-            let _ = lock.maybe_validate_position_for_current_leader(&tp, current_leader);
-        }
-    }
-
-    pub async fn prepare_fetch_requests(&self) -> Result<HashMap<NodeId, FetchRequestData>> {
-        let mut fetchable: HashMap<NodeId, FetchRequestDataBuilder> = HashMap::new();
-
-        self.validate_position_on_metadata_change().await;
-
-        for tp in self.fetchable_partitions().await.iter() {
-            if let Some(position) = self.subscription.lock().await.position(tp) {
-                if let Some(node) = position.current_leader.leader {
-                    if self.nodes_with_pending_fetch_requests.contains(&node) {
-                        trace!(
-                            "Skipping fetch for {} because previous request to {} has not been \
-                             processed",
-                            tp,
-                            node
-                        );
-                    } else {
-                        let data = FetchRequestPartitionData {
-                            topic_id: self.topic_id(&tp.topic),
-                            fetch_offset: position.offset,
-                            log_start_offset: INVALID_LOG_START_OFFSET,
-                            max_bytes: self.fetch_size,
-                            current_leader_epoch: position.offset_epoch,
-                            last_fetched_epoch: None,
-                        };
-                        if let Some(builder) = fetchable.get_mut(&node) {
-                            builder.add(tp.clone(), data);
-                        } else {
-                            if self.sessions.get_mut(&node).is_none() {
-                                let session = FetchSession::new(node);
-                                self.sessions.insert(node, session);
-                            }
-
-                            let mut builder = FetchRequestDataBuilder::new();
-                            builder.add(tp.clone(), data);
-                            fetchable.insert(node, builder);
-                            debug!(
-                                "Added {:?} fetch request for {} at position {} to node {}",
-                                self.isolation_level, tp, position.offset, node
-                            );
-                        }
-                    }
-                } else {
-                    debug!(
-                        "Requesting metadata update for {} since the position {:?} is missing the \
-                         current leader node",
-                        tp, position
-                    );
-                    // TODO: metadata update
-                    continue;
-                }
-            } else {
-                return Err(Error::Custom(format!(
-                    "Missing position for fetchable {tp}"
-                )));
-            }
-        }
-
-        let mut requests = HashMap::new();
-        for (node, mut builder) in fetchable {
-            if let Some(mut session) = self.sessions.get_mut(&node) {
-                requests.insert(node, builder.build(session.value_mut()));
-            }
-        }
-        Ok(requests)
-    }
-
     pub async fn collect_fetch(&mut self) -> Result<Fetch> {
         let mut fetch = Fetch::default();
         let mut records_remaining = self.max_poll_records;
@@ -415,8 +326,107 @@ impl<Exe: Executor> Fetcher<Exe> {
             Err(Error::InvalidApiRequest(ApiKey::FetchKey))
         }
     }
+}
 
-    pub async fn reset_offset(&mut self) -> Result<()> {
+impl<Exe: Executor> Fetcher<Exe> {
+    fn topic_id(&self, topic_name: &TopicName) -> Uuid {
+        if let Some(topic_id) = self.client.cluster_meta.topic_id(topic_name) {
+            topic_id
+        } else {
+            Uuid::nil()
+        }
+    }
+
+    async fn fetchable_partitions(&self) -> Vec<TopicPartition> {
+        let mut exclude: HashSet<TopicPartition> = HashSet::new();
+        for fetch in self.completed_fetches.lock().iter() {
+            exclude.insert(fetch.partition.clone());
+        }
+        self.subscription
+            .lock()
+            .await
+            .fetchable_partitions(|tp| !exclude.contains(tp))
+    }
+
+    async fn validate_position_on_metadata_change(&self) {
+        let mut lock = self.subscription.lock().await;
+        let mut tp_list = Vec::with_capacity(lock.assignments.len());
+        for (tp, _) in lock.assignments.iter() {
+            tp_list.push(tp.clone());
+        }
+        for tp in tp_list {
+            let current_leader = self.client.cluster_meta.current_leader(&tp);
+            let _ = lock.maybe_validate_position_for_current_leader(&tp, current_leader);
+        }
+    }
+
+    async fn prepare_fetch_requests(&self) -> Result<HashMap<NodeId, FetchRequestData>> {
+        let mut fetchable: HashMap<NodeId, FetchRequestDataBuilder> = HashMap::new();
+
+        self.validate_position_on_metadata_change().await;
+
+        for tp in self.fetchable_partitions().await.iter() {
+            if let Some(position) = self.subscription.lock().await.position(tp) {
+                if let Some(node) = position.current_leader.leader {
+                    if self.nodes_with_pending_fetch_requests.contains(&node) {
+                        trace!(
+                            "Skipping fetch for {} because previous request to {} has not been \
+                             processed",
+                            tp,
+                            node
+                        );
+                    } else {
+                        let data = FetchRequestPartitionData {
+                            topic_id: self.topic_id(&tp.topic),
+                            fetch_offset: position.offset,
+                            log_start_offset: INVALID_LOG_START_OFFSET,
+                            max_bytes: self.fetch_size,
+                            current_leader_epoch: position.offset_epoch,
+                            last_fetched_epoch: None,
+                        };
+                        if let Some(builder) = fetchable.get_mut(&node) {
+                            builder.add(tp.clone(), data);
+                        } else {
+                            if self.sessions.get_mut(&node).is_none() {
+                                let session = FetchSession::new(node);
+                                self.sessions.insert(node, session);
+                            }
+
+                            let mut builder = FetchRequestDataBuilder::new();
+                            builder.add(tp.clone(), data);
+                            fetchable.insert(node, builder);
+                            debug!(
+                                "Added {:?} fetch request for {} at position {} to node {}",
+                                self.isolation_level, tp, position.offset, node
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        "Requesting metadata update for {} since the position {:?} is missing the \
+                         current leader node",
+                        tp, position
+                    );
+                    // TODO: metadata update
+                    continue;
+                }
+            } else {
+                return Err(Error::Custom(format!(
+                    "Missing position for fetchable {tp}"
+                )));
+            }
+        }
+
+        let mut requests = HashMap::new();
+        for (node, mut builder) in fetchable {
+            if let Some(mut session) = self.sessions.get_mut(&node) {
+                requests.insert(node, builder.build(session.value_mut()));
+            }
+        }
+        Ok(requests)
+    }
+
+    async fn reset_offset(&mut self) -> Result<()> {
         if let Some(version_range) = self.client.version_range(ApiKey::ListOffsetsKey) {
             let version = version_range.max;
             let partitions = self
@@ -459,7 +469,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                             OffsetResetStrategy::from_timestamp(*timestamp),
                             list_offsets_data,
                         )
-                        .await?;
+                            .await?;
                     }
                 }
             }
@@ -467,16 +477,6 @@ impl<Exe: Executor> Fetcher<Exe> {
             Ok(())
         } else {
             Err(Error::InvalidApiRequest(ApiKey::ListOffsetsKey))
-        }
-    }
-}
-
-impl<Exe: Executor> Fetcher<Exe> {
-    fn topic_id(&self, topic_name: &TopicName) -> Uuid {
-        if let Some(topic_id) = self.client.cluster_meta.topic_id(topic_name) {
-            topic_id
-        } else {
-            Uuid::nil()
         }
     }
 
@@ -877,16 +877,6 @@ pub struct CompletedFetch {
     last_epoch: Option<i32>,
     is_consumed: bool,
     initialized: bool,
-}
-
-impl CompletedFetch {
-    // pub fn new(partition: TopicPartition, records: Vec<Record>) -> Self {
-    //     Self {
-    //         partition,
-    //         records,
-    //         ..Default::default()
-    //     }
-    // }
 }
 
 struct ListOffsetResult {
