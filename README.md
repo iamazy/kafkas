@@ -32,7 +32,7 @@ To get started using kafkas:
 async fn main() -> Result<(), Box<Error>> {
     let mut options = KafkaOptions::new();
     options.client_id("app");
-    let kafka_client = Kafka::new("127.0.0.1:50088", options, None, None, TokioExecutor).await?;
+    let client = Kafka::new("127.0.0.1:50088", options, None, None, TokioExecutor).await?;
 
     let producer = Producer::new(client, ProducerOptions::default()).await?;
 
@@ -63,9 +63,9 @@ async fn main() -> Result<(), Box<Error>> {
 async fn main() -> Result<(), Box<Error>> {
     let mut options = KafkaOptions::new();
     options.client_id("app");
-    let kafka_client = Kafka::new("127.0.0.1:50088", options, None, None, TokioExecutor).await?;
+    let client = Kafka::new("127.0.0.1:50088", options, None, None, TokioExecutor).await?;
 
-    let mut consumer = Consumer::new(kafka_client.clone(), "app").await?;
+    let mut consumer = Consumer::new(client, "app").await?;
     consumer.subscribe(vec!["kafka"]).await?;
 
     let consume_stream = consumer.stream()?;
