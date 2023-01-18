@@ -5,9 +5,7 @@ use std::{
 
 use kafka_protocol::{
     error::ParseResponseErrorCode,
-    messages::{
-        fetch_request::FetchPartition, fetch_response::PartitionData, FetchResponse, TopicName,
-    },
+    messages::{fetch_response::PartitionData, FetchResponse, TopicName},
     ResponseError,
 };
 use tracing::{debug, info};
@@ -15,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     consumer::{fetcher::FetchMetadata, INITIAL_EPOCH, INVALID_SESSION_ID},
-    metadata::TopicPartition,
+    metadata::{TopicIdPartition, TopicPartition},
     NodeId,
 };
 
@@ -24,7 +22,7 @@ pub struct FetchSession {
     pub node: NodeId,
     pub next_metadata: FetchMetadata,
     pub session_topic_names: HashMap<Uuid, TopicName>,
-    pub session_partitions: HashMap<TopicPartition, FetchPartition>,
+    pub session_partitions: HashMap<TopicPartition, FetchRequestPartitionData>,
 }
 
 impl FetchSession {
@@ -258,4 +256,167 @@ fn find_missing<'a, T: Eq + Hash>(
         }
     }
     ret
+}
+
+#[derive(Debug)]
+pub struct FetchRequestData {
+    pub(crate) to_send: HashMap<TopicPartition, FetchRequestPartitionData>,
+    pub(crate) to_forget: Vec<TopicIdPartition>,
+    pub(crate) to_replace: Vec<TopicIdPartition>,
+    pub(crate) session_partitions: HashMap<TopicPartition, FetchRequestPartitionData>,
+    pub(crate) metadata: FetchMetadata,
+    pub(crate) can_use_topic_ids: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FetchRequestPartitionData {
+    pub(crate) topic_id: Uuid,
+    pub(crate) fetch_offset: i64,
+    pub(crate) log_start_offset: i64,
+    pub(crate) max_bytes: i32,
+    pub(crate) current_leader_epoch: Option<i32>,
+    pub(crate) last_fetched_epoch: Option<i32>,
+}
+
+impl FetchRequestPartitionData {
+    pub fn copied_from(&mut self, data: &FetchRequestPartitionData) {
+        self.topic_id = data.topic_id;
+        self.fetch_offset = data.fetch_offset;
+        self.log_start_offset = data.log_start_offset;
+        self.max_bytes = data.max_bytes;
+        self.current_leader_epoch = data.current_leader_epoch;
+        self.last_fetched_epoch = data.last_fetched_epoch;
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct FetchRequestDataBuilder {
+    next: HashMap<TopicPartition, FetchRequestPartitionData>,
+    topic_names: HashMap<Uuid, TopicName>,
+    partitions_without_topic_ids: usize,
+    copy_session_partitions: bool,
+}
+
+impl FetchRequestDataBuilder {
+    pub fn new() -> Self {
+        Self {
+            copy_session_partitions: true,
+            ..Default::default()
+        }
+    }
+
+    /// Mark that we want data from this partition in the upcoming fetch.
+    pub fn add(&mut self, tp: TopicPartition, data: FetchRequestPartitionData) {
+        if data.topic_id == Uuid::nil() {
+            self.partitions_without_topic_ids += 1;
+        } else {
+            self.topic_names.insert(data.topic_id, tp.topic.clone());
+        }
+        self.next.insert(tp, data);
+    }
+
+    pub fn build(&mut self, session: &mut FetchSession) -> FetchRequestData {
+        let mut can_use_topic_ids = self.partitions_without_topic_ids == 0;
+        if session.next_metadata.is_full() {
+            debug!(
+                "Built full fetch {} for node {}",
+                session.next_metadata, session.node
+            );
+            session.session_partitions.clear();
+            session.session_partitions.extend(self.next.drain());
+
+            session.session_topic_names.clear();
+            if can_use_topic_ids {
+                session.session_topic_names.extend(self.topic_names.drain());
+            }
+
+            let mut to_send = HashMap::with_capacity(session.session_partitions.len());
+            for (tp, data) in session.session_partitions.iter() {
+                to_send.insert(tp.clone(), data.clone());
+            }
+            return FetchRequestData {
+                to_send: to_send.clone(),
+                to_forget: Vec::new(),
+                to_replace: Vec::new(),
+                session_partitions: to_send,
+                metadata: session.next_metadata,
+                can_use_topic_ids,
+            };
+        }
+
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        let mut altered = Vec::new();
+        let mut replaced = Vec::new();
+
+        let mut session_remove = Vec::new();
+        for (tp, prev_data) in session.session_partitions.iter_mut() {
+            if let Some(next_data) = self.next.remove(tp) {
+                if prev_data.topic_id != next_data.topic_id
+                    && !prev_data.topic_id.is_nil()
+                    && !next_data.topic_id.is_nil()
+                {
+                    let topic_id = prev_data.topic_id;
+                    prev_data.copied_from(&next_data);
+                    self.next.insert(tp.clone(), next_data);
+                    replaced.push(TopicIdPartition {
+                        topic_id,
+                        partition: tp.clone(),
+                    });
+                } else if prev_data != &next_data {
+                    let topic_id = next_data.topic_id;
+                    prev_data.copied_from(&next_data);
+                    self.next.insert(tp.clone(), next_data);
+                    altered.push(TopicIdPartition {
+                        topic_id,
+                        partition: tp.clone(),
+                    });
+                }
+            } else {
+                session_remove.push(tp.clone());
+                removed.push(TopicIdPartition {
+                    topic_id: prev_data.topic_id,
+                    partition: tp.clone(),
+                });
+                if can_use_topic_ids && prev_data.topic_id.is_nil() {
+                    can_use_topic_ids = false;
+                }
+            }
+        }
+
+        for tp in session_remove.iter() {
+            session.session_partitions.remove(tp);
+        }
+
+        for (tp, next_data) in self.next.iter() {
+            if session.session_partitions.contains_key(tp) {
+                break;
+            }
+            let topic_id = next_data.topic_id;
+            session
+                .session_partitions
+                .insert(tp.clone(), next_data.clone());
+            added.push(TopicIdPartition {
+                topic_id,
+                partition: tp.clone(),
+            });
+        }
+
+        session.session_topic_names.clear();
+        if can_use_topic_ids {
+            session.session_topic_names.extend(self.topic_names.drain());
+        }
+
+        let mut to_send = HashMap::with_capacity(self.next.len());
+        to_send.extend(self.next.drain());
+
+        FetchRequestData {
+            to_send,
+            to_forget: removed,
+            to_replace: replaced,
+            session_partitions: session.session_partitions.clone(),
+            metadata: session.next_metadata,
+            can_use_topic_ids,
+        }
+    }
 }

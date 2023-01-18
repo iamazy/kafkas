@@ -27,7 +27,7 @@ use kafka_protocol::{
         NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE,
     },
 };
-use tracing::{debug, error, warn};
+use tracing::{error, trace, warn};
 
 use crate::{
     client::{Kafka, SerializeMessage},
@@ -288,7 +288,7 @@ impl<Exe: Executor> Producer<Exe> {
         encode_options: &RecordEncodeOptions,
     ) -> Result<()> {
         if self.num_records.load(Ordering::Relaxed) == 0 {
-            debug!("no records to send.");
+            trace!("no records to send.");
             self.client.executor.delay(Duration::from_secs(1)).await;
             return Ok(());
         }

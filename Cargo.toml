@@ -23,13 +23,14 @@ bytes = "1"
 chrono = "0.4"
 dashmap = "5"
 fnv = "1"
-futures-timer = "3.0"
 futures = "0.3"
 fxhash = "0.2"
 indexmap = "1"
-kafka-protocol = { git = "https://github.com/iamazy/kafka-protocol-rs", branch = "trunk" }
+#kafka-protocol = { git = "https://github.com/iamazy/kafka-protocol-rs", branch = "trunk" }
+kafka-protocol = { path = "../kafka-protocol-rs" }
 native-tls = "0.2"
 pin-project-lite = "0.2"
+parking_lot = "0.12"
 rand = "0.8"
 regex = "1.1.7"
 thiserror = "1"

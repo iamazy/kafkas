@@ -92,6 +92,12 @@ impl From<&MetadataResponsePartition> for Partition {
     }
 }
 
+#[derive(Debug, Clone, Default, Eq, PartialEq, Hash)]
+pub struct TopicIdPartition {
+    pub topic_id: Uuid,
+    pub partition: TopicPartition,
+}
+
 #[derive(Clone, Default, Eq, PartialEq, Hash)]
 pub struct TopicPartition {
     pub topic: TopicName,

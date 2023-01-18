@@ -108,7 +108,15 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.inner.lock().await.subscriptions.clone()
     }
 
-    pub async fn offset_fetch(&mut self) -> Result<()> {
+    pub async fn join_group(&self) -> Result<()> {
+        self.inner.lock().await.join_group().await
+    }
+
+    pub async fn sync_group(&self) -> Result<()> {
+        self.inner.lock().await.sync_group().await
+    }
+
+    pub async fn offset_fetch(&self) -> Result<()> {
         self.inner.lock().await.offset_fetch().await
     }
 
@@ -117,8 +125,9 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     }
 
     pub async fn prepare_fetch(&self) -> Result<()> {
-        self.inner.lock().await.join_group().await?;
-        self.inner.lock().await.sync_group().await?;
+        self.join_group().await?;
+        self.sync_group().await?;
+        self.offset_fetch().await?;
 
         let mut heartbeat_interval = self.client.executor.interval(Duration::from_millis(
             self.inner
@@ -231,7 +240,7 @@ impl<Exe: Executor> Inner<Exe> {
                          id: {}",
                         self.group_meta.group_id.0, self.group_meta.member_id
                     );
-                    return self.join_group().await;
+                    self.join_group().await
                 }
                 Some(error) => Err(Error::Response { error, msg: None }),
                 None => {
@@ -310,10 +319,15 @@ impl<Exe: Executor> Inner<Exe> {
                     Assignment::deserialize_from_bytes(&mut sync_group_response.assignment)?;
                 for (topic, partitions) in assignment.partitions {
                     for partition in partitions.iter() {
-                        self.subscriptions.lock().await.assignments.insert(
-                            TopicPartition::new(topic.clone(), *partition),
-                            TopicPartitionState::new(*partition),
-                        );
+                        let tp = TopicPartition::new(topic.clone(), *partition);
+                        let mut tp_state = TopicPartitionState::new(*partition);
+                        tp_state.position.current_leader =
+                            self.client.cluster_meta.current_leader(&tp);
+                        self.subscriptions
+                            .lock()
+                            .await
+                            .assignments
+                            .insert(tp, tp_state);
                     }
                 }
                 self.state = MemberState::Stable;
@@ -399,7 +413,7 @@ impl<Exe: Executor> Inner<Exe> {
                 .heartbeat(&self.node, self.heartbeat_builder(version_range.max)?)
                 .await?;
 
-            return match heartbeat_response.error_code.err() {
+            match heartbeat_response.error_code.err() {
                 None => {
                     debug!(
                         "Heartbeat success, group: {}, member: {}",
@@ -469,7 +483,7 @@ impl<Exe: Executor> Inner<Exe> {
                     error,
                     msg: Some(format!("Unexpected error in heartbeat response: {error}")),
                 }),
-            };
+            }
         } else {
             Err(Error::InvalidApiRequest(ApiKey::HeartbeatKey))
         }
@@ -634,14 +648,17 @@ impl<Exe: Executor> Inner<Exe> {
         if version <= 8 {
             request.group_id = self.group_meta.group_id.clone();
 
+            let state_lock = self.subscriptions.lock().await;
             let mut topics: HashMap<TopicName, Vec<OffsetCommitRequestPartition>> =
-                HashMap::with_capacity(self.subscriptions.lock().await.topics.len());
-            for (tp, tp_state) in self.subscriptions.lock().await.assignments.iter() {
+                HashMap::with_capacity(state_lock.topics.len());
+            let all_consumed = state_lock.all_consumed();
+            for (tp, meta) in all_consumed.iter() {
                 let partition = OffsetCommitRequestPartition {
-                    partition_index: tp_state.partition,
-                    committed_offset: tp_state.position.offset,
-                    committed_leader_epoch: tp_state.position.offset_epoch.unwrap_or(-1),
+                    partition_index: tp.partition,
+                    committed_offset: meta.committed_offset,
+                    committed_leader_epoch: meta.committed_leader_epoch.unwrap_or(-1),
                     commit_timestamp: -1,
+                    committed_metadata: meta.metadata.clone(),
                     ..Default::default()
                 };
 

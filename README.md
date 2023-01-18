@@ -11,7 +11,7 @@ Async kafka client in pure Rust.
 ## APIs
 
 - [x] Producer
-- [ ] Consumer
+- [x] Consumer
 - [ ] Streams
 - [ ] Connect
 - [ ] Admin client
@@ -24,6 +24,8 @@ kafkas = { git = "https://github.com/iamazy/kafkas", branch = "main" }
 ```
 
 To get started using kafkas:
+
+- Producer
 
 ```rust
 #[tokio::main]
@@ -51,6 +53,29 @@ async fn main() -> Result<(), Box<Error>> {
     }
     // hold your main thread to prevent exit immediately.
     tokio::time::sleep(Duration::from_secs(1)).await;
+}
+```
+
+- Consumer
+
+```rust
+#[tokio::main]
+async fn main() -> Result<(), Box<Error>> {
+    let mut options = KafkaOptions::new();
+    options.client_id("app");
+    let kafka_client = Kafka::new("127.0.0.1:50088", options, None, None, TokioExecutor).await?;
+
+    let mut consumer = Consumer::new(kafka_client.clone(), "app").await?;
+    consumer.subscribe(vec!["kafka"]).await?;
+
+    let consume_stream = consumer.stream()?;
+    pin_mut!(consume_stream);
+
+    while let Some(Ok(record)) = consume_stream.next().await {
+        if let Some(record) = record.value {
+            println!("{:?}", String::from_utf8(record.to_vec())?);
+        }
+    }
 }
 ```
 

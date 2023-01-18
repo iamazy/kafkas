@@ -1,37 +1,45 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::{Display, Formatter},
     hash::Hash,
     sync::Arc,
+    vec::Drain,
 };
 
 use dashmap::DashMap;
-use futures::{channel::mpsc, lock::Mutex, SinkExt};
+use futures::{channel::mpsc, lock::Mutex};
 use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
-        fetch_request::{FetchPartition, FetchTopic},
+        fetch_request::{FetchPartition, FetchTopic, ForgottenTopic},
+        fetch_response::PartitionData,
         list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
         ApiKey, BrokerId, FetchRequest, ListOffsetsRequest, ListOffsetsResponse, TopicName,
     },
     records::{Record, RecordBatchDecoder, NO_PARTITION_LEADER_EPOCH},
     ResponseError,
 };
-use tracing::{debug, error, info, warn};
+use parking_lot::Mutex as plMutex;
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use crate::{
     client::Kafka,
     consumer::{
-        fetch_session::FetchSession, FetchPosition, IsolationLevel, OffsetResetStrategy,
-        SubscriptionState, FINAL_EPOCH, INITIAL_EPOCH, INVALID_SESSION_ID,
+        fetch_session::{
+            FetchRequestData, FetchRequestDataBuilder, FetchRequestPartitionData, FetchSession,
+        },
+        FetchPosition, IsolationLevel, OffsetResetStrategy, SubscriptionState, FINAL_EPOCH,
+        INITIAL_EPOCH, INVALID_SESSION_ID,
     },
     error::Result,
     executor::Executor,
-    metadata::{Node, TopicPartition},
-    Error, NodeId, UNKNOWN_EPOCH, UNKNOWN_OFFSET,
+    map_to_list,
+    metadata::{Node, TopicIdPartition, TopicPartition},
+    Error, NodeId, INVALID_LOG_START_OFFSET, UNKNOWN_EPOCH, UNKNOWN_OFFSET,
 };
 
+#[derive(Clone)]
 pub struct Fetcher<Exe: Executor> {
     client: Kafka<Exe>,
     timestamp: i64,
@@ -41,13 +49,16 @@ pub struct Fetcher<Exe: Executor> {
     fetch_size: i32,
     retry_backoff_ms: i64,
     request_timeout_ms: i64,
-    max_poll_records: i32,
+    pub(crate) max_poll_records: i32,
     check_crcs: bool,
     client_rack_id: String,
-    subscription: Arc<Mutex<SubscriptionState>>,
-    sessions: DashMap<NodeId, FetchSession>,
-    completed_fetches: VecDeque<CompletedFetch>,
-    records_tx: mpsc::UnboundedSender<Vec<Record>>,
+    isolation_level: IsolationLevel,
+    pub(crate) default_offset_strategy: OffsetResetStrategy,
+    pub(crate) subscription: Arc<Mutex<SubscriptionState>>,
+    sessions: Arc<DashMap<NodeId, FetchSession>>,
+    completed_fetches: Arc<plMutex<VecDeque<CompletedFetch>>>,
+    records_tx: mpsc::UnboundedSender<CompletedFetch>,
+    nodes_with_pending_fetch_requests: HashSet<i32>,
 }
 
 impl<Exe: Executor> Fetcher<Exe> {
@@ -55,7 +66,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         client: Kafka<Exe>,
         timestamp: i64,
         subscription: Arc<Mutex<SubscriptionState>>,
-        records_tx: mpsc::UnboundedSender<Vec<Record>>,
+        records_tx: mpsc::UnboundedSender<CompletedFetch>,
     ) -> Self {
         let sessions = DashMap::new();
         for node in client.cluster_meta.nodes.iter() {
@@ -75,218 +86,329 @@ impl<Exe: Executor> Fetcher<Exe> {
             check_crcs: false,
             client_rack_id: String::default(),
             subscription,
-            sessions,
-            completed_fetches: VecDeque::new(),
+            isolation_level: IsolationLevel::ReadUncommitted,
+            default_offset_strategy: OffsetResetStrategy::default(),
+            sessions: Arc::new(sessions),
+            completed_fetches: Arc::new(plMutex::new(VecDeque::new())),
             records_tx,
+            nodes_with_pending_fetch_requests: HashSet::new(),
         }
     }
 
-    pub fn collect_fetch(&mut self) -> Result<Fetch> {
-        let mut fetch = Fetch::default();
-        let mut records_remaining = self.max_poll_records as usize;
-        while records_remaining > 0 {
-            if let Some(completed_fetch) = self.completed_fetches.pop_back() {
-                records_remaining -= completed_fetch.records.len();
-                if let Some(records) = fetch.records.get_mut(&completed_fetch.partition) {
-                    records.extend(completed_fetch.records);
+    pub async fn fetchable_partitions(&self) -> Vec<TopicPartition> {
+        let exclude: HashSet<TopicPartition> = HashSet::new();
+        // for fetch in self.completed_fetches.iter() {
+        //     exclude.insert(fetch.partition.clone());
+        // }
+        self.subscription
+            .lock()
+            .await
+            .fetchable_partitions(|tp| !exclude.contains(tp))
+    }
+
+    pub async fn validate_position_on_metadata_change(&self) {
+        let mut lock = self.subscription.lock().await;
+        let mut tp_list = Vec::with_capacity(lock.assignments.len());
+        for (tp, _) in lock.assignments.iter() {
+            tp_list.push(tp.clone());
+        }
+        for tp in tp_list {
+            let current_leader = self.client.cluster_meta.current_leader(&tp);
+            let _ = lock.maybe_validate_position_for_current_leader(&tp, current_leader);
+        }
+    }
+
+    pub async fn prepare_fetch_requests(&self) -> Result<HashMap<NodeId, FetchRequestData>> {
+        let mut fetchable: HashMap<NodeId, FetchRequestDataBuilder> = HashMap::new();
+
+        self.validate_position_on_metadata_change().await;
+
+        for tp in self.fetchable_partitions().await.iter() {
+            if let Some(position) = self.subscription.lock().await.position(tp) {
+                if let Some(node) = position.current_leader.leader {
+                    if self.nodes_with_pending_fetch_requests.contains(&node) {
+                        trace!(
+                            "Skipping fetch for {} because previous request to {} has not been \
+                             processed",
+                            tp,
+                            node
+                        );
+                    } else {
+                        let data = FetchRequestPartitionData {
+                            topic_id: self.topic_id(&tp.topic),
+                            fetch_offset: position.offset,
+                            log_start_offset: INVALID_LOG_START_OFFSET,
+                            max_bytes: self.fetch_size,
+                            current_leader_epoch: position.offset_epoch,
+                            last_fetched_epoch: None,
+                        };
+                        if let Some(builder) = fetchable.get_mut(&node) {
+                            builder.add(tp.clone(), data);
+                        } else {
+                            if self.sessions.get_mut(&node).is_none() {
+                                let session = FetchSession::new(node);
+                                self.sessions.insert(node, session);
+                            }
+
+                            let mut builder = FetchRequestDataBuilder::new();
+                            builder.add(tp.clone(), data);
+                            fetchable.insert(node, builder);
+                            debug!(
+                                "Added {:?} fetch request for {} at position {} to node {}",
+                                self.isolation_level, tp, position.offset, node
+                            );
+                        }
+                    }
                 } else {
-                    fetch
-                        .records
-                        .insert(completed_fetch.partition, completed_fetch.records);
+                    debug!(
+                        "Requesting metadata update for {} since the position {:?} is missing the \
+                         current leader node",
+                        tp, position
+                    );
+                    // TODO: metadata update
+                    continue;
+                }
+            } else {
+                return Err(Error::Custom(format!(
+                    "Missing position for fetchable {tp}"
+                )));
+            }
+        }
+
+        let mut requests = HashMap::new();
+        for (node, mut builder) in fetchable {
+            if let Some(mut session) = self.sessions.get_mut(&node) {
+                requests.insert(node, builder.build(session.value_mut()));
+            }
+        }
+        Ok(requests)
+    }
+
+    pub async fn collect_fetch(&mut self) -> Result<Fetch> {
+        let mut fetch = Fetch::default();
+        let mut records_remaining = self.max_poll_records;
+        let mut need_reset_offset = false;
+        while records_remaining > 0 {
+            let completed_fetch = self.completed_fetches.lock().pop_front();
+            if let Some(completed_fetch) = completed_fetch {
+                let partition = completed_fetch.partition_data;
+                let tp = completed_fetch.partition;
+                if let Some(partition_state) =
+                    self.subscription.lock().await.assignments.get_mut(&tp)
+                {
+                    match partition.error_code.err() {
+                        Some(
+                            error @ ResponseError::NotLeaderOrFollower
+                            | error @ ResponseError::ReplicaNotAvailable
+                            | error @ ResponseError::KafkaStorageError
+                            | error @ ResponseError::FencedLeaderEpoch
+                            | error @ ResponseError::OffsetNotAvailable,
+                        ) => {
+                            debug!("Error in fetch for {tp}: {error}");
+                            // TODO: update metadata
+                        }
+                        Some(ResponseError::UnknownTopicOrPartition) => {
+                            warn!("Received unknown topic or partition error in fetch for {tp}");
+                            // TODO: update metadata
+                        }
+                        Some(ResponseError::UnknownTopicId) => {
+                            warn!("Received unknown topic ID error in fetch for {tp}");
+                            // TODO: update metadata
+                        }
+                        Some(ResponseError::InconsistentTopicId) => {
+                            warn!("Received inconsistent topic ID error in fetch for {tp}");
+                            // TODO: update metadata
+                        }
+                        Some(error @ ResponseError::OffsetOutOfRange) => {
+                            let error_msg = format!(
+                                "Fetch position {} is out of range for {tp}",
+                                partition_state.position.offset
+                            );
+                            let strategy = self.default_offset_strategy;
+                            if !matches!(strategy, OffsetResetStrategy::None) {
+                                info!("{error_msg}, resetting offset");
+                                partition_state.reset(strategy)?;
+                                need_reset_offset = true;
+                            } else {
+                                info!(
+                                    "{error_msg}, raising error to the application since no reset \
+                                     policy is configured."
+                                );
+                                return Err(Error::Response { error, msg: None });
+                            }
+                        }
+                        Some(error @ ResponseError::TopicAuthorizationFailed) => {
+                            warn!("Not authorized to read from {tp}");
+                            return Err(Error::Response { error, msg: None });
+                        }
+                        Some(ResponseError::UnknownLeaderEpoch) => {
+                            debug!("Received unknown leader epoch error in fetch for {tp}");
+                        }
+                        Some(ResponseError::UnknownServerError) => {
+                            warn!("Unknown server error while fetching offset for {tp}");
+                        }
+                        Some(error @ ResponseError::CorruptMessage) => {
+                            error!("Encountered corrupt message when fetching offset for {tp}");
+                            return Err(Error::Response { error, msg: None });
+                        }
+                        None => {
+                            if partition.last_stable_offset >= 0 {
+                                partition_state.last_stable_offset = partition.last_stable_offset;
+                            }
+                            if partition.log_start_offset >= 0 {
+                                partition_state.log_start_offset = partition.log_start_offset;
+                            }
+                            if partition.high_watermark >= 0 {
+                                partition_state.high_water_mark = partition.high_watermark;
+                            }
+                            debug!(
+                                "Fetch {tp} success, last stable offset: {}, log start offset: \
+                                 {}, high_water_mark: {}",
+                                partition.last_stable_offset,
+                                partition.log_start_offset,
+                                partition.high_watermark
+                            );
+                            // decode record batch
+                            if let Some(mut records) = partition.records {
+                                let records = RecordBatchDecoder::decode(&mut records)?;
+                                if let Some(record) =
+                                    records.iter().max_by_key(|record| record.offset)
+                                {
+                                    partition_state.position.offset = record.offset;
+                                    partition_state.position.current_leader.epoch =
+                                        Some(record.partition_leader_epoch);
+                                }
+                                debug!(
+                                    "Fetch {tp} records success, records size: {}",
+                                    records.len()
+                                );
+                                records_remaining -= records.len() as i32;
+                                fetch.records.insert(tp, records);
+                            }
+                        }
+                        Some(error) => {
+                            error!("Unexpected error code {error} while fetching offset from {tp}")
+                        }
+                    }
                 }
             } else {
                 break;
             }
         }
-        fetch.num_records = self.max_poll_records - records_remaining as i32;
+        if need_reset_offset {
+            self.reset_offset().await?;
+        }
+        fetch.num_records = self.max_poll_records - records_remaining;
         Ok(fetch)
     }
 
     pub async fn fetch(&mut self) -> Result<()> {
         if let Some(version_range) = self.client.version_range(ApiKey::FetchKey) {
-            let version = version_range.max;
-
-            let mut need_reset_offset = false;
-            for mut entry in self.sessions.iter_mut() {
-                let node_id = entry.node;
-                let session = entry.value_mut();
-                if let Some(node) = self.client.cluster_meta.nodes.get(&node_id) {
+            let mut version = version_range.max;
+            let fetch_requests = self.prepare_fetch_requests().await?;
+            for (node, mut fetch_request_data) in fetch_requests {
+                if !fetch_request_data.can_use_topic_ids {
+                    version = 12;
+                }
+                let metadata = fetch_request_data.metadata;
+                if let Some(node) = self.client.cluster_meta.nodes.get(&node) {
                     let fetch_response = self
                         .client
                         .fetch(
                             node.value(),
-                            self.fetch_builder(node.id, session, version).await?,
+                            self.fetch_builder(&mut fetch_request_data, version).await?,
                         )
                         .await?;
 
-                    if !session.handle_fetch_response(&fetch_response, version) {
-                        if let Some(error) = fetch_response.error_code.err() {
-                            if error == ResponseError::FetchSessionTopicIdError {
-                                // TODO: update metadata
-                            }
-                            return Ok(());
-                        }
-                    }
-
-                    for fetchable_topic in fetch_response.responses {
-                        let topic = if let Some(topic_name) =
-                            session.session_topic_names.get(&fetchable_topic.topic_id)
-                        {
-                            topic_name
-                        } else {
-                            &fetchable_topic.topic
-                        };
-
-                        let default_offset_strategy =
-                            self.subscription.lock().await.default_offset_strategy;
-                        for partition in fetchable_topic.partitions {
-                            let tp = TopicPartition::new(topic.clone(), partition.partition_index);
-                            if let Some(partition_state) =
-                                self.subscription.lock().await.assignments.get_mut(&tp)
+                    match self.sessions.get_mut(node.key()) {
+                        Some(mut session) => {
+                            if !session
+                                .value_mut()
+                                .handle_fetch_response(&fetch_response, version)
                             {
-                                match partition.error_code.err() {
-                                    Some(
-                                        error @ ResponseError::NotLeaderOrFollower
-                                        | error @ ResponseError::ReplicaNotAvailable
-                                        | error @ ResponseError::KafkaStorageError
-                                        | error @ ResponseError::FencedLeaderEpoch
-                                        | error @ ResponseError::OffsetNotAvailable,
-                                    ) => {
-                                        debug!("Error in fetch for {tp}: {error}");
+                                if let Some(error) = fetch_response.error_code.err() {
+                                    if error == ResponseError::FetchSessionTopicIdError {
                                         // TODO: update metadata
                                     }
-                                    Some(ResponseError::UnknownTopicOrPartition) => {
-                                        warn!(
-                                            "Received unknown topic or partition error in fetch \
-                                             for {tp}"
-                                        );
-                                        // TODO: update metadata
-                                    }
-                                    Some(ResponseError::UnknownTopicId) => {
-                                        warn!("Received unknown topic ID error in fetch for {tp}");
-                                        // TODO: update metadata
-                                    }
-                                    Some(ResponseError::InconsistentTopicId) => {
-                                        warn!(
-                                            "Received inconsistent topic ID error in fetch for \
-                                             {tp}"
-                                        );
-                                        // TODO: update metadata
-                                    }
-                                    Some(error @ ResponseError::OffsetOutOfRange) => {
-                                        let error_msg = format!(
-                                            "Fetch position {} is out of range for {tp}",
-                                            partition_state.position.offset
-                                        );
-                                        if !matches!(
-                                            default_offset_strategy,
-                                            OffsetResetStrategy::None
-                                        ) {
-                                            info!("{error_msg}, resetting offset");
-                                            partition_state.reset(default_offset_strategy)?;
-                                            need_reset_offset = true;
-                                        } else {
-                                            info!(
-                                                "{error_msg}, raising error to the application \
-                                                 since no reset policy is configured."
-                                            );
-                                            return Err(Error::Response { error, msg: None });
-                                        }
-                                    }
-                                    Some(error @ ResponseError::TopicAuthorizationFailed) => {
-                                        warn!("Not authorized to read from {tp}");
-                                        return Err(Error::Response { error, msg: None });
-                                    }
-                                    Some(ResponseError::UnknownLeaderEpoch) => {
-                                        debug!(
-                                            "Received unknown leader epoch error in fetch for {tp}"
-                                        );
-                                    }
-                                    Some(ResponseError::UnknownServerError) => {
-                                        warn!(
-                                            "Unknown server error while fetching offset for {tp}"
-                                        );
-                                    }
-                                    Some(error @ ResponseError::CorruptMessage) => {
-                                        error!(
-                                            "Encountered corrupt message when fetching offset for \
-                                             {tp}"
-                                        );
-                                        return Err(Error::Response { error, msg: None });
-                                    }
-                                    None => {
-                                        if partition.last_stable_offset >= 0 {
-                                            partition_state.last_stable_offset =
-                                                partition.last_stable_offset;
-                                        }
-                                        if partition.log_start_offset >= 0 {
-                                            partition_state.log_start_offset =
-                                                partition.log_start_offset;
-                                        }
-                                        if partition.high_watermark >= 0 {
-                                            partition_state.high_water_mark =
-                                                partition.high_watermark;
-                                        }
+                                    continue;
+                                }
+                            }
 
-                                        debug!(
-                                            "Fetch {tp} success, last stable offset: {}, log \
-                                             start offset: {}, high_water_mark: {}",
-                                            partition.last_stable_offset,
-                                            partition.log_start_offset,
-                                            partition.high_watermark
-                                        );
+                            for fetchable_topic in fetch_response.responses {
+                                let topic = if let Some(topic_name) =
+                                    session.session_topic_names.get(&fetchable_topic.topic_id)
+                                {
+                                    topic_name
+                                } else {
+                                    &fetchable_topic.topic
+                                };
 
-                                        // decode record batch
-                                        if let Some(mut records) = partition.records {
-                                            let records = RecordBatchDecoder::decode(&mut records)?;
-                                            if let Some(record) =
-                                                records.iter().max_by_key(|record| record.offset)
-                                            {
-                                                partition_state.position.offset = record.offset;
-                                                partition_state.position.current_leader.epoch =
-                                                    Some(record.partition_leader_epoch);
-                                            }
+                                for partition in fetchable_topic.partitions {
+                                    let tp = TopicPartition::new(
+                                        topic.clone(),
+                                        partition.partition_index,
+                                    );
 
+                                    match fetch_request_data.session_partitions.get(&tp) {
+                                        Some(data) => {
                                             debug!(
-                                                "Fetch {tp} records success, records size: {}",
-                                                records.len()
+                                                "Fetch {:?} at offset {} for {tp}",
+                                                self.isolation_level, data.fetch_offset
                                             );
-
-                                            self.records_tx.send(records).await?;
-                                            // TODO: support cache records
-                                            // self.completed_fetches
-                                            //     .push_back(CompletedFetch::new(tp, records));
+                                            self.completed_fetches.lock().push_back(
+                                                CompletedFetch {
+                                                    partition: tp,
+                                                    partition_data: partition,
+                                                    next_fetch_offset: data.fetch_offset,
+                                                    last_epoch: None,
+                                                    is_consumed: false,
+                                                    initialized: false,
+                                                },
+                                            );
                                         }
-                                    }
-                                    Some(error) => {
-                                        error!(
-                                            "Unexpected error code {error} while fetching offset \
-                                             from {tp}"
-                                        )
+                                        None => {
+                                            if metadata.is_full() {
+                                                warn!(
+                                                    "Response for missing full request {tp}; \
+                                                     metadata={metadata}."
+                                                );
+                                            } else {
+                                                warn!(
+                                                    "Response for missing session request \
+                                                     partition: {tp}; metadata={metadata}."
+                                                );
+                                            }
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    }
 
-                    if (7..=13).contains(&version) {
-                        if fetch_response.error_code.is_ok() {
-                            session.next_metadata.session_id = fetch_response.session_id;
-                        } else {
+                            if (7..=13).contains(&version) {
+                                if fetch_response.error_code.is_ok() {
+                                    session.next_metadata.session_id = fetch_response.session_id;
+                                } else {
+                                    error!(
+                                        "fetch records error: {}",
+                                        fetch_response.error_code.err().unwrap()
+                                    );
+                                    return Err(Error::Response {
+                                        error: fetch_response.error_code.err().unwrap(),
+                                        msg: None,
+                                    });
+                                }
+                            }
+                        }
+                        None => {
                             error!(
-                                "fetch records error: {}",
-                                fetch_response.error_code.err().unwrap()
+                                "Unable to find FetchSessionHandler for node {}. Ignoring fetch \
+                                 response.",
+                                node.key()
                             );
-                            return Err(Error::Response {
-                                error: fetch_response.error_code.err().unwrap(),
-                                msg: None,
-                            });
+                            continue;
                         }
                     }
                 }
-            }
-            if need_reset_offset {
-                self.reset_offset().await?;
             }
             Ok(())
         } else {
@@ -350,11 +472,8 @@ impl<Exe: Executor> Fetcher<Exe> {
 }
 
 impl<Exe: Executor> Fetcher<Exe> {
-    fn topic_id(&self, topic_name: &TopicName, session: &mut FetchSession) -> Uuid {
+    fn topic_id(&self, topic_name: &TopicName) -> Uuid {
         if let Some(topic_id) = self.client.cluster_meta.topic_id(topic_name) {
-            if !session.session_topic_names.contains_key(&topic_id) {
-                session.add_topic(topic_id, topic_name.clone());
-            }
             topic_id
         } else {
             Uuid::nil()
@@ -552,92 +671,90 @@ impl<Exe: Executor> Fetcher<Exe> {
         reset_strategy.map(|strategy| strategy.strategy_timestamp())
     }
 
-    async fn fetch_topic_builder(
+    fn add_to_forgotten_topic_map(
         &self,
-        node: NodeId,
-        session: &mut FetchSession,
-        version: i16,
-    ) -> Result<Vec<FetchTopic>> {
-        let mut topics: HashMap<TopicName, Vec<FetchPartition>> = HashMap::new();
-        let tp_in_node = self.client.cluster_meta.drain_node(node)?;
-        for tp in tp_in_node.iter() {
-            if let Some(tp_state) = self.subscription.lock().await.assignments.get(tp) {
-                let mut partition = FetchPartition::default();
-                partition.partition = tp_state.partition;
-                partition.fetch_offset = tp_state.position.offset;
-                partition.partition_max_bytes = self.max_bytes;
-
-                if version >= 5 {
-                    partition.log_start_offset = tp_state.last_stable_offset;
-                }
-
-                if version >= 9 {
-                    partition.current_leader_epoch =
-                        tp_state.position.current_leader.epoch.unwrap_or(-1);
-                }
-
-                if version >= 12 {
-                    partition.last_fetched_epoch = tp_state.position.offset_epoch.unwrap_or(-1);
-                }
-
-                debug!(
-                    "Fetch {tp} records with offset: {}, log_start_offset: {}, current leader \
-                     epoch: {}, last fetched epoch: {}",
-                    partition.fetch_offset,
-                    partition.log_start_offset,
-                    partition.current_leader_epoch,
-                    partition.last_fetched_epoch
-                );
-
-                session
-                    .session_partitions
-                    .insert(tp.clone(), partition.clone());
-                if let Some(partitions) = topics.get_mut(&tp.topic) {
-                    partitions.push(partition);
-                } else {
-                    let partitions = vec![partition];
-                    topics.insert(tp.topic.clone(), partitions);
+        to_forget: Drain<TopicIdPartition>,
+        forgotten_topics: &mut HashMap<TopicName, ForgottenTopic>,
+    ) {
+        for tp in to_forget {
+            match forgotten_topics.get_mut(&tp.partition.topic) {
+                Some(topic) => topic.partitions.push(tp.partition.partition),
+                None => {
+                    let topic = ForgottenTopic {
+                        topic_id: tp.topic_id,
+                        topic: tp.partition.topic,
+                        partitions: vec![tp.partition.partition],
+                        unknown_tagged_fields: Default::default(),
+                    };
+                    forgotten_topics.insert(topic.topic.clone(), topic);
                 }
             }
         }
-
-        let mut fetch_topics = Vec::with_capacity(topics.len());
-        for (topic, partitions) in topics {
-            let topic_id = self.topic_id(&topic, session);
-            let topic = FetchTopic {
-                topic,
-                topic_id,
-                partitions,
-                ..Default::default()
-            };
-            fetch_topics.push(topic);
-        }
-        Ok(fetch_topics)
     }
 
     async fn fetch_builder(
         &self,
-        node: NodeId,
-        session: &mut FetchSession,
+        data: &mut FetchRequestData,
         version: i16,
     ) -> Result<FetchRequest> {
         let mut request = FetchRequest::default();
+
+        let mut forgotten_topics = HashMap::new();
+        self.add_to_forgotten_topic_map(data.to_forget.drain(..), &mut forgotten_topics);
+
+        // If a version older than v13 is used, topic-partition which were replaced
+        // by a topic-partition with the same name but a different topic ID are not
+        // sent out in the "forget" set in order to not remove the newly added
+        // partition in the "fetch" set.
+        if version >= 13 {
+            self.add_to_forgotten_topic_map(data.to_replace.drain(..), &mut forgotten_topics);
+        }
+        request.forgotten_topics_data = map_to_list(forgotten_topics);
+
+        let mut topics: HashMap<TopicName, FetchTopic> = HashMap::new();
+        for (tp, data) in data.to_send.drain() {
+            let partition = FetchPartition {
+                partition: tp.partition,
+                current_leader_epoch: data
+                    .current_leader_epoch
+                    .unwrap_or(NO_PARTITION_LEADER_EPOCH),
+                last_fetched_epoch: data.last_fetched_epoch.unwrap_or(NO_PARTITION_LEADER_EPOCH),
+                fetch_offset: data.fetch_offset + 1,
+                log_start_offset: data.log_start_offset,
+                partition_max_bytes: data.max_bytes,
+                ..Default::default()
+            };
+            match topics.get_mut(&tp.topic) {
+                Some(fetch_topic) => fetch_topic.partitions.push(partition),
+                None => {
+                    let topic = FetchTopic {
+                        topic: tp.topic.clone(),
+                        topic_id: data.topic_id,
+                        partitions: vec![partition],
+                        ..Default::default()
+                    };
+                    topics.insert(tp.topic, topic);
+                }
+            }
+        }
+
         if version <= 13 {
             request.replica_id = BrokerId(-1);
             request.max_wait_ms = self.max_wait_ms;
             request.min_bytes = self.min_bytes;
-            request.topics = self.fetch_topic_builder(node, session, version).await?;
+            request.topics = map_to_list(topics);
 
             if version >= 3 {
                 request.max_bytes = self.max_bytes;
+            } else {
+                request.max_bytes = i32::MAX;
             }
             if version >= 4 {
                 request.isolation_level = IsolationLevel::ReadUncommitted.into();
             }
             if version >= 7 {
-                request.session_id = session.next_metadata.session_id;
-                request.session_epoch = session.next_metadata.epoch;
-                request.forgotten_topics_data = Default::default();
+                request.session_id = data.metadata.session_id;
+                request.session_epoch = data.metadata.epoch;
             }
             if version >= 11 {
                 request.rack_id = Default::default();
@@ -754,8 +871,8 @@ fn next_epoch(prev_epoch: i32) -> i32 {
 
 #[derive(Debug, Clone, Default)]
 pub struct CompletedFetch {
-    partition: TopicPartition,
-    records: Vec<Record>,
+    pub(crate) partition: TopicPartition,
+    pub(crate) partition_data: PartitionData,
     next_fetch_offset: i64,
     last_epoch: Option<i32>,
     is_consumed: bool,
@@ -763,13 +880,13 @@ pub struct CompletedFetch {
 }
 
 impl CompletedFetch {
-    pub fn new(partition: TopicPartition, records: Vec<Record>) -> Self {
-        Self {
-            partition,
-            records,
-            ..Default::default()
-        }
-    }
+    // pub fn new(partition: TopicPartition, records: Vec<Record>) -> Self {
+    //     Self {
+    //         partition,
+    //         records,
+    //         ..Default::default()
+    //     }
+    // }
 }
 
 struct ListOffsetResult {
@@ -787,9 +904,9 @@ struct ListOffsetData {
 
 #[derive(Default)]
 pub struct Fetch {
-    records: HashMap<TopicPartition, Vec<Record>>,
+    pub(crate) records: HashMap<TopicPartition, Vec<Record>>,
     position_advanced: bool,
-    pub num_records: i32,
+    pub(crate) num_records: i32,
 }
 
 impl Fetch {

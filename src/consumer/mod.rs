@@ -18,9 +18,13 @@ use kafka_protocol::{
 use tracing::{debug, error, info};
 
 use crate::{
-    client::Kafka, consumer::fetcher::Fetcher, coordinator::ConsumerCoordinator,
-    error::ConsumeError, executor::Executor, metadata::TopicPartition, Error, NodeId, PartitionId,
-    Result, ToStrBytes, DEFAULT_GENERATION_ID,
+    client::Kafka,
+    consumer::fetcher::{CompletedFetch, Fetcher},
+    coordinator::ConsumerCoordinator,
+    error::ConsumeError,
+    executor::Executor,
+    metadata::TopicPartition,
+    Error, NodeId, PartitionId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
 };
 
 const INITIAL_EPOCH: i32 = 0;
@@ -39,10 +43,11 @@ pub struct ConsumerRecord {
     pub timestamp: i64,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum OffsetResetStrategy {
-    Latest,
+    #[default]
     Earliest,
+    Latest,
     None,
 }
 
@@ -61,12 +66,6 @@ impl OffsetResetStrategy {
             Self::Latest => -1,
             _ => 0,
         }
-    }
-}
-
-impl Default for OffsetResetStrategy {
-    fn default() -> Self {
-        OffsetResetStrategy::Earliest
     }
 }
 
@@ -99,11 +98,28 @@ impl Default for RebalanceOptions {
 pub struct SubscriptionState {
     subscription_type: SubscriptionType,
     pub topics: HashSet<TopicName>,
-    default_offset_strategy: OffsetResetStrategy,
     pub assignments: HashMap<TopicPartition, TopicPartitionState>,
 }
 
 impl SubscriptionState {
+    pub fn all_consumed(&self) -> HashMap<TopicPartition, OffsetMetadata> {
+        let mut all_consumed = HashMap::new();
+        for (tp, tp_state) in self.assignments.iter() {
+            if tp_state.fetch_state.has_valid_position() {
+                all_consumed.insert(
+                    tp.clone(),
+                    OffsetMetadata {
+                        committed_offset: tp_state.position.offset,
+                        committed_leader_epoch: tp_state.position.offset_epoch,
+                        metadata: Some(StrBytes::from_str("")),
+                    },
+                );
+            }
+        }
+
+        all_consumed
+    }
+
     pub fn partitions(&self) -> HashMap<TopicName, Vec<PartitionId>> {
         let mut topics: HashMap<TopicName, Vec<PartitionId>> = HashMap::new();
         for (tp, _tp_state) in self.assignments.iter() {
@@ -115,6 +131,26 @@ impl SubscriptionState {
             }
         }
         topics
+    }
+
+    pub fn position(&self, tp: &TopicPartition) -> Option<&FetchPosition> {
+        match self.assignments.get(tp) {
+            Some(tp_state) => Some(&tp_state.position),
+            None => None,
+        }
+    }
+
+    fn fetchable_partitions<F>(&self, _func: F) -> Vec<TopicPartition>
+    where
+        F: Fn(&TopicPartition) -> bool,
+    {
+        let mut partitions = Vec::new();
+        for (tp, _tp_state) in self.assignments.iter() {
+            // if tp_state.is_fetchable() && func(tp) {
+            partitions.push(tp.clone());
+            // }
+        }
+        partitions
     }
 
     fn partitions_need_reset(&self, now: i64) -> Vec<TopicPartition> {
@@ -198,27 +234,33 @@ impl SubscriptionState {
 
         Ok(())
     }
+
+    pub fn maybe_validate_position_for_current_leader(
+        &mut self,
+        tp: &TopicPartition,
+        leader_epoch: LeaderAndEpoch,
+    ) -> Result<bool> {
+        if let Some(tp_state) = self.assignments.get_mut(tp) {
+            return tp_state.maybe_validate_position(leader_epoch);
+        }
+        Ok(false)
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 enum SubscriptionType {
+    #[default]
     None,
     AutoTopics,
     AutoPattern,
     UserAssigned,
 }
 
-impl Default for SubscriptionType {
-    fn default() -> Self {
-        SubscriptionType::None
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct OffsetMetadata {
-    committed_offset: i64,
-    committed_leader_epoch: i32,
-    metadata: Option<StrBytes>,
+    pub(crate) committed_offset: i64,
+    pub(crate) committed_leader_epoch: Option<i32>,
+    pub(crate) metadata: Option<StrBytes>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -292,6 +334,25 @@ impl TopicPartitionState {
         }
     }
 
+    fn maybe_validate_position(&mut self, current_leader: LeaderAndEpoch) -> Result<bool> {
+        if matches!(self.fetch_state, FetchState::AwaitReset) {
+            return Ok(false);
+        }
+        if current_leader.leader.is_none() {
+            return Ok(false);
+        }
+        if !self.position.is_nil() && self.position.current_leader == current_leader {
+            let position = FetchPosition {
+                offset: self.position.offset,
+                offset_epoch: self.position.offset_epoch,
+                current_leader,
+            };
+            self.validate_position(position)?;
+        }
+        let matched = matches!(self.fetch_state, FetchState::AwaitValidation);
+        Ok(matched)
+    }
+
     fn transition_state<F>(&mut self, new_state: FetchState, mut func: F) -> Result<()>
     where
         F: FnMut(&mut Self),
@@ -309,6 +370,10 @@ impl TopicPartitionState {
             }
         }
         Ok(())
+    }
+
+    fn is_fetchable(&self) -> bool {
+        !self.paused && self.fetch_state.has_valid_position()
     }
 }
 
@@ -406,7 +471,7 @@ impl FetchPosition {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct LeaderAndEpoch {
     pub leader: Option<NodeId>,
     pub epoch: Option<i32>,
@@ -455,15 +520,15 @@ impl From<IsolationLevel> for i8 {
 pub struct Consumer<Exe: Executor> {
     client: Kafka<Exe>,
     coordinator: ConsumerCoordinator<Exe>,
-    fetcher: Option<Fetcher<Exe>>,
-    records_rx: mpsc::UnboundedReceiver<Vec<Record>>,
+    fetcher: Fetcher<Exe>,
+    records_rx: mpsc::UnboundedReceiver<CompletedFetch>,
 }
 
 impl<Exe: Executor> Consumer<Exe> {
     pub async fn new<S: AsRef<str>>(client: Kafka<Exe>, group_id: S) -> Result<Self> {
         let coordinator = ConsumerCoordinator::new(client.clone(), group_id).await?;
 
-        let (tx, rx) = mpsc::unbounded::<Vec<Record>>();
+        let (tx, rx) = mpsc::unbounded::<CompletedFetch>();
         let fetcher = Fetcher::new(
             client.clone(),
             Local::now().timestamp(),
@@ -473,7 +538,7 @@ impl<Exe: Executor> Consumer<Exe> {
         Ok(Self {
             client,
             coordinator,
-            fetcher: Some(fetcher),
+            fetcher,
             records_rx: rx,
         })
     }
@@ -485,13 +550,21 @@ impl<Exe: Executor> Consumer<Exe> {
                 .await?;
         }
         self.coordinator.prepare_fetch().await?;
+        Ok(())
+    }
 
+    pub async fn commit_ack(&mut self) -> Result<()> {
+        self.coordinator.offset_commit().await
+    }
+
+    pub fn stream(&mut self) -> Result<impl Stream<Item = Result<Record>> + '_> {
         let mut fetch_interval = self.client.executor.interval(Duration::from_millis(100));
 
-        let mut fetcher = std::mem::replace(&mut self.fetcher, None);
+        let mut fetcher = self.fetcher.clone();
+        let mut _executor = self.client.executor.clone();
         let res = self.client.executor.spawn(Box::pin(async move {
             while fetch_interval.next().await.is_some() {
-                let _ = fetcher.as_mut().unwrap().fetch().await;
+                let _ = fetcher.fetch().await;
             }
         }));
 
@@ -502,20 +575,22 @@ impl<Exe: Executor> Consumer<Exe> {
             )
             .into());
         }
-        Ok(())
-    }
 
-    pub async fn commit_ack(&mut self) -> Result<()> {
-        self.coordinator.offset_commit().await
-    }
-
-    pub fn into_stream(mut self) -> impl Stream<Item = Result<Record>> {
-        try_stream! {
-            if let Some(records) = self.records_rx.next().await {
-                for record in records {
-                    yield record
+        let stream = try_stream! {
+            loop {
+                match self.fetcher.collect_fetch().await {
+                    Ok(fetch) => {
+                        for (_tp, records) in fetch.records {
+                            for record in records {
+                                yield record;
+                            }
+                        }
+                    }
+                    Err(err) => error!("fetch error: {}", err),
                 }
             }
-        }
+        };
+
+        Ok(stream)
     }
 }
