@@ -7,7 +7,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use futures::{channel::mpsc, lock::Mutex};
+use futures::lock::Mutex;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
@@ -29,8 +29,8 @@ use crate::{
         fetch_session::{
             FetchRequestData, FetchRequestDataBuilder, FetchRequestPartitionData, FetchSession,
         },
-        FetchPosition, IsolationLevel, OffsetResetStrategy, SubscriptionState, FINAL_EPOCH,
-        INITIAL_EPOCH, INVALID_SESSION_ID,
+        ConsumerOptions, FetchPosition, IsolationLevel, OffsetResetStrategy, SubscriptionState,
+        FINAL_EPOCH, INITIAL_EPOCH, INVALID_SESSION_ID,
     },
     error::Result,
     executor::Executor,
@@ -43,21 +43,10 @@ use crate::{
 pub struct Fetcher<Exe: Executor> {
     client: Kafka<Exe>,
     timestamp: i64,
-    min_bytes: i32,
-    max_bytes: i32,
-    max_wait_ms: i32,
-    fetch_size: i32,
-    retry_backoff_ms: i64,
-    request_timeout_ms: i64,
-    max_poll_records: i32,
-    check_crcs: bool,
-    client_rack_id: String,
-    isolation_level: IsolationLevel,
-    default_offset_strategy: OffsetResetStrategy,
+    options: Arc<ConsumerOptions>,
     subscription: Arc<Mutex<SubscriptionState>>,
     sessions: Arc<DashMap<NodeId, FetchSession>>,
     completed_fetches: Arc<plMutex<VecDeque<CompletedFetch>>>,
-    records_tx: mpsc::UnboundedSender<CompletedFetch>,
     nodes_with_pending_fetch_requests: HashSet<i32>,
 }
 
@@ -66,7 +55,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         client: Kafka<Exe>,
         timestamp: i64,
         subscription: Arc<Mutex<SubscriptionState>>,
-        records_tx: mpsc::UnboundedSender<CompletedFetch>,
+        options: Arc<ConsumerOptions>,
     ) -> Self {
         let sessions = DashMap::new();
         for node in client.cluster_meta.nodes.iter() {
@@ -76,28 +65,17 @@ impl<Exe: Executor> Fetcher<Exe> {
         Self {
             client,
             timestamp,
-            min_bytes: 1,
-            max_bytes: 52428800, // 50 * 1024 * 1024,
-            max_wait_ms: 500,
-            fetch_size: 1048576, // 1 * 1024 * 1024
-            retry_backoff_ms: 100,
-            request_timeout_ms: 30000,
-            max_poll_records: 500,
-            check_crcs: false,
-            client_rack_id: String::default(),
             subscription,
-            isolation_level: IsolationLevel::ReadUncommitted,
-            default_offset_strategy: OffsetResetStrategy::default(),
             sessions: Arc::new(sessions),
             completed_fetches: Arc::new(plMutex::new(VecDeque::new())),
-            records_tx,
+            options,
             nodes_with_pending_fetch_requests: HashSet::new(),
         }
     }
 
     pub async fn collect_fetch(&mut self) -> Result<Fetch> {
         let mut fetch = Fetch::default();
-        let mut records_remaining = self.max_poll_records;
+        let mut records_remaining = self.options.max_poll_records;
         let mut need_reset_offset = false;
         while records_remaining > 0 {
             let completed_fetch = self.completed_fetches.lock().pop_front();
@@ -135,7 +113,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 "Fetch position {} is out of range for {tp}",
                                 partition_state.position.offset
                             );
-                            let strategy = self.default_offset_strategy;
+                            let strategy = self.options.auto_offset_reset;
                             if !matches!(strategy, OffsetResetStrategy::None) {
                                 info!("{error_msg}, resetting offset");
                                 partition_state.reset(strategy)?;
@@ -209,7 +187,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         if need_reset_offset {
             self.reset_offset().await?;
         }
-        fetch.num_records = self.max_poll_records - records_remaining;
+        fetch.num_records = self.options.max_poll_records - records_remaining;
         Ok(fetch)
     }
 
@@ -264,7 +242,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                                         Some(data) => {
                                             debug!(
                                                 "Fetch {:?} at offset {} for {tp}",
-                                                self.isolation_level, data.fetch_offset
+                                                self.options.isolation_level, data.fetch_offset
                                             );
                                             self.completed_fetches.lock().push_back(
                                                 CompletedFetch {
@@ -380,7 +358,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                             topic_id: self.topic_id(&tp.topic),
                             fetch_offset: position.offset,
                             log_start_offset: INVALID_LOG_START_OFFSET,
-                            max_bytes: self.fetch_size,
+                            max_bytes: self.options.max_partition_fetch_bytes,
                             current_leader_epoch: position.offset_epoch,
                             last_fetched_epoch: None,
                         };
@@ -397,7 +375,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                             fetchable.insert(node, builder);
                             debug!(
                                 "Added {:?} fetch request for {} at position {} to node {}",
-                                self.isolation_level, tp, position.offset, node
+                                self.options.isolation_level, tp, position.offset, node
                             );
                         }
                     }
@@ -457,7 +435,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                 if !list_offset_result.partitions_to_retry.is_empty() {
                     self.subscription.lock().await.request_failed(
                         list_offset_result.partitions_to_retry,
-                        self.timestamp + self.retry_backoff_ms,
+                        self.timestamp + self.options.retry_backoff_ms,
                     );
                     // TODO: update metadata
                 }
@@ -651,7 +629,7 @@ impl<Exe: Executor> Fetcher<Exe> {
 
                 self.subscription.lock().await.set_next_allowed_retry(
                     topics.keys(),
-                    self.timestamp + self.request_timeout_ms,
+                    self.timestamp + self.options.request_timeout_ms as i64,
                 );
                 let request = self.list_offsets_builder(topics, version)?;
                 node_request.insert(node_entry.value().clone(), request);
@@ -740,12 +718,12 @@ impl<Exe: Executor> Fetcher<Exe> {
 
         if version <= 13 {
             request.replica_id = BrokerId(-1);
-            request.max_wait_ms = self.max_wait_ms;
-            request.min_bytes = self.min_bytes;
+            request.max_wait_ms = self.options.fetch_max_wait_ms;
+            request.min_bytes = self.options.fetch_min_bytes;
             request.topics = map_to_list(topics);
 
             if version >= 3 {
-                request.max_bytes = self.max_bytes;
+                request.max_bytes = self.options.max_partition_fetch_bytes;
             } else {
                 request.max_bytes = i32::MAX;
             }

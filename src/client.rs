@@ -20,7 +20,7 @@ use tracing::error;
 
 use crate::{
     connection::Connection,
-    connection_manager::{ConnectionManager, ConnectionRetryOptions, OperationRetryOptions},
+    connection_manager::{ConnectionManager, OperationRetryOptions},
     error::{ConnectionError, Error, Result},
     executor::Executor,
     metadata::{Cluster, Node},
@@ -82,18 +82,16 @@ impl<Exe: Executor> Kafka<Exe> {
     pub async fn new<S: Into<String>>(
         url: S,
         options: KafkaOptions,
-        connection_retry_options: Option<ConnectionRetryOptions>,
-        operation_retry_options: Option<OperationRetryOptions>,
         executor: Exe,
     ) -> Result<Self> {
         let url: String = url.into();
         let executor = Arc::new(executor);
-        let operation_retry_options = operation_retry_options.unwrap_or_default();
+        let operation_retry_options = OperationRetryOptions::default();
 
         let manager = ConnectionManager::new(
             url,
             options,
-            connection_retry_options,
+            None,
             operation_retry_options.clone(),
             executor.clone(),
         )

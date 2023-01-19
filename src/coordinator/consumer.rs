@@ -4,11 +4,7 @@ use std::{
     time::Duration,
 };
 
-use futures::{
-    channel::{mpsc, oneshot},
-    lock::Mutex,
-    StreamExt,
-};
+use futures::{lock::Mutex, StreamExt};
 use indexmap::IndexMap;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
@@ -22,8 +18,8 @@ use kafka_protocol::{
         },
         sync_group_request::SyncGroupRequestAssignment,
         ApiKey, ConsumerProtocolAssignment, DescribeGroupsRequest, HeartbeatRequest,
-        HeartbeatResponse, JoinGroupRequest, LeaveGroupRequest, OffsetCommitRequest,
-        OffsetFetchRequest, SyncGroupRequest, TopicName,
+        JoinGroupRequest, LeaveGroupRequest, OffsetCommitRequest, OffsetFetchRequest,
+        SyncGroupRequest, TopicName,
     },
     protocol::{Message, StrBytes},
     ResponseError,
@@ -37,7 +33,7 @@ use crate::{
             Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, RangeAssignor,
             Subscription,
         },
-        ConsumerGroupMetadata, RebalanceOptions, SubscriptionState, TopicPartitionState,
+        ConsumerGroupMetadata, ConsumerOptions, SubscriptionState, TopicPartitionState,
     },
     coordinator::{find_coordinator, CoordinatorType},
     error::{ConsumeError, Result},
@@ -91,13 +87,21 @@ enum MemberState {
 pub struct ConsumerCoordinator<Exe: Executor> {
     client: Kafka<Exe>,
     inner: Arc<Mutex<Inner<Exe>>>,
+    options: Arc<ConsumerOptions>,
 }
 
 impl<Exe: Executor> ConsumerCoordinator<Exe> {
-    pub async fn new<S: AsRef<str>>(client: Kafka<Exe>, group_id: S) -> Result<Self> {
-        let inner = Inner::new(client.clone(), group_id).await?;
+    pub async fn new(
+        client: Kafka<Exe>,
+        options: Arc<ConsumerOptions>,
+    ) -> Result<ConsumerCoordinator<Exe>> {
+        let inner = Inner::new(client.clone(), options.clone()).await?;
         let inner = Arc::new(Mutex::new(inner));
-        Ok(Self { inner, client })
+        Ok(Self {
+            inner,
+            client,
+            options,
+        })
     }
 
     pub async fn subscribe(&self, topic: TopicName) -> Result<()> {
@@ -122,7 +126,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 
     async fn auto_commit(&self) -> Result<()> {
         let mut auto_commit_interval = self.client.executor.interval(Duration::from_millis(
-            self.inner.lock().await.auto_commit_interval_ms as u64,
+            self.options.auto_commit_interval_ms as u64,
         ));
 
         let weak_inner = Arc::downgrade(&self.inner);
@@ -147,7 +151,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     }
 
     pub async fn offset_commit(&mut self) -> Result<()> {
-        if !self.inner.lock().await.auto_commit_enabled {
+        if !self.options.auto_commit_enabled {
             self.inner.lock().await.offset_commit().await?;
         }
         Ok(())
@@ -158,16 +162,12 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.sync_group().await?;
         self.offset_fetch().await?;
 
-        if self.inner.lock().await.auto_commit_enabled {
+        if self.options.auto_commit_enabled {
             self.auto_commit().await?;
         }
 
         let mut heartbeat_interval = self.client.executor.interval(Duration::from_millis(
-            self.inner
-                .lock()
-                .await
-                .rebalance_options
-                .heartbeat_interval_ms as u64,
+            self.options.rebalance_options.heartbeat_interval_ms as u64,
         ));
 
         let weak_inner = Arc::downgrade(&self.inner);
@@ -196,17 +196,15 @@ struct Inner<Exe: Executor> {
     node: Node,
     group_meta: ConsumerGroupMetadata,
     group_subscription: GroupSubscription,
-    rebalance_options: RebalanceOptions,
-    auto_commit_interval_ms: i32,
-    auto_commit_enabled: bool,
+    consumer_options: Arc<ConsumerOptions>,
     pub subscriptions: Arc<Mutex<SubscriptionState>>,
     assignors: Vec<PartitionAssignor>,
     state: MemberState,
 }
 
 impl<Exe: Executor> Inner<Exe> {
-    pub async fn new<S: AsRef<str>>(client: Kafka<Exe>, group_id: S) -> Result<Self> {
-        let group_id = group_id.as_ref().to_string().to_str_bytes();
+    pub async fn new(client: Kafka<Exe>, options: Arc<ConsumerOptions>) -> Result<Inner<Exe>> {
+        let group_id = options.group_id.clone().to_str_bytes();
 
         let node = find_coordinator(&client, group_id.clone(), CoordinatorType::Group).await?;
 
@@ -218,12 +216,10 @@ impl<Exe: Executor> Inner<Exe> {
         Ok(Self {
             client,
             node,
-            auto_commit_interval_ms: 5000,
-            auto_commit_enabled: true,
             subscriptions: Arc::new(Mutex::new(SubscriptionState::default())),
             group_meta: ConsumerGroupMetadata::new(group_id.into()),
             group_subscription: GroupSubscription::default(),
-            rebalance_options: RebalanceOptions::default(),
+            consumer_options: options,
             assignors: vec![PartitionAssignor::Range(RangeAssignor)],
             state: MemberState::UnJoined,
         })
@@ -582,9 +578,10 @@ impl<Exe: Executor> Inner<Exe> {
             request.member_id = self.group_meta.member_id.clone();
             request.protocol_type = StrBytes::from_str(CONSUMER_PROTOCOL_TYPE);
             request.protocols = self.join_group_protocol().await?;
-            request.session_timeout_ms = self.rebalance_options.session_timeout_ms;
+            request.session_timeout_ms = self.consumer_options.rebalance_options.session_timeout_ms;
             if version >= 1 {
-                request.rebalance_timeout_ms = self.rebalance_options.rebalance_timeout_ms;
+                request.rebalance_timeout_ms =
+                    self.consumer_options.rebalance_options.rebalance_timeout_ms;
             }
             if version >= 5 {
                 request.group_instance_id = self.group_meta.group_instance_id.clone();
@@ -742,22 +739,6 @@ impl<Exe: Executor> Inner<Exe> {
             }
         }
         Ok(request)
-    }
-}
-
-struct HeartbeatMessage {
-    request: HeartbeatRequest,
-    resolver: oneshot::Sender<Result<HeartbeatResponse>>,
-}
-
-async fn run_heartbeat<Exe: Executor>(
-    client: Kafka<Exe>,
-    node: Node,
-    mut messages: mpsc::UnboundedReceiver<HeartbeatMessage>,
-) {
-    while let Some(HeartbeatMessage { request, resolver }) = messages.next().await {
-        let response = client.heartbeat(&node, request).await;
-        let _ = resolver.send(response);
     }
 }
 

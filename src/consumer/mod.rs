@@ -4,12 +4,13 @@ pub mod partition_assignor;
 
 use std::{
     collections::{hash_map::Keys, BTreeMap, HashMap, HashSet},
+    sync::Arc,
     time::Duration,
 };
 
 use async_stream::try_stream;
 use chrono::Local;
-use futures::{channel::mpsc, Stream, StreamExt};
+use futures::{Stream, StreamExt};
 use kafka_protocol::{
     messages::{GroupId, TopicName},
     protocol::StrBytes,
@@ -18,13 +19,9 @@ use kafka_protocol::{
 use tracing::{debug, error, info};
 
 use crate::{
-    client::Kafka,
-    consumer::fetcher::{CompletedFetch, Fetcher},
-    coordinator::ConsumerCoordinator,
-    error::ConsumeError,
-    executor::Executor,
-    metadata::TopicPartition,
-    Error, NodeId, PartitionId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
+    client::Kafka, consumer::fetcher::Fetcher, coordinator::ConsumerCoordinator,
+    error::ConsumeError, executor::Executor, metadata::TopicPartition, Error, NodeId, PartitionId,
+    Result, ToStrBytes, DEFAULT_GENERATION_ID,
 };
 
 const INITIAL_EPOCH: i32 = 0;
@@ -70,7 +67,64 @@ impl OffsetResetStrategy {
 }
 
 #[derive(Debug, Clone)]
-pub struct ConsumerOptions {}
+pub struct ConsumerOptions {
+    pub max_poll_records: i32,
+    pub max_poll_interval_ms: i32,
+    pub auto_commit_interval_ms: i32,
+    pub auto_commit_enabled: bool,
+    pub request_timeout_ms: i32,
+    pub check_crcs: bool,
+    pub fetch_min_bytes: i32,
+    pub fetch_max_bytes: i32,
+    pub fetch_max_wait_ms: i32,
+    pub max_partition_fetch_bytes: i32,
+    pub reconnect_backoff_ms: i64,
+    pub reconnect_backoff_max_ms: i64,
+    pub retry_backoff_ms: i64,
+    pub client_rack: String,
+    pub allow_auto_create_topics: bool,
+    pub partition_assignment_strategy: String,
+    pub isolation_level: IsolationLevel,
+    pub auto_offset_reset: OffsetResetStrategy,
+    pub group_id: String,
+    pub rebalance_options: RebalanceOptions,
+}
+
+impl ConsumerOptions {
+    pub fn new<S: AsRef<str>>(group: S) -> Self {
+        Self {
+            group_id: group.as_ref().to_string(),
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for ConsumerOptions {
+    fn default() -> Self {
+        Self {
+            max_poll_records: 500,
+            max_poll_interval_ms: 300000,
+            auto_commit_interval_ms: 5000,
+            auto_commit_enabled: true,
+            request_timeout_ms: 30000,
+            check_crcs: false,
+            fetch_min_bytes: 1,
+            fetch_max_bytes: 52428800, // 50 * 1024 * 1024,
+            fetch_max_wait_ms: 500,
+            max_partition_fetch_bytes: 1048576, // 1 * 1024 * 1024
+            reconnect_backoff_ms: 50,
+            reconnect_backoff_max_ms: 1000,
+            retry_backoff_ms: 100,
+            client_rack: String::default(),
+            allow_auto_create_topics: false,
+            partition_assignment_strategy: "range".into(),
+            isolation_level: IsolationLevel::ReadUncommitted,
+            auto_offset_reset: OffsetResetStrategy::Earliest,
+            rebalance_options: RebalanceOptions::default(),
+            group_id: Default::default(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RebalanceOptions {
@@ -85,7 +139,6 @@ impl Default for RebalanceOptions {
     fn default() -> Self {
         Self {
             session_timeout_ms: 30_000,
-            // max.poll.interval.ms
             rebalance_timeout_ms: 300_000,
             heartbeat_interval_ms: 3000,
             retry_backoff_ms: 100,
@@ -539,25 +592,25 @@ pub struct Consumer<Exe: Executor> {
     client: Kafka<Exe>,
     coordinator: ConsumerCoordinator<Exe>,
     fetcher: Fetcher<Exe>,
-    records_rx: mpsc::UnboundedReceiver<CompletedFetch>,
+    options: Arc<ConsumerOptions>,
 }
 
 impl<Exe: Executor> Consumer<Exe> {
-    pub async fn new<S: AsRef<str>>(client: Kafka<Exe>, group_id: S) -> Result<Self> {
-        let coordinator = ConsumerCoordinator::new(client.clone(), group_id).await?;
+    pub async fn new(client: Kafka<Exe>, options: ConsumerOptions) -> Result<Self> {
+        let options = Arc::new(options);
+        let coordinator = ConsumerCoordinator::new(client.clone(), options.clone()).await?;
 
-        let (tx, rx) = mpsc::unbounded::<CompletedFetch>();
         let fetcher = Fetcher::new(
             client.clone(),
             Local::now().timestamp(),
             coordinator.subscriptions().await,
-            tx,
+            options.clone(),
         );
         Ok(Self {
             client,
             coordinator,
             fetcher,
-            records_rx: rx,
+            options,
         })
     }
 

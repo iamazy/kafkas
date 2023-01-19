@@ -5,7 +5,7 @@ use futures::{pin_mut, SinkExt, StreamExt};
 use kafka_protocol::records::TimestampType;
 use kafkas::{
     client::{Kafka, KafkaOptions, SerializeMessage},
-    consumer::Consumer,
+    consumer::{Consumer, ConsumerOptions},
     executor::{Executor, TokioExecutor},
     producer::{Producer, ProducerOptions},
     topic_name, Error, Record, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
@@ -27,13 +27,12 @@ async fn main() -> Result<(), Box<Error>> {
         // Set the subscriber as the default.
         .init();
 
-    let mut options = KafkaOptions::new();
-    options.client_id("app");
-    let kafka_client = Kafka::new("127.0.0.1:9092", options, None, None, TokioExecutor).await?;
+    let kafka_client = Kafka::new("127.0.0.1:9092", KafkaOptions::new(), TokioExecutor).await?;
 
     // produce(kafka_client.clone()).await?;
 
-    let mut consumer = Consumer::new(kafka_client, "app1").await?;
+    let consumer_options = ConsumerOptions::new("app");
+    let mut consumer = Consumer::new(kafka_client, consumer_options).await?;
     consumer.subscribe(vec!["kafka"]).await?;
 
     let consume_stream = consumer.stream()?;
