@@ -49,12 +49,12 @@ pub struct Fetcher<Exe: Executor> {
     fetch_size: i32,
     retry_backoff_ms: i64,
     request_timeout_ms: i64,
-    pub(crate) max_poll_records: i32,
+    max_poll_records: i32,
     check_crcs: bool,
     client_rack_id: String,
     isolation_level: IsolationLevel,
-    pub(crate) default_offset_strategy: OffsetResetStrategy,
-    pub(crate) subscription: Arc<Mutex<SubscriptionState>>,
+    default_offset_strategy: OffsetResetStrategy,
+    subscription: Arc<Mutex<SubscriptionState>>,
     sessions: Arc<DashMap<NodeId, FetchSession>>,
     completed_fetches: Arc<plMutex<VecDeque<CompletedFetch>>>,
     records_tx: mpsc::UnboundedSender<CompletedFetch>,
@@ -469,7 +469,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                             OffsetResetStrategy::from_timestamp(*timestamp),
                             list_offsets_data,
                         )
-                            .await?;
+                        .await?;
                     }
                 }
             }

@@ -120,14 +120,47 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.inner.lock().await.offset_fetch().await
     }
 
+    async fn auto_commit(&self) -> Result<()> {
+        let mut auto_commit_interval = self.client.executor.interval(Duration::from_millis(
+            self.inner.lock().await.auto_commit_interval_ms as u64,
+        ));
+
+        let weak_inner = Arc::downgrade(&self.inner);
+
+        let res = self.client.executor.spawn(Box::pin(async move {
+            while auto_commit_interval.next().await.is_some() {
+                if let Some(strong_inner) = weak_inner.upgrade() {
+                    let _ = strong_inner.lock().await.offset_commit().await;
+                }
+            }
+        }));
+
+        if res.is_err() {
+            error!("the executor could not spawn the offset_commit task");
+            return Err(ConsumeError::Custom(
+                "the executor could not spawn the offset_commit task".to_string(),
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+
     pub async fn offset_commit(&mut self) -> Result<()> {
-        self.inner.lock().await.offset_commit().await
+        if !self.inner.lock().await.auto_commit_enabled {
+            self.inner.lock().await.offset_commit().await?;
+        }
+        Ok(())
     }
 
     pub async fn prepare_fetch(&self) -> Result<()> {
         self.join_group().await?;
         self.sync_group().await?;
         self.offset_fetch().await?;
+
+        if self.inner.lock().await.auto_commit_enabled {
+            self.auto_commit().await?;
+        }
 
         let mut heartbeat_interval = self.client.executor.interval(Duration::from_millis(
             self.inner
@@ -648,10 +681,9 @@ impl<Exe: Executor> Inner<Exe> {
         if version <= 8 {
             request.group_id = self.group_meta.group_id.clone();
 
-            let state_lock = self.subscriptions.lock().await;
             let mut topics: HashMap<TopicName, Vec<OffsetCommitRequestPartition>> =
-                HashMap::with_capacity(state_lock.topics.len());
-            let all_consumed = state_lock.all_consumed();
+                HashMap::with_capacity(self.subscriptions.lock().await.topics.len());
+            let all_consumed = self.subscriptions.lock().await.all_consumed();
             for (tp, meta) in all_consumed.iter() {
                 let partition = OffsetCommitRequestPartition {
                     partition_index: tp.partition,

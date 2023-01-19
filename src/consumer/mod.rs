@@ -241,7 +241,10 @@ impl SubscriptionState {
         leader_epoch: LeaderAndEpoch,
     ) -> Result<bool> {
         if let Some(tp_state) = self.assignments.get_mut(tp) {
-            return tp_state.maybe_validate_position(leader_epoch);
+            // TODO：validate position
+            // return tp_state.maybe_validate_position(leader_epoch);
+            tp_state.update_position_leader_no_validation(leader_epoch)?;
+            return Ok(true);
         }
         Ok(false)
     }
@@ -332,6 +335,21 @@ impl TopicPartitionState {
                 state.next_retry_time_ms = None;
             })
         }
+    }
+
+    fn update_position_leader_no_validation(
+        &mut self,
+        current_leader: LeaderAndEpoch,
+    ) -> Result<()> {
+        if !self.position.is_nil() {
+            let mut position = self.position;
+            self.transition_state(FetchState::Fetching, |state| {
+                position.current_leader = current_leader;
+                state.position = position;
+                state.next_retry_time_ms = None;
+            })?;
+        }
+        Ok(())
     }
 
     fn maybe_validate_position(&mut self, current_leader: LeaderAndEpoch) -> Result<bool> {
