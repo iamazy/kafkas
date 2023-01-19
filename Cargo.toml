@@ -17,18 +17,19 @@ async-io = { version  = "1", optional = true}
 async-native-tls = { version = "0.4", optional = true }
 async-recursion = "1.0.0"
 async-std = { version = "1", features = ["attributes", "unstable"], optional = true }
+async-stream = "0.3"
 bit-vec = "0.6"
 bytes = "1"
 chrono = "0.4"
 dashmap = "5"
 fnv = "1"
-futures-timer = "3.0"
 futures = "0.3"
 fxhash = "0.2"
 indexmap = "1"
-kafka-protocol = { git = "https://github.com/iamazy/kafka-protocol-rs", branch = "trunk" }
+kafka-protocol = { git = "https://github.com/iamazy/kafka-protocol-rs", rev = "4db5630b61ff07bbeada582e83c0bfc281a1965c" }
 native-tls = "0.2"
 pin-project-lite = "0.2"
+parking_lot = "0.12"
 rand = "0.8"
 regex = "1.1.7"
 thiserror = "1"

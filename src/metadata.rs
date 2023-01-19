@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    fmt::{Debug, Display, Formatter},
+    sync::{Arc, Mutex},
+};
 
 use dashmap::{DashMap, DashSet};
 use kafka_protocol::{
@@ -15,12 +18,10 @@ use kafka_protocol::{
 use uuid::Uuid;
 
 use crate::{
+    consumer::LeaderAndEpoch,
     error::{Error, Result},
-    NodeId, NodeRef, PartitionRef,
+    NodeId, NodeRef, PartitionId, PartitionRef,
 };
-
-pub(crate) const GROUP_METADATA_TOPIC_NAME: &str = "__consumer_offsets";
-pub(crate) const TRANSACTION_STATE_TOPIC_NAME: &str = "__transaction_state";
 
 #[derive(Debug, Clone, Default)]
 pub struct Topic {
@@ -65,11 +66,12 @@ impl From<(&TopicName, &MetadataResponseTopic)> for Topic {
 
 #[derive(Debug, Clone, Default, Hash)]
 pub struct Partition {
-    pub partition: i32,
-    pub leader: i32,
-    pub replicas: Vec<i32>,
-    pub in_sync_replicas: Vec<i32>,
-    pub offline_replicas: Vec<i32>,
+    pub partition: PartitionId,
+    pub leader: NodeId,
+    pub leader_epoch: i32,
+    pub replicas: Vec<NodeId>,
+    pub in_sync_replicas: Vec<NodeId>,
+    pub offline_replicas: Vec<NodeId>,
 }
 
 impl From<&MetadataResponsePartition> for Partition {
@@ -78,6 +80,7 @@ impl From<&MetadataResponsePartition> for Partition {
         Self {
             partition: partition_index,
             leader: partition.leader_id.0,
+            leader_epoch: partition.leader_epoch,
             replicas: partition.replica_nodes.iter().map(|node| node.0).collect(),
             in_sync_replicas: partition.isr_nodes.iter().map(|node| node.0).collect(),
             offline_replicas: partition
@@ -90,25 +93,48 @@ impl From<&MetadataResponsePartition> for Partition {
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Hash)]
+pub struct TopicIdPartition {
+    pub topic_id: Uuid,
+    pub partition: TopicPartition,
+}
+
+#[derive(Clone, Default, Eq, PartialEq, Hash)]
 pub struct TopicPartition {
     pub topic: TopicName,
-    pub partition: i32,
+    pub partition: PartitionId,
+}
+
+impl TopicPartition {
+    pub fn new(topic: TopicName, partition: PartitionId) -> Self {
+        Self { topic, partition }
+    }
+}
+
+impl Debug for TopicPartition {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TopicPartition")
+            .field("topic", &self.topic.0)
+            .field("partition", &self.partition)
+            .finish()
+    }
+}
+
+impl Display for TopicPartition {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "partition [{} - {}]", self.topic.0, self.partition)
+    }
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Hash)]
 pub struct Node {
     pub id: NodeId,
-    pub host: String,
-    pub port: u16,
     address: String,
 }
 
 impl Node {
-    pub fn new(id: NodeId, host: String, port: u16) -> Self {
+    pub fn new(id: BrokerId, host: StrBytes, port: i32) -> Self {
         Self {
-            id,
-            host: host.clone(),
-            port,
+            id: id.0,
             address: format!("{host}:{port}"),
         }
     }
@@ -120,7 +146,7 @@ impl Node {
 
 impl From<(&BrokerId, &MetadataResponseBroker)> for Node {
     fn from((id, broker): (&BrokerId, &MetadataResponseBroker)) -> Self {
-        Node::new(id.0, broker.host.to_string(), broker.port as u16)
+        Node::new(*id, broker.host.clone(), broker.port)
     }
 }
 
@@ -130,12 +156,12 @@ pub struct Cluster {
     pub unauthorized_topics: DashSet<TopicName>,
     pub invalid_topics: DashSet<TopicName>,
     pub internal_topics: DashSet<TopicName>,
-    pub controller: Arc<Mutex<i32>>,
+    pub controller: Arc<Mutex<NodeId>>,
     pub topics: DashMap<TopicName, Topic>,
-    pub nodes: DashMap<i32, Node>,
-    pub available_partitions: DashMap<TopicName, Vec<i32>>,
-    pub partitions: DashMap<TopicName, Vec<i32>>,
-    pub partitions_by_nodes: DashMap<i32, Vec<(TopicName, Vec<i32>)>>,
+    pub nodes: DashMap<NodeId, Node>,
+    pub available_partitions: DashMap<TopicName, Vec<PartitionId>>,
+    pub partitions: DashMap<TopicName, Vec<PartitionId>>,
+    pub partitions_by_nodes: DashMap<NodeId, Vec<TopicPartition>>,
 }
 
 impl Cluster {
@@ -241,6 +267,22 @@ impl Cluster {
         })
     }
 
+    pub fn current_leader(&self, partition: &TopicPartition) -> LeaderAndEpoch {
+        let mut leader_epoch = LeaderAndEpoch::default();
+        if let Some(entry) = self.topics.get(&partition.topic) {
+            if let Some(partition) = entry
+                .value()
+                .partitions
+                .iter()
+                .find(|p| p.partition == partition.partition)
+            {
+                leader_epoch.leader = Some(partition.leader);
+                leader_epoch.epoch = Some(partition.leader_epoch);
+            }
+        }
+        leader_epoch
+    }
+
     pub fn drain_node(&self, node: NodeId) -> Result<NodeRef> {
         if !self.nodes.contains_key(&node) {
             return Err(Error::NodeNotAvailable { node });
@@ -250,14 +292,12 @@ impl Cluster {
         } else {
             let mut topic_partitions = Vec::new();
             for topic_entry in self.topics.iter() {
-                let partitions = topic_entry
-                    .value()
-                    .partitions
-                    .iter()
-                    .filter(|p| p.leader == node)
-                    .map(|p| p.partition)
-                    .collect();
-                topic_partitions.push((topic_entry.name.clone().into(), partitions));
+                for partition in topic_entry.partitions.iter() {
+                    topic_partitions.push(TopicPartition::new(
+                        topic_entry.key().clone(),
+                        partition.partition,
+                    ));
+                }
             }
             self.partitions_by_nodes.insert(node, topic_partitions);
             self.drain_node(node)

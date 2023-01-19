@@ -1,31 +1,26 @@
 use std::{collections::HashMap, sync::Arc};
 
 use bytes::Bytes;
-use chrono::Local;
 use futures::StreamExt;
 use kafka_protocol::{
     messages::{
-        api_versions_request::ApiVersionsRequest,
-        api_versions_response::ApiVersionsResponse,
-        list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
-        metadata_request::MetadataRequestTopic,
-        ApiKey, BrokerId, DescribeGroupsRequest, DescribeGroupsResponse, FetchRequest,
-        FetchResponse, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest,
-        HeartbeatResponse, JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest,
-        LeaveGroupResponse, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest,
-        OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse,
-        ProduceRequest, ProduceResponse, RequestKind, ResponseKind, SyncGroupRequest,
-        SyncGroupResponse, TopicName,
+        api_versions_request::ApiVersionsRequest, api_versions_response::ApiVersionsResponse,
+        metadata_request::MetadataRequestTopic, ApiKey, DescribeGroupsRequest,
+        DescribeGroupsResponse, FetchRequest, FetchResponse, FindCoordinatorRequest,
+        FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse, JoinGroupRequest,
+        JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsRequest,
+        ListOffsetsResponse, MetadataRequest, OffsetCommitRequest, OffsetCommitResponse,
+        OffsetFetchRequest, OffsetFetchResponse, ProduceRequest, ProduceResponse, RequestKind,
+        ResponseKind, SyncGroupRequest, SyncGroupResponse, TopicName,
     },
     protocol::VersionRange,
-    records::{Record, NO_PARTITION_LEADER_EPOCH},
+    records::Record,
 };
 use tracing::error;
 
 use crate::{
     connection::Connection,
-    connection_manager::{ConnectionManager, ConnectionRetryOptions, OperationRetryOptions},
-    consumer::{ConsumerRecord, IsolationLevel, TopicPartitionState},
+    connection_manager::{ConnectionManager, OperationRetryOptions},
     error::{ConnectionError, Error, Result},
     executor::Executor,
     metadata::{Cluster, Node},
@@ -37,7 +32,7 @@ pub trait DeserializeMessage {
     /// type produced from the message
     type Output: Sized;
     /// deserialize method that will be called by the consumer
-    fn deserialize_message(record: &ConsumerRecord) -> Self::Output;
+    fn deserialize_message(record: Record) -> Self::Output;
 }
 
 /// Helper trait for message serialization
@@ -51,9 +46,9 @@ pub trait SerializeMessage {
 
 #[derive(Clone)]
 pub struct Kafka<Exe: Executor> {
-    pub(crate) manager: Arc<ConnectionManager<Exe>>,
-    pub(crate) operation_retry_options: OperationRetryOptions,
-    pub(crate) executor: Arc<Exe>,
+    pub manager: Arc<ConnectionManager<Exe>>,
+    pub operation_retry_options: OperationRetryOptions,
+    pub executor: Arc<Exe>,
     pub cluster_meta: Arc<Cluster>,
     supported_versions: HashMap<i16, VersionRange>,
 }
@@ -87,18 +82,16 @@ impl<Exe: Executor> Kafka<Exe> {
     pub async fn new<S: Into<String>>(
         url: S,
         options: KafkaOptions,
-        connection_retry_options: Option<ConnectionRetryOptions>,
-        operation_retry_options: Option<OperationRetryOptions>,
         executor: Exe,
     ) -> Result<Self> {
         let url: String = url.into();
         let executor = Arc::new(executor);
-        let operation_retry_options = operation_retry_options.unwrap_or_default();
+        let operation_retry_options = OperationRetryOptions::default();
 
         let manager = ConnectionManager::new(
             url,
             options,
-            connection_retry_options,
+            None,
             operation_retry_options.clone(),
             executor.clone(),
         )
@@ -369,40 +362,6 @@ impl<Exe: Executor> Kafka<Exe> {
             client_software_version: Self::PKG_VERSION.to_string().to_str_bytes(),
             ..Default::default()
         };
-        Ok(request)
-    }
-
-    pub fn list_offsets_builder(
-        &self,
-        assignments: &HashMap<TopicName, Vec<TopicPartitionState>>,
-    ) -> Result<ListOffsetsRequest> {
-        let mut request = ListOffsetsRequest {
-            replica_id: BrokerId(-1),
-            isolation_level: IsolationLevel::ReadUncommitted.into(),
-            ..Default::default()
-        };
-
-        let mut topics = Vec::new();
-        let timestamp = Local::now().timestamp();
-        for (topic_name, partition_list) in assignments.iter() {
-            let mut partitions = Vec::new();
-            for partition in partition_list {
-                let partition = ListOffsetsPartition {
-                    partition_index: partition.partition(),
-                    current_leader_epoch: NO_PARTITION_LEADER_EPOCH,
-                    timestamp,
-                    ..Default::default()
-                };
-                partitions.push(partition);
-            }
-            let topic = ListOffsetsTopic {
-                name: topic_name.clone(),
-                partitions,
-                ..Default::default()
-            };
-            topics.push(topic);
-        }
-        request.topics = topics;
         Ok(request)
     }
 }

@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use futures::channel::mpsc::SendError;
 use kafka_protocol::{
     messages::{ApiKey, TopicName},
     protocol::{buf::NotEnoughBytesError, DecodeError, EncodeError},
@@ -26,6 +27,9 @@ pub enum Error {
     TopicNotAvailable {
         topic: TopicName,
     },
+    TopicAuthorizationError {
+        topics: Vec<TopicName>,
+    },
     PartitionNotAvailable {
         topic: TopicName,
         partition: i32,
@@ -44,6 +48,12 @@ pub enum Error {
 impl From<FromUtf8Error> for Error {
     fn from(value: FromUtf8Error) -> Self {
         Error::Custom(value.to_string())
+    }
+}
+
+impl From<FromUtf8Error> for Box<Error> {
+    fn from(value: FromUtf8Error) -> Self {
+        Box::new(Error::Custom(value.to_string()))
     }
 }
 
@@ -89,11 +99,11 @@ impl From<DecodeError> for Error {
     }
 }
 
-// impl From<ConsumerProtocolAssignmentBuilderError> for Error {
-//     fn from(value: ConsumerProtocolAssignmentBuilderError) -> Self {
-//         Error::Custom(value.to_string())
-//     }
-// }
+impl From<SendError> for Error {
+    fn from(value: SendError) -> Self {
+        Error::Custom(value.to_string())
+    }
+}
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -109,6 +119,9 @@ impl std::fmt::Display for Error {
             }
             Error::TopicNotAvailable { topic } => {
                 write!(f, "Topic not available, topic: {topic:?}")
+            }
+            Error::TopicAuthorizationError { topics } => {
+                write!(f, "Topic Authorization Error, topics: {topics:?}")
             }
             Error::NodeNotAvailable { node } => {
                 write!(f, "Node not available, node: {node:?}")
