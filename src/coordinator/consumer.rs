@@ -530,15 +530,14 @@ impl<Exe: Executor> Inner<Exe> {
 /// for request builder and response handler
 impl<Exe: Executor> Inner<Exe> {
     async fn join_group_protocol(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
-        let mut topics = HashSet::with_capacity(self.subscriptions.lock().await.topics.len());
-        self.subscriptions
+        let topics = self
+            .subscriptions
             .lock()
             .await
             .topics
             .iter()
-            .for_each(|topic| {
-                topics.insert(topic.clone());
-            });
+            .cloned()
+            .collect::<HashSet<TopicName>>();
         let mut protocols = IndexMap::with_capacity(topics.len());
         for assignor in self.assignors.iter() {
             let subscription = Subscription::new(
