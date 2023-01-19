@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<Error>> {
         }
     }
 
-    tokio::time::sleep(Duration::from_secs(100000000)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     Ok(())
 }
 
@@ -105,13 +105,13 @@ async fn produce<Exe: Executor>(client: Kafka<Exe>) -> Result<(), Box<Error>> {
 
     let now = Instant::now();
     let topic = topic_name("kafka");
-    for _ in 0..10 {
-        let record = TestData::new("hello kafka 123");
+    for i in 0..1_0000_0000 {
+        let record = TestData::new(&format!("hello kafka {i}"));
         let ret = producer.send(&topic, record).await?;
         let _ = tx.send(ret).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
     }
     info!("elapsed: {:?}", now.elapsed());
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     Ok(())
 }

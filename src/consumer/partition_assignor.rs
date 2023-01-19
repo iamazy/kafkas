@@ -234,9 +234,9 @@ impl<'a> MemberInfo<'a> {
 
 pub static SUPPORTED_PARTITION_ASSIGNORS: &[PartitionAssignor] = &[
     PartitionAssignor::Range(RangeAssignor),
-    PartitionAssignor::RoundRobin(RoundRobinAssignor),
-    PartitionAssignor::Sticky(StickyAssignor),
-    PartitionAssignor::CooperativeSticky(CooperativeStickyAssignor),
+    // PartitionAssignor::RoundRobin(RoundRobinAssignor),
+    // PartitionAssignor::Sticky(StickyAssignor),
+    // PartitionAssignor::CooperativeSticky(CooperativeStickyAssignor),
 ];
 
 #[derive(Debug, Clone)]

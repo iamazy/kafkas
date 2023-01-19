@@ -30,8 +30,8 @@ use crate::{
     client::Kafka,
     consumer::{
         partition_assignor::{
-            Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, RangeAssignor,
-            Subscription,
+            Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, Subscription,
+            SUPPORTED_PARTITION_ASSIGNORS,
         },
         ConsumerGroupMetadata, ConsumerOptions, SubscriptionState, TopicPartitionState,
     },
@@ -213,6 +213,14 @@ impl<Exe: Executor> Inner<Exe> {
             group_id, node
         );
 
+        // TODO: check consumer options
+        let assignors: Vec<_> = options.partition_assignment_strategy.split(',').collect();
+        let assignors: Vec<PartitionAssignor> = SUPPORTED_PARTITION_ASSIGNORS
+            .iter()
+            .filter(|assignor| assignors.contains(&assignor.name()))
+            .cloned()
+            .collect();
+
         Ok(Self {
             client,
             node,
@@ -220,7 +228,7 @@ impl<Exe: Executor> Inner<Exe> {
             group_meta: ConsumerGroupMetadata::new(group_id.into()),
             group_subscription: GroupSubscription::default(),
             consumer_options: options,
-            assignors: vec![PartitionAssignor::Range(RangeAssignor)],
+            assignors,
             state: MemberState::UnJoined,
         })
     }
@@ -616,11 +624,22 @@ impl<Exe: Executor> Inner<Exe> {
             request.member_id = self.group_meta.member_id.clone();
             request.generation_id = self.group_meta.generation_id;
 
-            let assignor = self.look_up_assignor("range")?;
             if self.group_meta.member_id == self.group_meta.leader {
-                let cluster = self.client.cluster_meta.clone();
-                request.assignments =
-                    serialize_assignments(assignor.assign(cluster, &self.group_subscription)?)?;
+                match self.group_meta.protocol_name {
+                    Some(ref protocol) => {
+                        let assignor = self.look_up_assignor(&protocol.to_string())?;
+                        let cluster = self.client.cluster_meta.clone();
+                        request.assignments = serialize_assignments(
+                            assignor.assign(cluster, &self.group_subscription)?,
+                        )?;
+                    }
+                    None => {
+                        return Err(Error::Custom(format!(
+                            "Group leader {} has no partition assignor protocol",
+                            self.group_meta.leader
+                        )))
+                    }
+                }
             }
 
             if version >= 3 {
