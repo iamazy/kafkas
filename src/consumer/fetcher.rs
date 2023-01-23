@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     fmt::{Display, Formatter},
     hash::Hash,
     sync::Arc,
@@ -19,9 +19,7 @@ use kafka_protocol::{
     records::{Record, RecordBatchDecoder, NO_PARTITION_LEADER_EPOCH},
     ResponseError,
 };
-use parking_lot::Mutex as plMutex;
 use tracing::{debug, error, info, trace, warn};
-use uuid::Uuid;
 
 use crate::{
     client::Kafka,
@@ -46,7 +44,7 @@ pub struct Fetcher<Exe: Executor> {
     options: Arc<ConsumerOptions>,
     subscription: Arc<Mutex<SubscriptionState>>,
     sessions: Arc<DashMap<NodeId, FetchSession>>,
-    completed_fetches: Arc<plMutex<VecDeque<CompletedFetch>>>,
+    completed_fetches: Arc<Mutex<Vec<CompletedFetch>>>,
     nodes_with_pending_fetch_requests: HashSet<i32>,
 }
 
@@ -67,7 +65,7 @@ impl<Exe: Executor> Fetcher<Exe> {
             timestamp,
             subscription,
             sessions: Arc::new(sessions),
-            completed_fetches: Arc::new(plMutex::new(VecDeque::new())),
+            completed_fetches: Arc::new(Mutex::new(Vec::new())),
             options,
             nodes_with_pending_fetch_requests: HashSet::new(),
         }
@@ -78,10 +76,10 @@ impl<Exe: Executor> Fetcher<Exe> {
         let mut records_remaining = self.options.max_poll_records;
         let mut need_reset_offset = false;
         while records_remaining > 0 {
-            let completed_fetch = self.completed_fetches.lock().pop_front();
-            if let Some(completed_fetch) = completed_fetch {
-                let partition = completed_fetch.partition_data;
-                let tp = completed_fetch.partition;
+            let mut fetches_lock = self.completed_fetches.lock().await;
+            if let Some(completed_fetch) = fetches_lock.first_mut() {
+                let partition = &mut completed_fetch.partition_data;
+                let tp = completed_fetch.partition.clone();
                 if let Some(partition_state) =
                     self.subscription.lock().await.assignments.get_mut(&tp)
                 {
@@ -123,12 +121,12 @@ impl<Exe: Executor> Fetcher<Exe> {
                                     "{error_msg}, raising error to the application since no reset \
                                      policy is configured."
                                 );
-                                return Err(Error::Response { error, msg: None });
+                                return Err(error.into());
                             }
                         }
                         Some(error @ ResponseError::TopicAuthorizationFailed) => {
                             warn!("Not authorized to read from {tp}");
-                            return Err(Error::Response { error, msg: None });
+                            return Err(error.into());
                         }
                         Some(ResponseError::UnknownLeaderEpoch) => {
                             debug!("Received unknown leader epoch error in fetch for {tp}");
@@ -138,7 +136,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                         }
                         Some(error @ ResponseError::CorruptMessage) => {
                             error!("Encountered corrupt message when fetching offset for {tp}");
-                            return Err(Error::Response { error, msg: None });
+                            return Err(error.into());
                         }
                         None => {
                             if partition.last_stable_offset >= 0 {
@@ -158,11 +156,17 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 partition.high_watermark
                             );
                             // decode record batch
-                            if let Some(mut records) = partition.records {
-                                let records = RecordBatchDecoder::decode(&mut records)?;
+                            if let Some(ref mut records) = partition.records {
+                                let records = RecordBatchDecoder::decode(records)?;
                                 if let Some(record) =
                                     records.iter().max_by_key(|record| record.offset)
                                 {
+                                    if record.offset <= partition_state.position.offset {
+                                        return Err(Error::Custom(format!(
+                                            "Invalid record offset: {}, expect greater than {}",
+                                            record.offset, partition_state.position.offset
+                                        )));
+                                    }
                                     partition_state.position.offset = record.offset;
                                     partition_state.position.current_leader.epoch =
                                         Some(record.partition_leader_epoch);
@@ -174,6 +178,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 records_remaining -= records.len() as i32;
                                 fetch.records.insert(tp, records);
                             }
+                            fetches_lock.pop();
                         }
                         Some(error) => {
                             error!("Unexpected error code {error} while fetching offset from {tp}")
@@ -244,7 +249,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                                                 "Fetch {:?} at offset {} for {tp}",
                                                 self.options.isolation_level, data.fetch_offset
                                             );
-                                            self.completed_fetches.lock().push_back(
+                                            self.completed_fetches.lock().await.push(
                                                 CompletedFetch {
                                                     partition: tp,
                                                     partition_data: partition,
@@ -274,17 +279,11 @@ impl<Exe: Executor> Fetcher<Exe> {
                             }
 
                             if (7..=13).contains(&version) {
-                                if fetch_response.error_code.is_ok() {
-                                    session.next_metadata.session_id = fetch_response.session_id;
-                                } else {
-                                    error!(
-                                        "fetch records error: {}",
-                                        fetch_response.error_code.err().unwrap()
-                                    );
-                                    return Err(Error::Response {
-                                        error: fetch_response.error_code.err().unwrap(),
-                                        msg: None,
-                                    });
+                                match fetch_response.error_code.err() {
+                                    None => {
+                                        session.next_metadata.session_id = fetch_response.session_id
+                                    }
+                                    Some(error) => return Err(error.into()),
                                 }
                             }
                         }
@@ -307,17 +306,9 @@ impl<Exe: Executor> Fetcher<Exe> {
 }
 
 impl<Exe: Executor> Fetcher<Exe> {
-    fn topic_id(&self, topic_name: &TopicName) -> Uuid {
-        if let Some(topic_id) = self.client.cluster_meta.topic_id(topic_name) {
-            topic_id
-        } else {
-            Uuid::nil()
-        }
-    }
-
     async fn fetchable_partitions(&self) -> Vec<TopicPartition> {
         let mut exclude: HashSet<TopicPartition> = HashSet::new();
-        for fetch in self.completed_fetches.lock().iter() {
+        for fetch in self.completed_fetches.lock().await.iter() {
             exclude.insert(fetch.partition.clone());
         }
         self.subscription
@@ -343,40 +334,41 @@ impl<Exe: Executor> Fetcher<Exe> {
 
         self.validate_position_on_metadata_change().await;
 
-        for tp in self.fetchable_partitions().await.iter() {
+        let fetchable_partitions = self.fetchable_partitions().await;
+        for tp in fetchable_partitions.iter() {
             if let Some(position) = self.subscription.lock().await.position(tp) {
                 if let Some(node) = position.current_leader.leader {
                     if self.nodes_with_pending_fetch_requests.contains(&node) {
                         trace!(
-                            "Skipping fetch for {} because previous request to {} has not been \
-                             processed",
-                            tp,
-                            node
+                            "Skipping fetch for {tp} because previous request to {node} has not \
+                             been processed"
                         );
                     } else {
                         let data = FetchRequestPartitionData {
-                            topic_id: self.topic_id(&tp.topic),
-                            fetch_offset: position.offset,
+                            topic_id: self.client.topic_id(&tp.topic),
+                            fetch_offset: position.offset + 1,
                             log_start_offset: INVALID_LOG_START_OFFSET,
                             max_bytes: self.options.max_partition_fetch_bytes,
                             current_leader_epoch: position.offset_epoch,
                             last_fetched_epoch: None,
                         };
-                        if let Some(builder) = fetchable.get_mut(&node) {
-                            builder.add(tp.clone(), data);
-                        } else {
-                            if self.sessions.get_mut(&node).is_none() {
-                                let session = FetchSession::new(node);
-                                self.sessions.insert(node, session);
-                            }
+                        match fetchable.get_mut(&node) {
+                            Some(builder) => builder.add(tp.clone(), data),
+                            None => {
+                                if self.sessions.get_mut(&node).is_none() {
+                                    let session = FetchSession::new(node);
+                                    self.sessions.insert(node, session);
+                                }
 
-                            let mut builder = FetchRequestDataBuilder::new();
-                            builder.add(tp.clone(), data);
-                            fetchable.insert(node, builder);
-                            debug!(
-                                "Added {:?} fetch request for {} at position {} to node {}",
-                                self.options.isolation_level, tp, position.offset, node
-                            );
+                                let mut builder = FetchRequestDataBuilder::new();
+                                builder.add(tp.clone(), data);
+                                fetchable.insert(node, builder);
+                                debug!(
+                                    "Added {:?} fetch request for {tp} at position {} to node \
+                                     {node}",
+                                    self.options.isolation_level, position.offset
+                                );
+                            }
                         }
                     }
                 } else {
@@ -697,7 +689,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                     .current_leader_epoch
                     .unwrap_or(NO_PARTITION_LEADER_EPOCH),
                 last_fetched_epoch: data.last_fetched_epoch.unwrap_or(NO_PARTITION_LEADER_EPOCH),
-                fetch_offset: data.fetch_offset + 1,
+                fetch_offset: data.fetch_offset,
                 log_start_offset: data.log_start_offset,
                 partition_max_bytes: data.max_bytes,
                 ..Default::default()

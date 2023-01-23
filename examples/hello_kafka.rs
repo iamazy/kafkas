@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<Error>> {
         // Set the subscriber as the default.
         .init();
 
-    let kafka_client = Kafka::new("127.0.0.1:9092", KafkaOptions::new(), TokioExecutor).await?;
+    let kafka_client = Kafka::new("127.0.0.1:9092", KafkaOptions::default(), TokioExecutor).await?;
 
     // produce(kafka_client.clone()).await?;
 

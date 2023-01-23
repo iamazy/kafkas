@@ -17,6 +17,7 @@ use kafka_protocol::{
     records::Record,
 };
 use tracing::error;
+use uuid::Uuid;
 
 use crate::{
     connection::Connection,
@@ -62,17 +63,13 @@ pub struct KafkaOptions {
 impl Default for KafkaOptions {
     fn default() -> Self {
         Self {
-            client_id: Some("default_client_id".into()),
+            client_id: Some("default".into()),
             request_timeout_ms: 1,
         }
     }
 }
 
 impl KafkaOptions {
-    pub fn new() -> Self {
-        Default::default()
-    }
-
     pub fn client_id<S: Into<String>>(&mut self, client_id: S) {
         self.client_id = Some(client_id.into());
     }
@@ -137,6 +134,14 @@ impl<Exe: Executor> Kafka<Exe> {
             cluster_meta: Arc::new(Cluster::new()),
             supported_versions,
         })
+    }
+
+    pub fn topic_id(&self, topic_name: &TopicName) -> Uuid {
+        if let Some(topic_id) = self.cluster_meta.topic_id(topic_name) {
+            topic_id
+        } else {
+            Uuid::nil()
+        }
     }
 
     pub fn partitions(&self, topic: &TopicName) -> Result<PartitionRef> {

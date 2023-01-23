@@ -24,25 +24,18 @@ pub enum Error {
     Connection(ConnectionError),
     InvalidVersion(i16),
     InvalidApiRequest(ApiKey),
-    TopicNotAvailable {
-        topic: TopicName,
-    },
-    TopicAuthorizationError {
-        topics: Vec<TopicName>,
-    },
-    PartitionNotAvailable {
-        topic: TopicName,
-        partition: i32,
-    },
-    NodeNotAvailable {
-        node: NodeId,
-    },
+    TopicNotAvailable { topic: TopicName },
+    TopicAuthorizationError { topics: Vec<TopicName> },
+    PartitionNotAvailable { topic: TopicName, partition: i32 },
+    NodeNotAvailable { node: NodeId },
     Produce(ProduceError),
     Consume(ConsumeError),
-    Response {
-        error: ResponseError,
-        msg: Option<String>,
-    },
+}
+
+impl From<ResponseError> for Error {
+    fn from(value: ResponseError) -> Self {
+        Error::Custom(value.to_string())
+    }
 }
 
 impl From<FromUtf8Error> for Error {
@@ -126,7 +119,6 @@ impl std::fmt::Display for Error {
             Error::NodeNotAvailable { node } => {
                 write!(f, "Node not available, node: {node:?}")
             }
-            Error::Response { error, msg } => write!(f, "Error code: {error:?}, msg: {msg:?}"),
         }
     }
 }

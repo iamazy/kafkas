@@ -163,7 +163,7 @@ impl SubscriptionState {
                     tp.clone(),
                     OffsetMetadata {
                         committed_offset: tp_state.position.offset,
-                        committed_leader_epoch: tp_state.position.offset_epoch,
+                        committed_leader_epoch: tp_state.position.current_leader.epoch,
                         metadata: Some(StrBytes::from_str("")),
                     },
                 );
@@ -193,15 +193,15 @@ impl SubscriptionState {
         }
     }
 
-    fn fetchable_partitions<F>(&self, _func: F) -> Vec<TopicPartition>
+    fn fetchable_partitions<F>(&self, func: F) -> Vec<TopicPartition>
     where
         F: Fn(&TopicPartition) -> bool,
     {
         let mut partitions = Vec::new();
-        for (tp, _tp_state) in self.assignments.iter() {
-            // if tp_state.is_fetchable() && func(tp) {
-            partitions.push(tp.clone());
-            // }
+        for (tp, tp_state) in self.assignments.iter() {
+            if tp_state.is_fetchable() && func(tp) {
+                partitions.push(tp.clone());
+            }
         }
         partitions
     }
@@ -635,7 +635,9 @@ impl<Exe: Executor> Consumer<Exe> {
         let mut _executor = self.client.executor.clone();
         let res = self.client.executor.spawn(Box::pin(async move {
             while fetch_interval.next().await.is_some() {
-                let _ = fetcher.fetch().await;
+                if let Err(err) = fetcher.fetch().await {
+                    error!("fetch error: {}", err);
+                }
             }
         }));
 

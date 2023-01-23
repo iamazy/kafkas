@@ -240,6 +240,24 @@ impl<Exe: Executor> Inner<Exe> {
         Ok(())
     }
 
+    async fn rejoin_group(&mut self) -> Result<()> {
+        self.join_group().await?;
+        self.sync_group().await?;
+        self.offset_fetch().await
+    }
+
+    fn reset_state(&mut self, should_reset_member_id: bool) {
+        self.state = MemberState::UnJoined;
+        if should_reset_member_id {
+            self.group_meta.generation_id = DEFAULT_GENERATION_ID;
+            self.group_meta.member_id = StrBytes::default();
+            self.group_meta.protocol_name = None;
+        } else {
+            self.group_meta.generation_id = DEFAULT_GENERATION_ID;
+            self.group_meta.protocol_name = None;
+        }
+    }
+
     pub async fn describe_groups(&mut self) -> Result<()> {
         if let Some(version_range) = self.client.version_range(ApiKey::JoinGroupKey) {
             let describe_groups_response = self
@@ -257,7 +275,7 @@ impl<Exe: Executor> Inner<Exe> {
         }
     }
 
-    #[async_recursion::async_recursion(? Send)]
+    #[async_recursion::async_recursion]
     pub async fn join_group(&mut self) -> Result<()> {
         self.state = MemberState::PreparingRebalance;
         if let Some(version_range) = self.client.version_range(ApiKey::JoinGroupKey) {
@@ -279,7 +297,7 @@ impl<Exe: Executor> Inner<Exe> {
                     );
                     self.join_group().await
                 }
-                Some(error) => Err(Error::Response { error, msg: None }),
+                Some(error) => Err(error.into()),
                 None => {
                     self.group_meta.member_id = join_group_response.member_id;
                     self.group_meta.generation_id = join_group_response.generation_id;
@@ -312,31 +330,38 @@ impl<Exe: Executor> Inner<Exe> {
             .leave_group(&self.node, self.leave_group_builder()?)
             .await?;
 
-        if leave_group_response.error_code.is_ok() {
-            for member in leave_group_response.members {
-                if member.error_code.is_ok() {
-                    debug!(
-                        "Member {} leave group {:?} success.",
-                        member.member_id, self.group_meta.group_id
-                    );
-                } else {
-                    error!(
-                        "Member {} leave group {:?} failed.",
-                        member.member_id, self.group_meta.group_id
-                    );
+        match leave_group_response.error_code.err() {
+            None => {
+                for member in leave_group_response.members {
+                    if member.error_code.is_ok() {
+                        debug!(
+                            "Member {} leave group {:?} success.",
+                            member.member_id, self.group_meta.group_id
+                        );
+                    } else {
+                        error!(
+                            "Member {} leave group {:?} failed.",
+                            member.member_id, self.group_meta.group_id
+                        );
+                    }
                 }
+                info!(
+                    "Leave group {:?} success, member: {}",
+                    self.group_meta.group_id, self.group_meta.member_id
+                );
+                Ok(())
             }
-            info!(
-                "Leave group {:?} success, member: {}",
-                self.group_meta.group_id, self.group_meta.member_id
-            );
-            Ok(())
-        } else {
-            Err(Error::Response {
-                error: leave_group_response.error_code.err().unwrap(),
-                msg: None,
-            })
+            Some(error) => Err(error.into()),
         }
+    }
+
+    fn has_generation_reset(&self) -> bool {
+        self.group_meta.generation_id == DEFAULT_GENERATION_ID
+            && self.group_meta.protocol_name.is_none()
+    }
+
+    fn is_protocol_type_inconsistent(&self, protocol_type: &Option<StrBytes>) -> bool {
+        protocol_type.is_some() && protocol_type != &self.group_meta.protocol_type
     }
 
     pub async fn sync_group(&mut self) -> Result<()> {
@@ -345,45 +370,53 @@ impl<Exe: Executor> Inner<Exe> {
                 .client
                 .sync_group(&self.node, self.sync_group_builder(version_range.max)?)
                 .await?;
-            if sync_group_response.error_code.is_ok() {
-                if self.group_meta.protocol_name.is_none() {
-                    self.group_meta.protocol_name = sync_group_response.protocol_name;
-                }
-                if self.group_meta.protocol_type.is_none() {
-                    self.group_meta.protocol_type = sync_group_response.protocol_type;
-                }
-                let assignment =
-                    Assignment::deserialize_from_bytes(&mut sync_group_response.assignment)?;
-                for (topic, partitions) in assignment.partitions {
-                    for partition in partitions.iter() {
-                        let tp = TopicPartition::new(topic.clone(), *partition);
-                        let mut tp_state = TopicPartitionState::new(*partition);
-                        tp_state.position.current_leader =
-                            self.client.cluster_meta.current_leader(&tp);
-                        self.subscriptions
-                            .lock()
-                            .await
-                            .assignments
-                            .insert(tp, tp_state);
+            match sync_group_response.error_code.err() {
+                None => {
+                    if self.is_protocol_type_inconsistent(&sync_group_response.protocol_type) {
+                        error!(
+                            "JoinGroup failed: Inconsistent Protocol Type, received {:?} but \
+                             expected {:?}",
+                            sync_group_response.protocol_type, self.group_meta.protocol_type
+                        );
+                        return Err(ResponseError::InconsistentGroupProtocol.into());
                     }
+
+                    if self.group_meta.protocol_name.is_none() {
+                        self.group_meta.protocol_name = sync_group_response.protocol_name;
+                    }
+                    if self.group_meta.protocol_type.is_none() {
+                        self.group_meta.protocol_type = sync_group_response.protocol_type;
+                    }
+                    let assignment =
+                        Assignment::deserialize_from_bytes(&mut sync_group_response.assignment)?;
+                    self.subscriptions.lock().await.assignments.clear();
+                    for (topic, partitions) in assignment.partitions {
+                        for partition in partitions.iter() {
+                            let tp = TopicPartition::new(topic.clone(), *partition);
+                            let mut tp_state = TopicPartitionState::new(*partition);
+                            tp_state.position.current_leader =
+                                self.client.cluster_meta.current_leader(&tp);
+                            self.subscriptions
+                                .lock()
+                                .await
+                                .assignments
+                                .insert(tp, tp_state);
+                        }
+                    }
+                    self.state = MemberState::Stable;
+                    info!(
+                        "Sync group [{}] success, leader = {}, member_id = {}, generation_id = \
+                         {}, protocol_type = {:?}, protocol_name = {:?}",
+                        self.group_meta.group_id.0,
+                        self.group_meta.leader,
+                        self.group_meta.member_id,
+                        self.group_meta.generation_id,
+                        self.group_meta.protocol_type.as_ref(),
+                        self.group_meta.protocol_name.as_ref(),
+                    );
+                    Ok(())
                 }
-                self.state = MemberState::Stable;
-                info!(
-                    "Sync group [{}] success, leader = {}, member_id = {}, generation_id = {}, \
-                     protocol_type = {:?}, protocol_name = {:?}",
-                    self.group_meta.group_id.0,
-                    self.group_meta.leader,
-                    self.group_meta.member_id,
-                    self.group_meta.generation_id,
-                    self.group_meta.protocol_type.as_ref(),
-                    self.group_meta.protocol_name.as_ref(),
-                );
-                Ok(())
-            } else {
-                Err(Error::Response {
-                    error: sync_group_response.error_code.err().unwrap(),
-                    msg: None,
-                })
+                Some(error) => Err(error.into()),
             }
         } else {
             Err(Error::InvalidApiRequest(ApiKey::SyncGroupKey))
@@ -399,18 +432,16 @@ impl<Exe: Executor> Inner<Exe> {
                     self.offset_fetch_builder(version_range.max).await?,
                 )
                 .await?;
-            if offset_fetch_response.error_code.is_ok() {
-                if let Some(group) = offset_fetch_response.groups.pop() {
-                    offset_fetch_block!(self, group);
-                } else {
-                    offset_fetch_block!(self, offset_fetch_response);
+            match offset_fetch_response.error_code.err() {
+                None => {
+                    if let Some(group) = offset_fetch_response.groups.pop() {
+                        offset_fetch_block!(self, group);
+                    } else {
+                        offset_fetch_block!(self, offset_fetch_response);
+                    }
+                    Ok(())
                 }
-                Ok(())
-            } else {
-                Err(Error::Response {
-                    error: offset_fetch_response.error_code.err().unwrap(),
-                    msg: None,
-                })
+                Some(error) => Err(error.into()),
             }
         } else {
             Err(Error::InvalidApiRequest(ApiKey::OffsetFetchKey))
@@ -467,12 +498,13 @@ impl<Exe: Executor> Inner<Exe> {
                          or not valid",
                         self.node.id
                     );
-                    Err(Error::Response { error, msg: None })
+                    Err(error.into())
                 }
                 Some(error @ ResponseError::RebalanceInProgress) => {
                     if matches!(self.state, MemberState::Stable) {
-                        // TODO: request rejoin group
-                        Err(Error::Response { error, msg: None })
+                        warn!("Request joining group due to: group is already rebalancing");
+                        self.rejoin_group().await?;
+                        Err(error.into())
                     } else {
                         debug!(
                             "Ignoring heartbeat response with error {error} during {:?} state",
@@ -492,17 +524,9 @@ impl<Exe: Executor> Inner<Exe> {
                              failed due to {error}, resetting generation",
                             self.group_meta.generation_id, self.group_meta.group_instance_id
                         );
-                        self.state = MemberState::UnJoined;
-                        if !matches!(error, ResponseError::IllegalGeneration) {
-                            self.group_meta.generation_id = DEFAULT_GENERATION_ID;
-                            self.group_meta.member_id = MemberId::default();
-                            self.group_meta.protocol_name = None;
-                        } else {
-                            self.group_meta.generation_id = DEFAULT_GENERATION_ID;
-                            self.group_meta.protocol_name = None;
-                        }
-                        // TODO: rejoin group
-                        Err(Error::Response { error, msg: None })
+                        self.reset_state(matches!(error, ResponseError::IllegalGeneration));
+                        self.rejoin_group().await?;
+                        Err(error.into())
                     } else {
                         info!(
                             "Attempt to heartbeat with stale generation {} and group instance id \
@@ -512,14 +536,8 @@ impl<Exe: Executor> Inner<Exe> {
                         Ok(())
                     }
                 }
-                Some(error @ ResponseError::GroupAuthorizationFailed) => Err(Error::Response {
-                    error,
-                    msg: Some(format!("group: {}", self.group_meta.group_id.0)),
-                }),
-                Some(error) => Err(Error::Response {
-                    error,
-                    msg: Some(format!("Unexpected error in heartbeat response: {error}")),
-                }),
+                Some(error @ ResponseError::GroupAuthorizationFailed) => Err(error.into()),
+                Some(error) => Err(error.into()),
             }
         } else {
             Err(Error::InvalidApiRequest(ApiKey::HeartbeatKey))
