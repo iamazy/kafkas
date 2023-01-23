@@ -1,17 +1,17 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures::{pin_mut, SinkExt, StreamExt};
-use kafka_protocol::records::TimestampType;
-use kafkas::{
-    client::{Kafka, KafkaOptions, SerializeMessage},
-    consumer::{Consumer, ConsumerOptions},
-    executor::{Executor, TokioExecutor},
-    producer::{Producer, ProducerOptions},
-    topic_name, Error, Record, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
+use futures::{SinkExt, StreamExt};
+use kafka_protocol::records::{
+    Record, TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
     NO_SEQUENCE,
 };
-use tokio::time::Instant;
+use kafkas::{
+    client::{Kafka, KafkaOptions, SerializeMessage},
+    executor::TokioExecutor,
+    producer::{Producer, ProducerOptions},
+    topic_name, Error,
+};
 use tracing::{error, info};
 
 #[tokio::main]
@@ -29,22 +29,27 @@ async fn main() -> Result<(), Box<Error>> {
 
     let kafka_client = Kafka::new("127.0.0.1:9092", KafkaOptions::default(), TokioExecutor).await?;
 
-    // produce(kafka_client.clone()).await?;
+    let producer = Producer::new(kafka_client, ProducerOptions::default()).await?;
 
-    let consumer_options = ConsumerOptions::new("app");
-    let mut consumer = Consumer::new(kafka_client, consumer_options).await?;
-    consumer.subscribe(vec!["kafka"]).await?;
-
-    let consume_stream = consumer.stream()?;
-    pin_mut!(consume_stream);
-
-    while let Some(Ok(record)) = consume_stream.next().await {
-        if let Some(record) = record.value {
-            println!("{:?}", String::from_utf8(record.to_vec())?);
+    let (mut tx, mut rx) = futures::channel::mpsc::unbounded();
+    tokio::task::spawn(Box::pin(async move {
+        while let Some(fut) = rx.next().await {
+            if let Err(e) = fut.await {
+                error!("{e}");
+            }
         }
-    }
+    }));
 
+    let now = Instant::now();
+    let topic = topic_name("kafka");
+    for i in 0..10000_0000 {
+        let record = TestData::new(&format!("hello - kafka {i}"));
+        let ret = producer.send(&topic, record).await?;
+        let _ = tx.send(ret).await;
+    }
+    info!("elapsed: {:?}", now.elapsed());
     tokio::time::sleep(Duration::from_secs(1)).await;
+
     Ok(())
 }
 
@@ -89,29 +94,4 @@ impl SerializeMessage for TestData {
             headers: indexmap::IndexMap::new(),
         })
     }
-}
-
-async fn produce<Exe: Executor>(client: Kafka<Exe>) -> Result<(), Box<Error>> {
-    let producer = Producer::new(client, ProducerOptions::default()).await?;
-
-    let (mut tx, mut rx) = futures::channel::mpsc::unbounded();
-    tokio::task::spawn(Box::pin(async move {
-        while let Some(fut) = rx.next().await {
-            if let Err(e) = fut.await {
-                error!("{e}");
-            }
-        }
-    }));
-
-    let now = Instant::now();
-    let topic = topic_name("kafka");
-    for i in 0..1_0000_0000 {
-        let record = TestData::new(&format!("hello kafka {i}"));
-        let ret = producer.send(&topic, record).await?;
-        let _ = tx.send(ret).await;
-    }
-    info!("elapsed: {:?}", now.elapsed());
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    Ok(())
 }
