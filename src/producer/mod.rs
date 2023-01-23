@@ -453,7 +453,8 @@ impl<Exe: Executor> TopicProducer<Exe> {
         let num_partitions = partitions.len();
         let batches = DashMap::with_capacity_and_hasher(num_partitions, FxBuildHasher::default());
         for partition in partitions {
-            batches.insert(*partition, ProducerBatch::new(1024 * 1024, *partition));
+            // TODO: split batch when got `MessageTooLarge` error
+            batches.insert(*partition, ProducerBatch::new(100 * 1024, *partition));
         }
 
         let producer = Self {
