@@ -868,13 +868,3 @@ pub struct Fetch {
     position_advanced: bool,
     pub(crate) num_records: i32,
 }
-
-impl Fetch {
-    pub(crate) fn records(self) -> Vec<Record> {
-        let mut records = Vec::with_capacity(self.num_records as usize);
-        for (_, records_per_tp) in self.records {
-            records.extend(records_per_tp);
-        }
-        records
-    }
-}

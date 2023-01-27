@@ -279,7 +279,7 @@ impl<Exe: Executor> Kafka<Exe> {
         invoke_request!(self, addr, request, FetchResponse)
     }
 
-    pub async fn topics_metadata(&self, topics: Vec<TopicName>) -> Result<()> {
+    pub async fn update_metadata(&self, topics: Vec<TopicName>) -> Result<()> {
         let mut request = MetadataRequest::default();
         let mut metadata_topics = Vec::with_capacity(topics.len());
         for topic_name in topics {

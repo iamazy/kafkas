@@ -10,18 +10,25 @@ use std::{
 
 use async_stream::try_stream;
 use chrono::Local;
-use futures::{Stream, StreamExt};
+use futures::{
+    future::{select, Either},
+    pin_mut, Stream, StreamExt,
+};
 use kafka_protocol::{
     messages::{GroupId, TopicName},
     protocol::StrBytes,
     records::Record,
 };
+use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
 use crate::{
-    client::Kafka, consumer::fetcher::Fetcher, coordinator::ConsumerCoordinator,
-    error::ConsumeError, executor::Executor, metadata::TopicPartition, Error, NodeId, PartitionId,
-    Result, ToStrBytes, DEFAULT_GENERATION_ID,
+    client::Kafka,
+    consumer::fetcher::Fetcher,
+    coordinator::ConsumerCoordinator,
+    executor::{Executor, Interval},
+    metadata::TopicPartition,
+    Error, NodeId, PartitionId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
 };
 
 const INITIAL_EPOCH: i32 = 0;
@@ -593,12 +600,17 @@ pub struct Consumer<Exe: Executor> {
     coordinator: ConsumerCoordinator<Exe>,
     fetcher: Fetcher<Exe>,
     options: Arc<ConsumerOptions>,
+    notify_shutdown: broadcast::Sender<()>,
 }
 
 impl<Exe: Executor> Consumer<Exe> {
     pub async fn new(client: Kafka<Exe>, options: ConsumerOptions) -> Result<Self> {
         let options = Arc::new(options);
-        let coordinator = ConsumerCoordinator::new(client.clone(), options.clone()).await?;
+
+        let (notify_shutdown, _) = broadcast::channel(1);
+        let coordinator =
+            ConsumerCoordinator::new(client.clone(), options.clone(), notify_shutdown.clone())
+                .await?;
 
         let fetcher = Fetcher::new(
             client.clone(),
@@ -606,64 +618,115 @@ impl<Exe: Executor> Consumer<Exe> {
             coordinator.subscriptions().await,
             options.clone(),
         );
+
         Ok(Self {
             client,
             coordinator,
             fetcher,
             options,
+            notify_shutdown,
         })
-    }
-
-    pub async fn subscribe<S: AsRef<str>>(&mut self, topics: Vec<S>) -> Result<()> {
-        for topic in topics {
-            self.coordinator
-                .subscribe(topic.as_ref().to_string().to_str_bytes().into())
-                .await?;
-        }
-        self.coordinator.prepare_fetch().await?;
-        Ok(())
     }
 
     pub async fn commit_ack(&mut self) -> Result<()> {
         self.coordinator.offset_commit().await
     }
 
-    pub fn stream(&mut self) -> Result<impl Stream<Item = Result<Record>> + '_> {
-        let mut fetch_interval = self.client.executor.interval(Duration::from_millis(100));
-
-        let mut fetcher = self.fetcher.clone();
-        let mut _executor = self.client.executor.clone();
-        let res = self.client.executor.spawn(Box::pin(async move {
-            while fetch_interval.next().await.is_some() {
-                if let Err(err) = fetcher.fetch().await {
-                    error!("fetch error: {}", err);
-                }
-            }
-        }));
-
-        if res.is_err() {
-            error!("the executor could not spawn the fetch task");
-            return Err(ConsumeError::Custom(
-                "the executor could not spawn the fetch task".to_string(),
+    pub async fn subscribe<S: AsRef<str>>(
+        &mut self,
+        topics: Vec<S>,
+    ) -> Result<impl Stream<Item = Result<Record>> + '_> {
+        self.coordinator
+            .subscribe(
+                topics
+                    .iter()
+                    .map(|topic| topic.as_ref().to_string().to_str_bytes().into())
+                    .collect(),
             )
-            .into());
-        }
+            .await?;
+        self.coordinator.prepare_fetch().await?;
 
-        let stream = try_stream! {
-            loop {
-                match self.fetcher.collect_fetch().await {
-                    Ok(fetch) => {
-                        for (_tp, records) in fetch.records {
-                            for record in records {
-                                yield record;
-                            }
+        let fetch_interval = self.client.executor.interval(Duration::from_millis(100));
+
+        let spawn_ret = self.client.executor.spawn(Box::pin(do_fetch(
+            self.fetcher.clone(),
+            fetch_interval,
+            self.notify_shutdown.subscribe(),
+        )));
+
+        match spawn_ret {
+            Err(_) => Err(Error::Custom(
+                "The executor could not spawn the fetch task".to_string(),
+            )),
+            Ok(_) => Ok(fetch_stream(
+                self.client.clone(),
+                self.fetcher.clone(),
+                self.options.fetch_max_wait_ms as u64,
+                self.notify_shutdown.subscribe(),
+            )),
+        }
+    }
+}
+
+impl<Exe: Executor> Drop for Consumer<Exe> {
+    fn drop(&mut self) {
+        let _ = self.notify_shutdown.send(());
+    }
+}
+
+async fn do_fetch<Exe: Executor>(
+    mut fetcher: Fetcher<Exe>,
+    mut interval: Interval,
+    mut rx: broadcast::Receiver<()>,
+) {
+    while interval.next().await.is_some() {
+        let fetcher_fut = fetcher.fetch();
+        let shutdown = rx.recv();
+        pin_mut!(fetcher_fut);
+        pin_mut!(shutdown);
+
+        match select(fetcher_fut, shutdown).await {
+            Either::Left((Err(err), _)) => {
+                error!("Fetch error: {err}");
+            }
+            Either::Left((_, _)) => {}
+            Either::Right(_) => break,
+        }
+    }
+    info!("Fetch task finished.");
+}
+
+fn fetch_stream<Exe: Executor>(
+    client: Kafka<Exe>,
+    mut fetcher: Fetcher<Exe>,
+    fetch_wait_ms: u64,
+    mut rx: broadcast::Receiver<()>,
+) -> impl Stream<Item = Result<Record>> {
+    try_stream! {
+        loop {
+            let collect_fetch = fetcher.collect_fetch();
+            let shutdown = rx.recv();
+
+            pin_mut!(collect_fetch);
+            pin_mut!(shutdown);
+
+            match select(collect_fetch, shutdown).await {
+                Either::Left((Ok(fetch), _)) => {
+                    if fetch.num_records == 0 {
+                        client.executor.delay(Duration::from_millis(fetch_wait_ms)).await;
+                    }
+                    for (_tp, records) in fetch.records {
+                        for record in records {
+                            yield record;
                         }
                     }
-                    Err(err) => error!("fetch error: {}", err),
                 }
+                Either::Left((Err(err), _)) => error!("Fetch error: {}", err),
+                Either::Right(_) => {
+                    info!("Fetch task is shutting down");
+                    break
+                },
             }
-        };
-
-        Ok(stream)
+        }
     }
 }

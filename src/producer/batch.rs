@@ -41,11 +41,11 @@ impl Thunk {
                 value_size: self.value_size,
             })
         } else if let Some(ref err) = res.error_message {
-            Err(ProduceError::Custom(err.to_string()).into())
+            Err(Error::Custom(err.to_string()))
         } else if let Some(err) = res.error_code.err() {
-            Err(ProduceError::Custom(err.to_string()).into())
+            Err(Error::Custom(err.to_string()))
         } else {
-            Err(ProduceError::Custom("unknown error".to_string()).into())
+            Err(Error::Custom("Unknown error".to_string()))
         };
         self.sender.send(result)
     }

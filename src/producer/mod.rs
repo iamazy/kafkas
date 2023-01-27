@@ -27,7 +27,7 @@ use kafka_protocol::{
         NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE,
     },
 };
-use tracing::{error, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::{
     client::{Kafka, SerializeMessage},
@@ -53,10 +53,9 @@ impl Future for SendFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match Pin::new(&mut self.0).poll(cx) {
             Poll::Ready(Ok(r)) => Poll::Ready(r),
-            Poll::Ready(Err(_canceled)) => Poll::Ready(Err(ProduceError::Custom(
-                "producer unexpectedly disconnected".into(),
-            )
-            .into())),
+            Poll::Ready(Err(_canceled)) => Poll::Ready(Err(Error::Custom(
+                "Producer unexpectedly disconnected".into(),
+            ))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -196,7 +195,7 @@ impl<Exe: Executor> Producer<Exe> {
             Partitioner::RoundRobin => {
                 PartitionerSelector::RoundRobin(RoundRobinPartitioner::new())
             }
-            _ => unimplemented!("only support roundbin partitioner"),
+            _ => unimplemented!("Only support roundbin partitioner"),
         };
 
         let encode_options = RecordEncodeOptions {
@@ -220,27 +219,29 @@ impl<Exe: Executor> Producer<Exe> {
             .executor
             .interval(producer.options.linger_ms);
 
-        let res = producer.client.executor.spawn(Box::pin(async move {
+        let spawn_produce = producer.client.executor.spawn(Box::pin(async move {
             while interval.next().await.is_some() {
-                if let Some(strong_producer) = weak_producer.upgrade() {
-                    if let Err(e) = strong_producer
-                        .send_raw(&strong_producer.options, &strong_producer.encode_options)
-                        .await
-                    {
-                        error!("send failed!, error: {e}");
+                match weak_producer.upgrade() {
+                    Some(strong_producer) => {
+                        if let Err(err) = strong_producer
+                            .send_raw(&strong_producer.options, &strong_producer.encode_options)
+                            .await
+                        {
+                            error!("Send failed!, error: {err}");
+                        }
                     }
-                } else {
-                    break;
+                    None => {
+                        info!("Producer is shutting down.");
+                        break;
+                    }
                 }
             }
         }));
 
-        if res.is_err() {
-            error!("the executor could not spawn the linger task");
-            return Err(ProduceError::Custom(
-                "the executor could not spawn the linger task".to_string(),
-            )
-            .into());
+        if spawn_produce.is_err() {
+            return Err(Error::Custom(
+                "The executor could not spawn the produce task".to_string(),
+            ));
         }
 
         Ok(producer)
@@ -446,7 +447,7 @@ struct TopicProducer<Exe: Executor> {
 
 impl<Exe: Executor> TopicProducer<Exe> {
     pub async fn new(client: Arc<Kafka<Exe>>, topic: TopicName) -> Result<Arc<TopicProducer<Exe>>> {
-        client.topics_metadata(vec![topic.clone()]).await?;
+        client.update_metadata(vec![topic.clone()]).await?;
 
         let partitions = client.cluster_meta.partitions(&topic)?;
         let partitions = partitions.value();

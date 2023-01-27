@@ -25,9 +25,8 @@ async fn main() -> Result<(), Box<Error>> {
 
     let consumer_options = ConsumerOptions::new("app");
     let mut consumer = Consumer::new(kafka_client, consumer_options).await?;
-    consumer.subscribe(vec!["kafka"]).await?;
 
-    let consume_stream = consumer.stream()?;
+    let consume_stream = consumer.subscribe(vec!["kafka"]).await?;
     pin_mut!(consume_stream);
 
     while let Some(Ok(record)) = consume_stream.next().await {

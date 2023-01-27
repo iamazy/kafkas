@@ -4,7 +4,11 @@ use std::{
     time::Duration,
 };
 
-use futures::{lock::Mutex, StreamExt};
+use futures::{
+    future::{select, Either},
+    lock::Mutex,
+    pin_mut, StreamExt,
+};
 use indexmap::IndexMap;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
@@ -24,6 +28,7 @@ use kafka_protocol::{
     protocol::{Message, StrBytes},
     ResponseError,
 };
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -72,6 +77,49 @@ macro_rules! offset_fetch_block {
     };
 }
 
+macro_rules! coordinator_task {
+    ($self:ident, $interval_ms:ident, $task:ident) => {
+        let mut interval = $self
+            .client
+            .executor
+            .interval(Duration::from_millis($interval_ms as u64));
+
+        let weak_inner = Arc::downgrade(&$self.inner);
+
+        let mut shutdown = $self.notify_shutdown.subscribe();
+        let res = $self.client.executor.spawn(Box::pin(async move {
+            while interval.next().await.is_some() {
+                match weak_inner.upgrade() {
+                    Some(strong_inner) => {
+                        let mut lock = strong_inner.lock().await;
+                        let task = lock.$task();
+                        let shutdown = shutdown.recv();
+
+                        pin_mut!(task);
+                        pin_mut!(shutdown);
+
+                        match select(task, shutdown).await {
+                            Either::Left((Err(err), _)) => {
+                                error!("{} failed, {}", stringify!(task), err);
+                            }
+                            Either::Left((Ok(_), _)) => {}
+                            Either::Right(_) => break,
+                        }
+                    }
+                    None => break,
+                }
+            }
+            info!("{} task finished.", stringify!(task));
+        }));
+
+        if res.is_err() {
+            return Err(Error::Custom(format!(
+                "The executor could not spawn the {} task",
+                stringify!(task)
+            )));
+        }
+    };
+}
 #[derive(Debug, Copy, Clone)]
 enum MemberState {
     // the client is not part of a group
@@ -88,28 +136,36 @@ pub struct ConsumerCoordinator<Exe: Executor> {
     client: Kafka<Exe>,
     inner: Arc<Mutex<Inner<Exe>>>,
     options: Arc<ConsumerOptions>,
+    notify_shutdown: broadcast::Sender<()>,
 }
 
 impl<Exe: Executor> ConsumerCoordinator<Exe> {
     pub async fn new(
         client: Kafka<Exe>,
         options: Arc<ConsumerOptions>,
+        notify: broadcast::Sender<()>,
     ) -> Result<ConsumerCoordinator<Exe>> {
         let inner = Inner::new(client.clone(), options.clone()).await?;
         let inner = Arc::new(Mutex::new(inner));
+
         Ok(Self {
             inner,
             client,
             options,
+            notify_shutdown: notify,
         })
     }
 
-    pub async fn subscribe(&self, topic: TopicName) -> Result<()> {
-        self.inner.lock().await.subscribe(topic).await
+    pub async fn subscribe(&self, topics: Vec<TopicName>) -> Result<()> {
+        self.inner.lock().await.subscribe(topics).await
     }
 
     pub async fn subscriptions(&self) -> Arc<Mutex<SubscriptionState>> {
         self.inner.lock().await.subscriptions.clone()
+    }
+
+    pub async fn current_generation(&self) -> i32 {
+        self.inner.lock().await.group_meta.generation_id
     }
 
     pub async fn join_group(&self) -> Result<()> {
@@ -122,32 +178,6 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 
     pub async fn offset_fetch(&self) -> Result<()> {
         self.inner.lock().await.offset_fetch().await
-    }
-
-    async fn auto_commit(&self) -> Result<()> {
-        let mut auto_commit_interval = self.client.executor.interval(Duration::from_millis(
-            self.options.auto_commit_interval_ms as u64,
-        ));
-
-        let weak_inner = Arc::downgrade(&self.inner);
-
-        let res = self.client.executor.spawn(Box::pin(async move {
-            while auto_commit_interval.next().await.is_some() {
-                if let Some(strong_inner) = weak_inner.upgrade() {
-                    let _ = strong_inner.lock().await.offset_commit().await;
-                }
-            }
-        }));
-
-        if res.is_err() {
-            error!("the executor could not spawn the offset_commit task");
-            return Err(ConsumeError::Custom(
-                "the executor could not spawn the offset_commit task".to_string(),
-            )
-            .into());
-        }
-
-        Ok(())
     }
 
     pub async fn offset_commit(&mut self) -> Result<()> {
@@ -163,30 +193,13 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.offset_fetch().await?;
 
         if self.options.auto_commit_enabled {
-            self.auto_commit().await?;
+            // auto commit offset
+            let interval_ms = self.options.auto_commit_interval_ms;
+            coordinator_task!(self, interval_ms, offset_commit);
         }
-
-        let mut heartbeat_interval = self.client.executor.interval(Duration::from_millis(
-            self.options.rebalance_options.heartbeat_interval_ms as u64,
-        ));
-
-        let weak_inner = Arc::downgrade(&self.inner);
-
-        let res = self.client.executor.spawn(Box::pin(async move {
-            while heartbeat_interval.next().await.is_some() {
-                if let Some(strong_inner) = weak_inner.upgrade() {
-                    let _ = strong_inner.lock().await.heartbeat().await;
-                }
-            }
-        }));
-
-        if res.is_err() {
-            error!("the executor could not spawn the heartbeat task");
-            return Err(ConsumeError::Custom(
-                "the executor could not spawn the heartbeat task".to_string(),
-            )
-            .into());
-        }
+        // heartbeat
+        let interval_ms = self.options.rebalance_options.heartbeat_interval_ms;
+        coordinator_task!(self, interval_ms, heartbeat);
         Ok(())
     }
 }
@@ -194,7 +207,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 struct Inner<Exe: Executor> {
     client: Kafka<Exe>,
     node: Node,
-    group_meta: ConsumerGroupMetadata,
+    pub group_meta: ConsumerGroupMetadata,
     group_subscription: GroupSubscription,
     consumer_options: Arc<ConsumerOptions>,
     pub subscriptions: Arc<Mutex<SubscriptionState>>,
@@ -233,10 +246,14 @@ impl<Exe: Executor> Inner<Exe> {
         })
     }
 
-    pub async fn subscribe(&self, topic: TopicName) -> Result<()> {
-        self.subscriptions.lock().await.topics.insert(topic.clone());
+    pub async fn subscribe(&self, topics: Vec<TopicName>) -> Result<()> {
+        self.subscriptions
+            .lock()
+            .await
+            .topics
+            .extend(topics.clone());
         // TODO: remove it
-        self.client.topics_metadata(vec![topic]).await?;
+        self.client.update_metadata(topics).await?;
         Ok(())
     }
 
@@ -654,7 +671,7 @@ impl<Exe: Executor> Inner<Exe> {
                         return Err(Error::Custom(format!(
                             "Group leader {} has no partition assignor protocol",
                             self.group_meta.leader
-                        )))
+                        )));
                     }
                 }
             }
