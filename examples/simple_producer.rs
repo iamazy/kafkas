@@ -40,18 +40,16 @@ async fn main() -> Result<(), Box<Error>> {
 
     let now = Instant::now();
     let topic = topic_name("kafka");
-    {
-        let producer = Producer::new(kafka_client, ProducerOptions::default()).await?;
-        for i in 0..10 {
-            let record = TestData::new(&format!("hello - kafka {i}"));
-            let ret = producer.send(&topic, record).await?;
-            let _ = tx.send(ret).await;
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+    let producer = Producer::new(kafka_client, ProducerOptions::default()).await?;
+    for i in 0..10 {
+        let record = TestData::new(&format!("hello - kafka {i}"));
+        let ret = producer.send(&topic, record).await?;
+        let _ = tx.send(ret).await;
     }
     info!("elapsed: {:?}", now.elapsed());
-    tokio::time::sleep(Duration::from_secs(100000)).await;
-
+    // wait till all cached records send to kafka
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    drop(producer);
     Ok(())
 }
 
