@@ -100,7 +100,7 @@ macro_rules! coordinator_task {
 
                         match select(task, shutdown).await {
                             Either::Left((Err(err), _)) => {
-                                error!("{} failed, {}", stringify!(task), err);
+                                error!("{} failed, {}", stringify!($task), err);
                             }
                             Either::Left((Ok(_), _)) => {}
                             Either::Right(_) => break,

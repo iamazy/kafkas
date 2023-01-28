@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use futures::channel::mpsc::SendError;
+use futures::channel::mpsc::{SendError, TryRecvError};
 use kafka_protocol::{
     messages::{ApiKey, TopicName},
     protocol::{buf::NotEnoughBytesError, DecodeError, EncodeError},
@@ -92,6 +92,11 @@ impl From<DecodeError> for Error {
     }
 }
 
+impl From<TryRecvError> for Error {
+    fn from(value: TryRecvError) -> Self {
+        Error::Custom(value.to_string())
+    }
+}
 impl From<SendError> for Error {
     fn from(value: SendError) -> Self {
         Error::Custom(value.to_string())
