@@ -29,7 +29,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     client::Kafka,
-    consumer::fetcher::{CompletedFetch, Fetch, Fetcher},
+    consumer::fetcher::{CompletedFetch, Fetcher},
     coordinator::ConsumerCoordinator,
     executor::{Executor, Interval},
     metadata::TopicPartition,
@@ -669,12 +669,10 @@ impl<Exe: Executor> Consumer<Exe> {
                 "The executor could not spawn the fetch task".to_string(),
             )),
             Ok(_) => Ok(fetch_stream(
-                self.client.clone(),
                 self.options.clone(),
                 self.fetches_rx.take().unwrap(),
                 self.coordinator.subscriptions().await,
                 self.fetcher.completed_partitions.clone(),
-                self.options.fetch_max_wait_ms as u64,
                 self.notify_shutdown.subscribe(),
             )),
         }
@@ -709,197 +707,177 @@ async fn do_fetch<Exe: Executor>(
     info!("Fetch task finished.");
 }
 
-fn fetch_stream<Exe: Executor>(
-    client: Kafka<Exe>,
+fn fetch_stream(
     options: Arc<ConsumerOptions>,
-    completed_fetches_rx: mpsc::UnboundedReceiver<CompletedFetch>,
+    mut completed_fetches_rx: mpsc::UnboundedReceiver<CompletedFetch>,
     subscription: Arc<Mutex<SubscriptionState>>,
     completed_partitions: Arc<DashSet<TopicPartition>>,
-    fetch_wait_ms: u64,
     mut rx: broadcast::Receiver<()>,
 ) -> impl Stream<Item = Result<Record>> {
-    let mut completed_fetches_rx = completed_fetches_rx;
     try_stream! {
-        loop {
-            let collect_fetch = collect_fetch(&options, &mut completed_fetches_rx, &subscription, &completed_partitions);
-            let shutdown = rx.recv();
-
-            pin_mut!(collect_fetch);
-            pin_mut!(shutdown);
-
-            match select(collect_fetch, shutdown).await {
-                Either::Left((Ok(fetch), _)) => {
-                    if fetch.num_records == 0 {
-                        client.executor.delay(Duration::from_millis(fetch_wait_ms)).await;
-                    }
-                    for (_tp, records) in fetch.records {
-                        for record in records {
-                            yield record;
-                        }
-                    }
-                }
-                Either::Left((Err(err), _)) => error!("Fetch error: {}", err),
-                Either::Right(_) => {
-                    info!("Fetch task is shutting down");
-                    break
-                },
-            }
-        }
-    }
-}
-
-pub async fn collect_fetch(
-    options: &Arc<ConsumerOptions>,
-    completed_fetches_rx: &mut mpsc::UnboundedReceiver<CompletedFetch>,
-    subscription: &Arc<Mutex<SubscriptionState>>,
-    completed_partitions: &Arc<DashSet<TopicPartition>>,
-) -> Result<Fetch> {
-    let mut fetch = Fetch::default();
-    let mut records_remaining = options.max_poll_records;
-    let mut need_reset_offset = false;
-    while records_remaining > 0 {
-        if let Some(mut completed_fetch) = completed_fetches_rx.next().await {
-            let partition = &mut completed_fetch.partition_data;
+        while let Some(completed_fetch) = completed_fetches_rx.next().await {
             if let Some(partition_state) = subscription
                 .lock()
                 .await
                 .assignments
                 .get_mut(&completed_fetch.partition)
             {
-                match partition.error_code.err() {
-                    Some(
-                        error @ ResponseError::NotLeaderOrFollower
-                        | error @ ResponseError::ReplicaNotAvailable
-                        | error @ ResponseError::KafkaStorageError
-                        | error @ ResponseError::FencedLeaderEpoch
-                        | error @ ResponseError::OffsetNotAvailable,
-                    ) => {
-                        debug!("Error in fetch for {}: {error}", completed_fetch.partition);
-                        // TODO: update metadata
-                    }
-                    Some(ResponseError::UnknownTopicOrPartition) => {
-                        warn!(
-                            "Received unknown topic or partition error in fetch for {}",
-                            completed_fetch.partition
-                        );
-                        // TODO: update metadata
-                    }
-                    Some(ResponseError::UnknownTopicId) => {
-                        warn!(
-                            "Received unknown topic ID error in fetch for {}",
-                            completed_fetch.partition
-                        );
-                        // TODO: update metadata
-                    }
-                    Some(ResponseError::InconsistentTopicId) => {
-                        warn!(
-                            "Received inconsistent topic ID error in fetch for {}",
-                            completed_fetch.partition
-                        );
-                        // TODO: update metadata
-                    }
-                    Some(error @ ResponseError::OffsetOutOfRange) => {
-                        let error_msg = format!(
-                            "Fetch position {} is out of range for {}",
-                            partition_state.position.offset, completed_fetch.partition
-                        );
-                        let strategy = options.auto_offset_reset;
-                        if !matches!(strategy, OffsetResetStrategy::None) {
-                            info!("{error_msg}, resetting offset");
-                            partition_state.reset(strategy)?;
-                            need_reset_offset = true;
-                            completed_partitions.remove(&completed_fetch.partition);
-                            break;
-                        } else {
-                            info!(
-                                "{error_msg}, raising error to the application since no reset \
-                                 policy is configured."
-                            );
-                            return Err(error.into());
+                let records_fut = handle_partition_response(
+                    completed_fetch,
+                    &options,
+                    partition_state,
+                    &completed_partitions,
+                );
+                let shutdown = rx.recv();
+
+                pin_mut!(records_fut);
+                pin_mut!(shutdown);
+
+                match select(records_fut, shutdown).await {
+                    Either::Left((Ok(Some(records)), _)) => {
+                        for record in records {
+                            yield record;
                         }
                     }
-                    Some(error @ ResponseError::TopicAuthorizationFailed) => {
-                        warn!("Not authorized to read from {}", completed_fetch.partition);
-                        return Err(error.into());
-                    }
-                    Some(ResponseError::UnknownLeaderEpoch) => {
-                        debug!(
-                            "Received unknown leader epoch error in fetch for {}",
-                            completed_fetch.partition
-                        );
-                    }
-                    Some(ResponseError::UnknownServerError) => {
-                        warn!(
-                            "Unknown server error while fetching offset for {}",
-                            completed_fetch.partition
-                        );
-                    }
-                    Some(error @ ResponseError::CorruptMessage) => {
-                        error!(
-                            "Encountered corrupt message when fetching offset for {}",
-                            completed_fetch.partition
-                        );
-                        return Err(error.into());
-                    }
-                    None => {
-                        if partition.last_stable_offset >= 0 {
-                            partition_state.last_stable_offset = partition.last_stable_offset;
-                        }
-                        if partition.log_start_offset >= 0 {
-                            partition_state.log_start_offset = partition.log_start_offset;
-                        }
-                        if partition.high_watermark >= 0 {
-                            partition_state.high_water_mark = partition.high_watermark;
-                        }
-                        debug!(
-                            "Fetch {} success, last stable offset: {}, log start offset: {}, \
-                             high_water_mark: {}",
-                            completed_fetch.partition,
-                            partition.last_stable_offset,
-                            partition.log_start_offset,
-                            partition.high_watermark
-                        );
-                        // decode record batch
-                        if let Some(ref mut records) = partition.records {
-                            let records = RecordBatchDecoder::decode(records)?;
-                            if let Some(record) = records.last() {
-                                if record.offset <= partition_state.position.offset {
-                                    return Err(Error::Custom(format!(
-                                        "Invalid record offset: {}, expect greater than {}",
-                                        record.offset, partition_state.position.offset
-                                    )));
-                                }
-                                partition_state.position.offset = record.offset;
-                                partition_state.position.current_leader.epoch =
-                                    Some(record.partition_leader_epoch);
-                            }
-                            debug!(
-                                "Fetch {} records success, records size: {}",
-                                completed_fetch.partition,
-                                records.len()
-                            );
-                            records_remaining -= records.len() as i32;
-                            fetch
-                                .records
-                                .insert(completed_fetch.partition.clone(), records);
-                        }
-                        completed_partitions.remove(&completed_fetch.partition);
-                    }
-                    Some(error) => {
-                        error!(
-                            "Unexpected error code {error} while fetching offset from {}",
-                            completed_fetch.partition
-                        )
-                    }
+                    Either::Left((Ok(None), _)) => {},
+                    Either::Left((Err(err), _)) => error!("Fetch error: {}", err),
+                    Either::Right(_) => {
+                        info!("Fetch task is shutting down");
+                        break
+                    },
                 }
             }
-        } else {
-            break;
         }
     }
-    if need_reset_offset {
-        // self.reset_offset().await?;
+}
+
+async fn handle_partition_response(
+    completed_fetch: CompletedFetch,
+    options: &Arc<ConsumerOptions>,
+    partition_state: &mut TopicPartitionState,
+    completed_partitions: &Arc<DashSet<TopicPartition>>,
+) -> Result<Option<Vec<Record>>> {
+    let mut partition = completed_fetch.partition_data;
+    match partition.error_code.err() {
+        Some(
+            error @ ResponseError::NotLeaderOrFollower
+            | error @ ResponseError::ReplicaNotAvailable
+            | error @ ResponseError::KafkaStorageError
+            | error @ ResponseError::FencedLeaderEpoch
+            | error @ ResponseError::OffsetNotAvailable,
+        ) => {
+            debug!("Error in fetch for {}: {error}", completed_fetch.partition);
+            // TODO: update metadata
+        }
+        Some(ResponseError::UnknownTopicOrPartition) => {
+            warn!(
+                "Received unknown topic or partition error in fetch for {}",
+                completed_fetch.partition
+            );
+            // TODO: update metadata
+        }
+        Some(ResponseError::UnknownTopicId) => {
+            warn!(
+                "Received unknown topic ID error in fetch for {}",
+                completed_fetch.partition
+            );
+            // TODO: update metadata
+        }
+        Some(ResponseError::InconsistentTopicId) => {
+            warn!(
+                "Received inconsistent topic ID error in fetch for {}",
+                completed_fetch.partition
+            );
+            // TODO: update metadata
+        }
+        Some(error @ ResponseError::OffsetOutOfRange) => {
+            let error_msg = format!(
+                "Fetch position {} is out of range for {}",
+                partition_state.position.offset, completed_fetch.partition
+            );
+            let strategy = options.auto_offset_reset;
+            if !matches!(strategy, OffsetResetStrategy::None) {
+                info!("{error_msg}, resetting offset");
+                partition_state.reset(strategy)?;
+                completed_partitions.remove(&completed_fetch.partition);
+            } else {
+                info!(
+                    "{error_msg}, raising error to the application since no reset policy is \
+                     configured."
+                );
+                return Err(error.into());
+            }
+        }
+        Some(error @ ResponseError::TopicAuthorizationFailed) => {
+            warn!("Not authorized to read from {}", completed_fetch.partition);
+            return Err(error.into());
+        }
+        Some(ResponseError::UnknownLeaderEpoch) => {
+            debug!(
+                "Received unknown leader epoch error in fetch for {}",
+                completed_fetch.partition
+            );
+        }
+        Some(ResponseError::UnknownServerError) => {
+            warn!(
+                "Unknown server error while fetching offset for {}",
+                completed_fetch.partition
+            );
+        }
+        Some(error @ ResponseError::CorruptMessage) => {
+            error!(
+                "Encountered corrupt message when fetching offset for {}",
+                completed_fetch.partition
+            );
+            return Err(error.into());
+        }
+        None => {
+            if partition.last_stable_offset >= 0 {
+                partition_state.last_stable_offset = partition.last_stable_offset;
+            }
+            if partition.log_start_offset >= 0 {
+                partition_state.log_start_offset = partition.log_start_offset;
+            }
+            if partition.high_watermark >= 0 {
+                partition_state.high_water_mark = partition.high_watermark;
+            }
+            debug!(
+                "Fetch {} success, last stable offset: {}, log start offset: {}, high_water_mark: \
+                 {}",
+                completed_fetch.partition,
+                partition.last_stable_offset,
+                partition.log_start_offset,
+                partition.high_watermark
+            );
+            // decode record batch
+            if let Some(ref mut records) = partition.records {
+                let records = RecordBatchDecoder::decode(records)?;
+                if let Some(record) = records.last() {
+                    if record.offset <= partition_state.position.offset {
+                        return Err(Error::Custom(format!(
+                            "Invalid record offset: {}, expect greater than {}",
+                            record.offset, partition_state.position.offset
+                        )));
+                    }
+                    partition_state.position.offset = record.offset;
+                    partition_state.position.current_leader.epoch =
+                        Some(record.partition_leader_epoch);
+                }
+                debug!(
+                    "Fetch {} records success, records size: {}",
+                    completed_fetch.partition,
+                    records.len()
+                );
+                completed_partitions.remove(&completed_fetch.partition);
+                return Ok(Some(records));
+            }
+        }
+        Some(error) => {
+            error!(
+                "Unexpected error code {error} while fetching offset from {}",
+                completed_fetch.partition
+            )
+        }
     }
-    fetch.num_records = options.max_poll_records - records_remaining;
-    Ok(fetch)
+    Ok(None)
 }

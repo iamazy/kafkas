@@ -19,7 +19,7 @@ use kafka_protocol::{
     records::{Record, NO_PARTITION_LEADER_EPOCH},
     ResponseError,
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::{
     client::Kafka,
@@ -44,7 +44,6 @@ pub struct Fetcher<Exe: Executor> {
     options: Arc<ConsumerOptions>,
     subscription: Arc<Mutex<SubscriptionState>>,
     sessions: Arc<DashMap<NodeId, FetchSession>>,
-    completed_fetches: Arc<Mutex<Vec<CompletedFetch>>>,
     completed_fetches_tx: mpsc::UnboundedSender<CompletedFetch>,
     pub completed_partitions: Arc<DashSet<TopicPartition>>,
     nodes_with_pending_fetch_requests: HashSet<i32>,
@@ -68,7 +67,6 @@ impl<Exe: Executor> Fetcher<Exe> {
             timestamp,
             subscription,
             sessions: Arc::new(sessions),
-            completed_fetches: Arc::new(Mutex::new(Vec::new())),
             completed_fetches_tx,
             completed_partitions: Arc::new(DashSet::with_capacity(100)),
             options,
@@ -130,7 +128,6 @@ impl<Exe: Executor> Fetcher<Exe> {
                                                 self.options.isolation_level, data.fetch_offset
                                             );
                                             self.completed_partitions.insert(tp.clone());
-                                            info!("{}", tp);
                                             if let Err(err) = self
                                                 .completed_fetches_tx
                                                 .unbounded_send(CompletedFetch {
@@ -144,16 +141,6 @@ impl<Exe: Executor> Fetcher<Exe> {
                                             {
                                                 error!("send error: {}", err);
                                             }
-                                            // self.completed_fetches.lock().await.push(
-                                            //     CompletedFetch {
-                                            //         partition: tp,
-                                            //         partition_data: partition,
-                                            //         next_fetch_offset: data.fetch_offset,
-                                            //         last_epoch: None,
-                                            //         is_consumed: false,
-                                            //         initialized: false,
-                                            //     },
-                                            // );
                                         }
                                         None => {
                                             if metadata.is_full() {
