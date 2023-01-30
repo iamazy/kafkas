@@ -645,7 +645,7 @@ impl<Exe: Executor> Consumer<Exe> {
     pub async fn subscribe<S: AsRef<str>>(
         &mut self,
         topics: Vec<S>,
-    ) -> Result<impl Stream<Item = Result<Record>> + '_> {
+    ) -> Result<impl Stream<Item = Result<Record>>> {
         self.coordinator
             .subscribe(
                 topics
