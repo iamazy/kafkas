@@ -529,13 +529,6 @@ pub struct FetchPosition {
 }
 
 impl FetchPosition {
-    pub fn new(offset: i64, epoch: Option<i32>) -> Self {
-        Self {
-            offset,
-            offset_epoch: epoch,
-            ..Default::default()
-        }
-    }
 
     pub fn clear(&mut self) {
         self.offset = i64::MIN;

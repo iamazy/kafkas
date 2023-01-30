@@ -116,6 +116,8 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 info!("{error_msg}, resetting offset");
                                 partition_state.reset(strategy)?;
                                 need_reset_offset = true;
+                                fetches_lock.pop();
+                                break;
                             } else {
                                 info!(
                                     "{error_msg}, raising error to the application since no reset \
