@@ -16,7 +16,7 @@ use kafka_protocol::{
         list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
         ApiKey, BrokerId, FetchRequest, ListOffsetsRequest, ListOffsetsResponse, TopicName,
     },
-    records::{Record, NO_PARTITION_LEADER_EPOCH},
+    records::NO_PARTITION_LEADER_EPOCH,
     ResponseError,
 };
 use tracing::{debug, error, trace, warn};
@@ -742,11 +742,4 @@ struct ListOffsetData {
     // None if the broker does not support returning timestamps
     timestamp: Option<i64>,
     leader_epoch: Option<i32>,
-}
-
-#[derive(Default)]
-pub struct Fetch {
-    pub(crate) records: HashMap<TopicPartition, Vec<Record>>,
-    position_advanced: bool,
-    pub(crate) num_records: i32,
 }
