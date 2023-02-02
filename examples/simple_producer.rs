@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<Error>> {
     let now = Instant::now();
     let topic = topic_name("kafka");
     let producer = Producer::new(kafka_client, ProducerOptions::default()).await?;
-    for i in 0..10 {
+    for i in 0..10000_0000 {
         let record = TestData::new(&format!("hello - kafka {i}"));
         let ret = producer.send(&topic, record).await?;
         let _ = tx.send(ret).await;

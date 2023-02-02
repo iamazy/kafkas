@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use async_lock::RwLock;
 use futures::{
     future::{select, Either},
     lock::Mutex,
@@ -56,7 +57,7 @@ macro_rules! offset_fetch_block {
                 let tp = TopicPartition::new(topic.name.clone(), partition.partition_index);
                 if partition.error_code.is_ok() {
                     if let Some(partition_state) =
-                        $self.subscriptions.lock().await.assignments.get_mut(&tp)
+                        $self.subscriptions.write().await.assignments.get_mut(&tp)
                     {
                         partition_state.position.offset = partition.committed_offset;
                         partition_state.position.offset_epoch =
@@ -160,7 +161,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.inner.lock().await.subscribe(topics).await
     }
 
-    pub async fn subscriptions(&self) -> Arc<Mutex<SubscriptionState>> {
+    pub async fn subscriptions(&self) -> Arc<RwLock<SubscriptionState>> {
         self.inner.lock().await.subscriptions.clone()
     }
 
@@ -210,7 +211,7 @@ struct Inner<Exe: Executor> {
     pub group_meta: ConsumerGroupMetadata,
     group_subscription: GroupSubscription,
     consumer_options: Arc<ConsumerOptions>,
-    pub subscriptions: Arc<Mutex<SubscriptionState>>,
+    pub subscriptions: Arc<RwLock<SubscriptionState>>,
     assignors: Vec<PartitionAssignor>,
     state: MemberState,
 }
@@ -237,7 +238,7 @@ impl<Exe: Executor> Inner<Exe> {
         Ok(Self {
             client,
             node,
-            subscriptions: Arc::new(Mutex::new(SubscriptionState::default())),
+            subscriptions: Arc::new(RwLock::new(SubscriptionState::default())),
             group_meta: ConsumerGroupMetadata::new(group_id.into()),
             group_subscription: GroupSubscription::default(),
             consumer_options: options,
@@ -248,7 +249,7 @@ impl<Exe: Executor> Inner<Exe> {
 
     pub async fn subscribe(&self, topics: Vec<TopicName>) -> Result<()> {
         self.subscriptions
-            .lock()
+            .write()
             .await
             .topics
             .extend(topics.clone());
@@ -406,7 +407,7 @@ impl<Exe: Executor> Inner<Exe> {
                     }
                     let assignment =
                         Assignment::deserialize_from_bytes(&mut sync_group_response.assignment)?;
-                    self.subscriptions.lock().await.assignments.clear();
+                    self.subscriptions.write().await.assignments.clear();
                     for (topic, partitions) in assignment.partitions {
                         for partition in partitions.iter() {
                             let tp = TopicPartition::new(topic.clone(), *partition);
@@ -414,7 +415,7 @@ impl<Exe: Executor> Inner<Exe> {
                             tp_state.position.current_leader =
                                 self.client.cluster_meta.current_leader(&tp);
                             self.subscriptions
-                                .lock()
+                                .write()
                                 .await
                                 .assignments
                                 .insert(tp, tp_state);
@@ -567,7 +568,7 @@ impl<Exe: Executor> Inner<Exe> {
     async fn join_group_protocol(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
         let topics = self
             .subscriptions
-            .lock()
+            .read()
             .await
             .topics
             .iter()
@@ -578,7 +579,7 @@ impl<Exe: Executor> Inner<Exe> {
             let subscription = Subscription::new(
                 topics.clone(),
                 assignor.subscription_user_data(&topics)?,
-                self.subscriptions.lock().await.partitions(),
+                self.subscriptions.read().await.partitions(),
             );
             let metadata = subscription.serialize_to_bytes()?;
             protocols.insert(
@@ -691,8 +692,8 @@ impl<Exe: Executor> Inner<Exe> {
     pub async fn offset_fetch_builder(&self, version: i16) -> Result<OffsetFetchRequest> {
         let mut request = OffsetFetchRequest::default();
         if version <= 7 {
-            let mut topics = Vec::with_capacity(self.subscriptions.lock().await.topics.len());
-            for assign in self.subscriptions.lock().await.topics.iter() {
+            let mut topics = Vec::with_capacity(self.subscriptions.read().await.topics.len());
+            for assign in self.subscriptions.read().await.topics.iter() {
                 let partitions = self.client.cluster_meta.partitions(assign)?;
                 let topic = OffsetFetchRequestTopic {
                     name: assign.clone(),
@@ -704,8 +705,8 @@ impl<Exe: Executor> Inner<Exe> {
             request.group_id = self.group_meta.group_id.clone();
             request.topics = Some(topics);
         } else {
-            let mut topics = Vec::with_capacity(self.subscriptions.lock().await.topics.len());
-            for assign in self.subscriptions.lock().await.topics.iter() {
+            let mut topics = Vec::with_capacity(self.subscriptions.read().await.topics.len());
+            for assign in self.subscriptions.read().await.topics.iter() {
                 let partitions = self.client.cluster_meta.partitions(assign)?;
                 let topic = OffsetFetchRequestTopics {
                     name: assign.clone(),
@@ -732,8 +733,8 @@ impl<Exe: Executor> Inner<Exe> {
             request.group_id = self.group_meta.group_id.clone();
 
             let mut topics: HashMap<TopicName, Vec<OffsetCommitRequestPartition>> =
-                HashMap::with_capacity(self.subscriptions.lock().await.topics.len());
-            let all_consumed = self.subscriptions.lock().await.all_consumed();
+                HashMap::with_capacity(self.subscriptions.read().await.topics.len());
+            let all_consumed = self.subscriptions.read().await.all_consumed();
             for (tp, meta) in all_consumed.iter() {
                 let partition = OffsetCommitRequestPartition {
                     partition_index: tp.partition,

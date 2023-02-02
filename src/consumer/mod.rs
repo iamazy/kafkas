@@ -8,13 +8,13 @@ use std::{
     time::Duration,
 };
 
+use async_lock::RwLock;
 use async_stream::try_stream;
 use chrono::Local;
 use dashmap::DashSet;
 use futures::{
     channel::mpsc,
     future::{select, Either},
-    lock::Mutex,
     pin_mut, Stream, StreamExt,
 };
 use kafka_protocol::{
@@ -710,14 +710,14 @@ async fn do_fetch<Exe: Executor>(
 fn fetch_stream(
     options: Arc<ConsumerOptions>,
     mut completed_fetches_rx: mpsc::UnboundedReceiver<CompletedFetch>,
-    subscription: Arc<Mutex<SubscriptionState>>,
+    subscription: Arc<RwLock<SubscriptionState>>,
     completed_partitions: Arc<DashSet<TopicPartition>>,
     mut rx: broadcast::Receiver<()>,
 ) -> impl Stream<Item = Result<Record>> {
     try_stream! {
         while let Some(completed_fetch) = completed_fetches_rx.next().await {
             if let Some(partition_state) = subscription
-                .lock()
+                .write()
                 .await
                 .assignments
                 .get_mut(&completed_fetch.partition)

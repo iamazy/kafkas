@@ -6,8 +6,9 @@ use std::{
     vec::Drain,
 };
 
+use async_lock::RwLock;
 use dashmap::{DashMap, DashSet};
-use futures::{channel::mpsc, lock::Mutex};
+use futures::channel::mpsc;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
@@ -42,7 +43,7 @@ pub struct Fetcher<Exe: Executor> {
     client: Kafka<Exe>,
     timestamp: i64,
     options: Arc<ConsumerOptions>,
-    subscription: Arc<Mutex<SubscriptionState>>,
+    subscription: Arc<RwLock<SubscriptionState>>,
     sessions: Arc<DashMap<NodeId, FetchSession>>,
     completed_fetches_tx: mpsc::UnboundedSender<CompletedFetch>,
     pub completed_partitions: Arc<DashSet<TopicPartition>>,
@@ -53,7 +54,7 @@ impl<Exe: Executor> Fetcher<Exe> {
     pub fn new(
         client: Kafka<Exe>,
         timestamp: i64,
-        subscription: Arc<Mutex<SubscriptionState>>,
+        subscription: Arc<RwLock<SubscriptionState>>,
         options: Arc<ConsumerOptions>,
         completed_fetches_tx: mpsc::UnboundedSender<CompletedFetch>,
     ) -> Self {
@@ -194,20 +195,23 @@ impl<Exe: Executor> Fetcher<Exe> {
             exclude.insert(fetch.key().clone());
         }
         self.subscription
-            .lock()
+            .read()
             .await
             .fetchable_partitions(|tp| !exclude.contains(tp))
     }
 
     async fn validate_position_on_metadata_change(&self) {
-        let mut lock = self.subscription.lock().await;
-        let mut tp_list = Vec::with_capacity(lock.assignments.len());
-        for (tp, _) in lock.assignments.iter() {
+        let mut tp_list = Vec::with_capacity(self.subscription.read().await.assignments.len());
+        for (tp, _) in self.subscription.read().await.assignments.iter() {
             tp_list.push(tp.clone());
         }
         for tp in tp_list {
             let current_leader = self.client.cluster_meta.current_leader(&tp);
-            let _ = lock.maybe_validate_position_for_current_leader(&tp, current_leader);
+            let _ = self
+                .subscription
+                .write()
+                .await
+                .maybe_validate_position_for_current_leader(&tp, current_leader);
         }
     }
 
@@ -218,7 +222,7 @@ impl<Exe: Executor> Fetcher<Exe> {
 
         let fetchable_partitions = self.fetchable_partitions().await;
         for tp in fetchable_partitions.iter() {
-            if let Some(position) = self.subscription.lock().await.position(tp) {
+            if let Some(position) = self.subscription.read().await.position(tp) {
                 if let Some(node) = position.current_leader.leader {
                     if self.nodes_with_pending_fetch_requests.contains(&node) {
                         trace!(
@@ -283,7 +287,7 @@ impl<Exe: Executor> Fetcher<Exe> {
             let version = version_range.max;
             let partitions = self
                 .subscription
-                .lock()
+                .read()
                 .await
                 .partitions_need_reset(self.timestamp);
             if partitions.is_empty() {
@@ -292,7 +296,7 @@ impl<Exe: Executor> Fetcher<Exe> {
 
             let mut offset_reset_timestamps = HashMap::new();
             for partition in partitions {
-                if let Some(tp_state) = self.subscription.lock().await.assignments.get(&partition) {
+                if let Some(tp_state) = self.subscription.read().await.assignments.get(&partition) {
                     let timestamp = tp_state.offset_strategy.strategy_timestamp();
                     if timestamp != 0 {
                         offset_reset_timestamps.insert(partition, timestamp);
@@ -307,7 +311,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                 let response = self.client.list_offsets(&node, request).await?;
                 let list_offset_result = self.handle_list_offsets_response(response)?;
                 if !list_offset_result.partitions_to_retry.is_empty() {
-                    self.subscription.lock().await.request_failed(
+                    self.subscription.write().await.request_failed(
                         list_offset_result.partitions_to_retry,
                         self.timestamp + self.options.retry_backoff_ms,
                     );
@@ -345,7 +349,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         };
         // TODO: metadata update last seen epoch if newer
         self.subscription
-            .lock()
+            .write()
             .await
             .maybe_seek_unvalidated(partition, position, offset_strategy)
     }
@@ -501,7 +505,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                     }
                 }
 
-                self.subscription.lock().await.set_next_allowed_retry(
+                self.subscription.write().await.set_next_allowed_retry(
                     topics.keys(),
                     self.timestamp + self.options.request_timeout_ms as i64,
                 );
@@ -515,7 +519,7 @@ impl<Exe: Executor> Fetcher<Exe> {
     async fn offset_reset_strategy_timestamp(&self, partition: &TopicPartition) -> Option<i64> {
         let reset_strategy = self
             .subscription
-            .lock()
+            .read()
             .await
             .assignments
             .get(partition)
