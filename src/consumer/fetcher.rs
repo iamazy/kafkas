@@ -40,7 +40,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct Fetcher<Exe: Executor> {
-    client: Kafka<Exe>,
+    pub client: Kafka<Exe>,
     timestamp: i64,
     options: Arc<ConsumerOptions>,
     subscription: Arc<RwLock<SubscriptionState>>,
@@ -282,7 +282,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         Ok(requests)
     }
 
-    async fn reset_offset(&mut self) -> Result<()> {
+    pub(crate) async fn reset_offset(&mut self) -> Result<()> {
         if let Some(version_range) = self.client.version_range(ApiKey::ListOffsetsKey) {
             let version = version_range.max;
             let partitions = self

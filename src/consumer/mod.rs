@@ -9,13 +9,13 @@ use std::{
 };
 
 use async_lock::RwLock;
-use async_stream::try_stream;
+use async_stream::stream;
 use chrono::Local;
 use dashmap::DashSet;
 use futures::{
     channel::mpsc,
     future::{select, Either},
-    pin_mut, Stream, StreamExt,
+    pin_mut, SinkExt, Stream, StreamExt,
 };
 use kafka_protocol::{
     error::ParseResponseErrorCode,
@@ -31,7 +31,7 @@ use crate::{
     client::Kafka,
     consumer::fetcher::{CompletedFetch, Fetcher},
     coordinator::ConsumerCoordinator,
-    executor::{Executor, Interval},
+    executor::Executor,
     metadata::TopicPartition,
     Error, NodeId, PartitionId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
 };
@@ -645,7 +645,7 @@ impl<Exe: Executor> Consumer<Exe> {
     pub async fn subscribe<S: AsRef<str>>(
         &mut self,
         topics: Vec<S>,
-    ) -> Result<impl Stream<Item = Result<Record>>> {
+    ) -> Result<impl Stream<Item = Record>> {
         self.coordinator
             .subscribe(
                 topics
@@ -656,26 +656,28 @@ impl<Exe: Executor> Consumer<Exe> {
             .await?;
         self.coordinator.prepare_fetch().await?;
 
-        let fetch_interval = self.client.executor.interval(Duration::from_millis(100));
-
-        let spawn_ret = self.client.executor.spawn(Box::pin(do_fetch(
+        // fetch records task
+        self.client.executor.spawn(Box::pin(do_fetch(
             self.fetcher.clone(),
-            fetch_interval,
             self.notify_shutdown.subscribe(),
-        )));
+        )))?;
 
-        match spawn_ret {
-            Err(_) => Err(Error::Custom(
-                "The executor could not spawn the fetch task".to_string(),
-            )),
-            Ok(_) => Ok(fetch_stream(
-                self.options.clone(),
-                self.fetches_rx.take().unwrap(),
-                self.coordinator.subscriptions().await,
-                self.fetcher.completed_partitions.clone(),
-                self.notify_shutdown.subscribe(),
-            )),
-        }
+        // reset offset task
+        let (reset_offset_tx, reset_offset_rx) = mpsc::unbounded();
+        self.client.executor.spawn(Box::pin(reset_offset(
+            self.fetcher.clone(),
+            reset_offset_rx,
+            self.notify_shutdown.subscribe(),
+        )))?;
+
+        Ok(fetch_stream(
+            self.options.clone(),
+            self.fetches_rx.take().unwrap(),
+            self.coordinator.subscriptions().await,
+            self.fetcher.completed_partitions.clone(),
+            reset_offset_tx,
+            self.notify_shutdown.subscribe(),
+        ))
     }
 }
 
@@ -685,11 +687,8 @@ impl<Exe: Executor> Drop for Consumer<Exe> {
     }
 }
 
-async fn do_fetch<Exe: Executor>(
-    mut fetcher: Fetcher<Exe>,
-    mut interval: Interval,
-    mut rx: broadcast::Receiver<()>,
-) {
+async fn do_fetch<Exe: Executor>(mut fetcher: Fetcher<Exe>, mut rx: broadcast::Receiver<()>) {
+    let mut interval = fetcher.client.executor.interval(Duration::from_millis(100));
     while interval.next().await.is_some() {
         let fetcher_fut = fetcher.fetch();
         let shutdown = rx.recv();
@@ -712,9 +711,10 @@ fn fetch_stream(
     mut completed_fetches_rx: mpsc::UnboundedReceiver<CompletedFetch>,
     subscription: Arc<RwLock<SubscriptionState>>,
     completed_partitions: Arc<DashSet<TopicPartition>>,
-    mut rx: broadcast::Receiver<()>,
-) -> impl Stream<Item = Result<Record>> {
-    try_stream! {
+    mut reset_offset_tx: mpsc::UnboundedSender<()>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) -> impl Stream<Item = Record> {
+    stream! {
         while let Some(completed_fetch) = completed_fetches_rx.next().await {
             if let Some(partition_state) = subscription
                 .write()
@@ -723,12 +723,13 @@ fn fetch_stream(
                 .get_mut(&completed_fetch.partition)
             {
                 let records_fut = handle_partition_response(
+                    &mut reset_offset_tx,
                     completed_fetch,
                     &options,
                     partition_state,
                     &completed_partitions,
                 );
-                let shutdown = rx.recv();
+                let shutdown = shutdown_rx.recv();
 
                 pin_mut!(records_fut);
                 pin_mut!(shutdown);
@@ -752,6 +753,7 @@ fn fetch_stream(
 }
 
 async fn handle_partition_response(
+    reset_offset_tx: &mut mpsc::UnboundedSender<()>,
     completed_fetch: CompletedFetch,
     options: &Arc<ConsumerOptions>,
     partition_state: &mut TopicPartitionState,
@@ -799,6 +801,7 @@ async fn handle_partition_response(
             if !matches!(strategy, OffsetResetStrategy::None) {
                 info!("{error_msg}, resetting offset");
                 partition_state.reset(strategy)?;
+                let _ = reset_offset_tx.send(()).await;
                 completed_partitions.remove(&completed_fetch.partition);
             } else {
                 info!(
@@ -880,4 +883,30 @@ async fn handle_partition_response(
         }
     }
     Ok(None)
+}
+
+async fn reset_offset<Exe: Executor>(
+    mut fetcher: Fetcher<Exe>,
+    mut reset_offset_rx: mpsc::UnboundedReceiver<()>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    debug!("Start the reset offset task");
+    while reset_offset_rx.next().await.is_some() {
+        let reset_fut = fetcher.reset_offset();
+        let shutdown = shutdown_rx.recv();
+
+        pin_mut!(reset_fut);
+        pin_mut!(shutdown);
+
+        match select(reset_fut, shutdown).await {
+            Either::Left((Err(err), _)) => {
+                error!("Reset offset failed, {}", err);
+            }
+            Either::Left(_) => {}
+            Either::Right(_) => {
+                info!("Reset offset task is shutting down");
+                break;
+            }
+        }
+    }
 }

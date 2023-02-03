@@ -16,7 +16,6 @@ use kafka_protocol::{
     protocol::VersionRange,
     records::Record,
 };
-use tracing::error;
 use uuid::Uuid;
 
 use crate::{
@@ -110,7 +109,7 @@ impl<Exe: Executor> Kafka<Exe> {
 
         let weak_manager = Arc::downgrade(&manager);
         let mut interval = executor.interval(std::time::Duration::from_secs(60));
-        let res = executor.spawn(Box::pin(async move {
+        executor.spawn(Box::pin(async move {
             while let Some(()) = interval.next().await {
                 if let Some(strong_manager) = weak_manager.upgrade() {
                     strong_manager.check_connections().await;
@@ -120,12 +119,7 @@ impl<Exe: Executor> Kafka<Exe> {
                     break;
                 }
             }
-        }));
-
-        if res.is_err() {
-            error!("the executor could not spawn the check connection task");
-            return Err(ConnectionError::Shutdown.into());
-        }
+        }))?;
 
         Ok(Kafka {
             manager,

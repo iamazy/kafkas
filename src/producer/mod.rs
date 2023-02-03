@@ -219,7 +219,7 @@ impl<Exe: Executor> Producer<Exe> {
             .executor
             .interval(producer.options.linger_ms);
 
-        let spawn_produce = producer.client.executor.spawn(Box::pin(async move {
+        producer.client.executor.spawn(Box::pin(async move {
             while interval.next().await.is_some() {
                 match weak_producer.upgrade() {
                     Some(strong_producer) => {
@@ -236,13 +236,7 @@ impl<Exe: Executor> Producer<Exe> {
                     }
                 }
             }
-        }));
-
-        if spawn_produce.is_err() {
-            return Err(Error::Custom(
-                "The executor could not spawn the produce task".to_string(),
-            ));
-        }
+        }))?;
 
         Ok(producer)
     }

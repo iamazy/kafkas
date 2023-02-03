@@ -32,6 +32,12 @@ pub enum Error {
     Consume(ConsumeError),
 }
 
+impl From<()> for Error {
+    fn from(_: ()) -> Self {
+        Self::Custom("The executor could not spawn the task".to_string())
+    }
+}
+
 impl From<ResponseError> for Error {
     fn from(value: ResponseError) -> Self {
         Error::Custom(value.to_string())
@@ -107,7 +113,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Error::Custom(e) => write!(f, "{e}"),
-            Error::Connection(e) => write!(f, "Connection error: {e}"),
+            Error::Connection(e) => write!(f, "{e}"),
             Error::InvalidVersion(v) => write!(f, "Invalid version: {v}"),
             Error::InvalidApiRequest(v) => write!(f, "Invalid Api Request: {v:?}"),
             Error::Produce(e) => write!(f, "Produce error: {e}"),

@@ -310,25 +310,19 @@ impl<Exe: Executor> Connection<Exe> {
         let error = SharedError::new();
         let (receiver_shutdown_tx, receiver_shutdown_rx) = oneshot::channel();
 
-        if executor
-            .spawn(Box::pin(
-                Receiver::new(
-                    stream,
-                    tx.clone(),
-                    error.clone(),
-                    registrations_rx,
-                    receiver_shutdown_rx,
-                )
-                .map(|_| ()),
-            ))
-            .is_err()
-        {
-            error!("the executor could not spawn the receiver future");
-            return Err(ConnectionError::Shutdown);
-        }
+        executor.spawn(Box::pin(
+            Receiver::new(
+                stream,
+                tx.clone(),
+                error.clone(),
+                registrations_rx,
+                receiver_shutdown_rx,
+            )
+            .map(|_| ()),
+        ))?;
 
         let err = error.clone();
-        let res = executor.spawn(Box::pin(async move {
+        executor.spawn(Box::pin(async move {
             while let Some(cmd) = rx.next().await {
                 if let Err(e) = sink.send(cmd).await {
                     error!("error occur: {:?}", e);
@@ -336,11 +330,7 @@ impl<Exe: Executor> Connection<Exe> {
                     break;
                 }
             }
-        }));
-        if res.is_err() {
-            error!("the executor could not spawn the receiver future");
-            return Err(ConnectionError::Shutdown);
-        }
+        }))?;
 
         let mut sender = ConnectionSender::new(
             tx,

@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<Error>> {
     let consume_stream = consumer.subscribe(vec!["kafka"]).await?;
     pin_mut!(consume_stream);
 
-    while let Some(Ok(record)) = consume_stream.next().await {
+    while let Some(record) = consume_stream.next().await {
         if let Some(value) = record.value {
             println!(
                 "{:?} - {}",
