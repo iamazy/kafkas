@@ -516,17 +516,6 @@ impl<Exe: Executor> Fetcher<Exe> {
         Ok(node_request)
     }
 
-    async fn offset_reset_strategy_timestamp(&self, partition: &TopicPartition) -> Option<i64> {
-        let reset_strategy = self
-            .subscription
-            .read()
-            .await
-            .assignments
-            .get(partition)
-            .map(|tp_state| tp_state.offset_strategy);
-        reset_strategy.map(|strategy| strategy.strategy_timestamp())
-    }
-
     fn add_to_forgotten_topic_map(
         &self,
         to_forget: Drain<TopicIdPartition>,
@@ -636,11 +625,12 @@ impl<Exe: Executor> Fetcher<Exe> {
                 ..Default::default()
             };
 
-            if let Some(partitions) = topics.get_mut(&partition.topic) {
-                partitions.push(list_offsets_partition);
-            } else {
-                let partitions = vec![list_offsets_partition];
-                topics.insert(partition.topic.clone(), partitions);
+            match topics.get_mut(&partition.topic) {
+                Some(partitions) => partitions.push(list_offsets_partition),
+                None => {
+                    let partitions = vec![list_offsets_partition];
+                    topics.insert(partition.topic.clone(), partitions);
+                }
             }
         }
 

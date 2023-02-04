@@ -245,13 +245,14 @@ impl<Exe: Executor> Producer<Exe> {
     where
         T: SerializeMessage + Sized,
     {
-        let fut = if let Some(producer) = self.producers.get(topic) {
-            producer.try_push(&self.partitioner, record).await
-        } else {
-            let producer = TopicProducer::new(self.client.clone(), topic.clone()).await?;
-            let fut = producer.try_push(&self.partitioner, record).await;
-            self.producers.insert(topic.clone(), producer);
-            fut
+        let fut = match self.producers.get(topic) {
+            Some(producer) => producer.try_push(&self.partitioner, record).await,
+            None => {
+                let producer = TopicProducer::new(self.client.clone(), topic.clone()).await?;
+                let fut = producer.try_push(&self.partitioner, record).await;
+                self.producers.insert(topic.clone(), producer);
+                fut
+            }
         };
 
         return match fut {
@@ -378,30 +379,34 @@ impl<Exe: Executor> Producer<Exe> {
                     .flush_partition(batch.value_mut(), encode_options)
                     .await?
                 {
-                    if let Some(topic_data) = topics_data.get_mut(&partition.topic) {
-                        topic_data.partition_data.push(partition_produce_data);
-                    } else {
-                        let topic_data = vec![partition_produce_data];
-                        topics_data.insert(
-                            partition.topic.clone(),
-                            TopicProduceData {
-                                partition_data: topic_data,
-                                ..Default::default()
-                            },
-                        );
+                    match topics_data.get_mut(&partition.topic) {
+                        Some(topic_data) => topic_data.partition_data.push(partition_produce_data),
+                        None => {
+                            let topic_data = vec![partition_produce_data];
+                            topics_data.insert(
+                                partition.topic.clone(),
+                                TopicProduceData {
+                                    partition_data: topic_data,
+                                    ..Default::default()
+                                },
+                            );
+                        }
                     }
 
-                    if let Some(topic_thunks) = topics_thunks.get_mut(&partition.topic) {
-                        topic_thunks
-                            .partitions_thunks
-                            .insert(batch.partition, thunks);
-                    } else {
-                        let mut partitions_thunks = BTreeMap::new();
-                        partitions_thunks.insert(partition.partition, thunks);
-                        topics_thunks.insert(
-                            partition.topic.clone(),
-                            PartitionsFlush { partitions_thunks },
-                        );
+                    match topics_thunks.get_mut(&partition.topic) {
+                        Some(topic_thunks) => {
+                            topic_thunks
+                                .partitions_thunks
+                                .insert(batch.partition, thunks);
+                        }
+                        None => {
+                            let mut partitions_thunks = BTreeMap::new();
+                            partitions_thunks.insert(partition.partition, thunks);
+                            topics_thunks.insert(
+                                partition.topic.clone(),
+                                PartitionsFlush { partitions_thunks },
+                            );
+                        }
                     }
                 }
             }

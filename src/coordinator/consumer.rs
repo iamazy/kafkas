@@ -182,10 +182,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     }
 
     pub async fn offset_commit(&mut self) -> Result<()> {
-        if !self.options.auto_commit_enabled {
-            self.inner.lock().await.offset_commit().await?;
-        }
-        Ok(())
+        self.inner.lock().await.offset_commit().await
     }
 
     pub async fn prepare_fetch(&self) -> Result<()> {

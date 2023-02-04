@@ -111,12 +111,9 @@ impl<Exe: Executor> Kafka<Exe> {
         let mut interval = executor.interval(std::time::Duration::from_secs(60));
         executor.spawn(Box::pin(async move {
             while let Some(()) = interval.next().await {
-                if let Some(strong_manager) = weak_manager.upgrade() {
-                    strong_manager.check_connections().await;
-                } else {
-                    // if all the strong references to the manager were dropped,
-                    // we can stop the task.
-                    break;
+                match weak_manager.upgrade() {
+                    Some(strong_manager) => strong_manager.check_connections().await,
+                    None => break,
                 }
             }
         }))?;
@@ -131,10 +128,9 @@ impl<Exe: Executor> Kafka<Exe> {
     }
 
     pub fn topic_id(&self, topic_name: &TopicName) -> Uuid {
-        if let Some(topic_id) = self.cluster_meta.topic_id(topic_name) {
-            topic_id
-        } else {
-            Uuid::nil()
+        match self.cluster_meta.topic_id(topic_name) {
+            Some(topic_id) => topic_id,
+            None => Uuid::nil(),
         }
     }
 
