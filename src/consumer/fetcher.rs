@@ -17,7 +17,7 @@ use kafka_protocol::{
         list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
         ApiKey, BrokerId, FetchRequest, ListOffsetsRequest, ListOffsetsResponse, TopicName,
     },
-    records::NO_PARTITION_LEADER_EPOCH,
+    records::{Record, NO_PARTITION_LEADER_EPOCH},
     ResponseError,
 };
 use tracing::{debug, error, trace, warn};
@@ -85,14 +85,10 @@ impl<Exe: Executor> Fetcher<Exe> {
                 }
                 let metadata = fetch_request_data.metadata;
                 if let Some(node) = self.client.cluster_meta.nodes.get(&node) {
-                    let fetch_response = self
-                        .client
-                        .fetch(
-                            node.value(),
-                            self.fetch_builder(&mut fetch_request_data, version).await?,
-                        )
-                        .await?;
-
+                    self.nodes_with_pending_fetch_requests.insert(node.id);
+                    let fetch_request =
+                        self.fetch_builder(&mut fetch_request_data, version).await?;
+                    let fetch_response = self.client.fetch(node.value(), fetch_request).await?;
                     match self.sessions.get_mut(node.key()) {
                         Some(mut session) => {
                             if !session
@@ -179,6 +175,8 @@ impl<Exe: Executor> Fetcher<Exe> {
                             continue;
                         }
                     }
+                    // TODO: remove when error caused
+                    self.nodes_with_pending_fetch_requests.remove(&node.id);
                 }
             }
             Ok(())
@@ -232,7 +230,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                     } else {
                         let data = FetchRequestPartitionData {
                             topic_id: self.client.topic_id(&tp.topic),
-                            fetch_offset: position.offset + 1,
+                            fetch_offset: position.offset,
                             log_start_offset: INVALID_LOG_START_OFFSET,
                             max_bytes: self.options.max_partition_fetch_bytes,
                             current_leader_epoch: position.offset_epoch,
@@ -653,6 +651,108 @@ impl<Exe: Executor> Fetcher<Exe> {
         }
         Ok(request)
     }
+
+    async fn fetch_records(
+        &mut self,
+        mut completed_fetch: CompletedFetch,
+        max_records: i32,
+    ) -> Result<Fetch> {
+        if !self
+            .subscription
+            .read()
+            .await
+            .is_assigned(&completed_fetch.partition)
+        {
+            // this can happen when a rebalance happened before fetched records are returned to the
+            // consumer's poll call
+            debug!(
+                "Not returning fetched records for partition {} since it is no longer assigned",
+                completed_fetch.partition
+            );
+        } else if self
+            .subscription
+            .read()
+            .await
+            .is_fetchable(&completed_fetch.partition)
+        {
+            // this can happen when a partition is paused before fetched records are returned to the
+            // consumer's poll call or if the offset is being reset
+            debug!(
+                "Not returning fetched records for assigned partition {} since it is no longer \
+                 fetchable",
+                completed_fetch.partition
+            );
+        } else {
+            match self
+                .subscription
+                .read()
+                .await
+                .position(&completed_fetch.partition)
+            {
+                Some(position) => {
+                    if completed_fetch.next_fetch_offset == position.offset {
+                        let records = completed_fetch.fetch_records(max_records)?;
+                        trace!(
+                            "Returning {} fetched records at offset {} for assigned partition {}",
+                            records.len(),
+                            position.offset,
+                            completed_fetch.partition
+                        );
+                        let mut position_advanced = false;
+                        if completed_fetch.next_fetch_offset > position.offset {
+                            let position = FetchPosition {
+                                offset: completed_fetch.next_fetch_offset,
+                                offset_epoch: completed_fetch.last_epoch,
+                                current_leader: position.current_leader,
+                            };
+                            trace!(
+                                "Updating fetch position from {} to {} for partition {} and \
+                                 returning {} records.",
+                                position.offset,
+                                completed_fetch.next_fetch_offset,
+                                completed_fetch.partition,
+                                records.len()
+                            );
+                            self.subscription
+                                .write()
+                                .await
+                                .update_position(&completed_fetch.partition, position)?;
+                            position_advanced = true;
+                        }
+                        let mut tp_records = HashMap::with_capacity(1);
+                        let num_records = records.len();
+                        tp_records.insert(completed_fetch.partition.clone(), records);
+                        return Ok(Fetch {
+                            records: tp_records,
+                            position_advanced,
+                            num_records,
+                        });
+                    } else {
+                        debug!(
+                            "Ignoring fetched records for {} at offset {} since the current \
+                             position is {}",
+                            completed_fetch.partition,
+                            completed_fetch.next_fetch_offset,
+                            position.offset
+                        );
+                    }
+                }
+                None => {
+                    return Err(Error::Custom(format!(
+                        "Missing position for fetchable partition {}",
+                        completed_fetch.partition
+                    )));
+                }
+            }
+        }
+
+        trace!(
+            "Draining fetched records for partition {}",
+            completed_fetch.partition
+        );
+        completed_fetch.drain();
+        Ok(Fetch::default())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Hash)]
@@ -719,10 +819,22 @@ fn next_epoch(prev_epoch: i32) -> i32 {
 pub struct CompletedFetch {
     pub(crate) partition: TopicPartition,
     pub(crate) partition_data: PartitionData,
-    next_fetch_offset: i64,
+    pub(crate) next_fetch_offset: i64,
     last_epoch: Option<i32>,
     is_consumed: bool,
     initialized: bool,
+}
+
+impl CompletedFetch {
+    pub fn fetch_records(&mut self, _max_records: i32) -> Result<Vec<Record>> {
+        unimplemented!()
+    }
+
+    pub fn drain(mut self) {
+        if !self.is_consumed {
+            self.is_consumed = true;
+        }
+    }
 }
 
 struct ListOffsetResult {
@@ -736,4 +848,11 @@ struct ListOffsetData {
     // None if the broker does not support returning timestamps
     timestamp: Option<i64>,
     leader_epoch: Option<i32>,
+}
+
+#[derive(Default)]
+pub struct Fetch {
+    records: HashMap<TopicPartition, Vec<Record>>,
+    position_advanced: bool,
+    num_records: usize,
 }

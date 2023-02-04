@@ -205,6 +205,18 @@ impl SubscriptionState {
         }
     }
 
+    pub fn update_position(&mut self, tp: &TopicPartition, position: FetchPosition) -> Result<()> {
+        if let Some(tp_state) = self.assignments.get_mut(tp) {
+            if !tp_state.fetch_state.has_valid_position() {
+                return Err(Error::Custom(
+                    "Cannot set a new position without a valid current position".into(),
+                ));
+            }
+            tp_state.position = position;
+        }
+        Ok(())
+    }
+
     fn fetchable_partitions<F>(&self, func: F) -> Vec<TopicPartition>
     where
         F: Fn(&TopicPartition) -> bool,
@@ -312,6 +324,17 @@ impl SubscriptionState {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    pub fn is_assigned(&self, tp: &TopicPartition) -> bool {
+        self.assignments.contains_key(tp)
+    }
+
+    pub fn is_fetchable(&self, tp: &TopicPartition) -> bool {
+        match self.assignments.get(tp) {
+            Some(tp_state) => tp_state.is_fetchable(),
+            None => false,
+        }
     }
 }
 
@@ -754,7 +777,7 @@ fn fetch_stream(
 
 async fn handle_partition_response(
     reset_offset_tx: &mut mpsc::UnboundedSender<()>,
-    completed_fetch: CompletedFetch,
+    mut completed_fetch: CompletedFetch,
     options: &Arc<ConsumerOptions>,
     partition_state: &mut TopicPartitionState,
     completed_partitions: &Arc<DashSet<TopicPartition>>,
@@ -865,6 +888,7 @@ async fn handle_partition_response(
                     partition_state.position.offset = record.offset;
                     partition_state.position.current_leader.epoch =
                         Some(record.partition_leader_epoch);
+                    completed_fetch.next_fetch_offset = record.offset + 1;
                 }
                 debug!(
                     "Fetch {} records success, records size: {}",
