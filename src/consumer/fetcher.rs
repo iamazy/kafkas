@@ -28,8 +28,9 @@ use crate::{
         fetch_session::{
             FetchRequestData, FetchRequestDataBuilder, FetchRequestPartitionData, FetchSession,
         },
-        ConsumerOptions, FetchPosition, IsolationLevel, OffsetResetStrategy, SubscriptionState,
-        FINAL_EPOCH, INITIAL_EPOCH, INVALID_SESSION_ID,
+        subscription_state::FetchPosition,
+        ConsumerOptions, IsolationLevel, OffsetResetStrategy, SubscriptionState, FINAL_EPOCH,
+        INITIAL_EPOCH, INVALID_SESSION_ID,
     },
     error::Result,
     executor::Executor,
@@ -117,7 +118,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 };
 
                                 for partition in fetchable_topic.partitions {
-                                    let tp = TopicPartition::new(
+                                    let tp = TopicPartition::new0(
                                         topic.clone(),
                                         partition.partition_index,
                                     );
@@ -385,7 +386,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                             );
                             if offset != UNKNOWN_OFFSET {
                                 fetched_offsets.insert(
-                                    TopicPartition::new(topic.name, partition),
+                                    TopicPartition::new0(topic.name, partition),
                                     ListOffsetData {
                                         offset,
                                         timestamp: None,
@@ -411,7 +412,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                                         Some(partition_response.leader_epoch)
                                     };
                                 fetched_offsets.insert(
-                                    TopicPartition::new(topic.name, partition),
+                                    TopicPartition::new0(topic.name, partition),
                                     ListOffsetData {
                                         offset: partition_response.offset,
                                         timestamp: Some(partition_response.timestamp),
@@ -449,7 +450,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                             topic.name.0, partition, error
                         );
                         partitions_to_retry
-                            .push(TopicPartition::new(topic.name.clone(), partition));
+                            .push(TopicPartition::new0(topic.name.clone(), partition));
                     }
                     Some(ResponseError::UnknownTopicOrPartition) => {
                         warn!(
@@ -458,7 +459,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                             topic.name.0, partition
                         );
                         partitions_to_retry
-                            .push(TopicPartition::new(topic.name.clone(), partition));
+                            .push(TopicPartition::new0(topic.name.clone(), partition));
                     }
                     Some(ResponseError::TopicAuthorizationFailed) => {
                         unauthorized_topics.push(topic.name.clone());
@@ -470,7 +471,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                             topic.name.0, partition, error
                         );
                         partitions_to_retry
-                            .push(TopicPartition::new(topic.name.clone(), partition));
+                            .push(TopicPartition::new0(topic.name.clone(), partition));
                     }
                 }
             }

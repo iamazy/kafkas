@@ -39,7 +39,8 @@ use crate::{
             Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, Subscription,
             SUPPORTED_PARTITION_ASSIGNORS,
         },
-        ConsumerGroupMetadata, ConsumerOptions, SubscriptionState, TopicPartitionState,
+        subscription_state::{SubscriptionState, TopicPartitionState},
+        ConsumerGroupMetadata, ConsumerOptions,
     },
     coordinator::{find_coordinator, CoordinatorType},
     error::{ConsumeError, Result},
@@ -54,7 +55,7 @@ macro_rules! offset_fetch_block {
     ($self:ident, $source:ident) => {
         for topic in $source.topics {
             for partition in topic.partitions {
-                let tp = TopicPartition::new(topic.name.clone(), partition.partition_index);
+                let tp = TopicPartition::new0(topic.name.clone(), partition.partition_index);
                 if partition.error_code.is_ok() {
                     if let Some(partition_state) =
                         $self.subscriptions.write().await.assignments.get_mut(&tp)
@@ -73,6 +74,17 @@ macro_rules! offset_fetch_block {
                         partition.error_code.err().unwrap()
                     );
                 }
+            }
+        }
+
+        let seek_offsets: HashMap<TopicPartition, i64> =
+            HashMap::from_iter($self.subscriptions.write().await.seek_offsets.drain());
+        for (tp, offset) in seek_offsets {
+            if let Some(tp_state) = $self.subscriptions.write().await.assignments.get_mut(&tp) {
+                tp_state.position.offset = offset;
+                tp_state.position.offset_epoch = None;
+                tp_state.position.current_leader = $self.client.cluster_meta.current_leader(&tp);
+                info!("Seek {tp} with offset: {offset}",);
             }
         }
     };
@@ -407,7 +419,7 @@ impl<Exe: Executor> Inner<Exe> {
                     self.subscriptions.write().await.assignments.clear();
                     for (topic, partitions) in assignment.partitions {
                         for partition in partitions.iter() {
-                            let tp = TopicPartition::new(topic.clone(), *partition);
+                            let tp = TopicPartition::new0(topic.clone(), *partition);
                             let mut tp_state = TopicPartitionState::new(*partition);
                             tp_state.position.current_leader =
                                 self.client.cluster_meta.current_leader(&tp);
