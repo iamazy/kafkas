@@ -5,6 +5,7 @@ use kafkas::{
     client::{Kafka, KafkaOptions},
     consumer::{Consumer, ConsumerOptions},
     executor::TokioExecutor,
+    metadata::TopicPartition,
     Error,
 };
 
@@ -25,6 +26,9 @@ async fn main() -> Result<(), Box<Error>> {
 
     let consumer_options = ConsumerOptions::new("app");
     let mut consumer = Consumer::new(kafka_client, consumer_options).await?;
+
+    let tp = TopicPartition::new("kafka", 0);
+    consumer.seek(tp, 100000).await;
 
     let consume_stream = consumer.subscribe(vec!["kafka"]).await?;
     pin_mut!(consume_stream);
