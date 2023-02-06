@@ -33,7 +33,7 @@ use crate::{
     coordinator::ConsumerCoordinator,
     executor::Executor,
     metadata::TopicPartition,
-    Error, NodeId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
+    NodeId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
 };
 
 const INITIAL_EPOCH: i32 = 0;
@@ -477,12 +477,6 @@ async fn handle_partition_response(
             if let Some(ref mut records) = partition.records {
                 let records = RecordBatchDecoder::decode(records)?;
                 if let Some(record) = records.last() {
-                    if record.offset <= partition_state.position.offset {
-                        return Err(Error::Custom(format!(
-                            "Invalid record offset: {}, expect greater than {}",
-                            record.offset, partition_state.position.offset
-                        )));
-                    }
                     partition_state.position.offset = record.offset;
                     partition_state.position.current_leader.epoch =
                         Some(record.partition_leader_epoch);

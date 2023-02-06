@@ -86,14 +86,9 @@ impl<Exe: Executor> Fetcher<Exe> {
                 }
                 let metadata = fetch_request_data.metadata;
                 if let Some(node) = self.client.cluster_meta.nodes.get(&node) {
-                    let fetch_response = self
-                        .client
-                        .fetch(
-                            node.value(),
-                            self.fetch_builder(&mut fetch_request_data, version).await?,
-                        )
-                        .await?;
-
+                    let fetch_request =
+                        self.fetch_builder(&mut fetch_request_data, version).await?;
+                    let fetch_response = self.client.fetch(node.value(), fetch_request).await?;
                     match self.sessions.get_mut(node.key()) {
                         Some(mut session) => {
                             if !session
@@ -233,7 +228,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                     } else {
                         let data = FetchRequestPartitionData {
                             topic_id: self.client.topic_id(&tp.topic),
-                            fetch_offset: position.offset + 1,
+                            fetch_offset: position.offset,
                             log_start_offset: INVALID_LOG_START_OFFSET,
                             max_bytes: self.options.max_partition_fetch_bytes,
                             current_leader_epoch: position.offset_epoch,
@@ -565,7 +560,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                     .current_leader_epoch
                     .unwrap_or(NO_PARTITION_LEADER_EPOCH),
                 last_fetched_epoch: data.last_fetched_epoch.unwrap_or(NO_PARTITION_LEADER_EPOCH),
-                fetch_offset: data.fetch_offset,
+                fetch_offset: data.fetch_offset + 1,
                 log_start_offset: data.log_start_offset,
                 partition_max_bytes: data.max_bytes,
                 ..Default::default()
