@@ -30,7 +30,7 @@ To get started using kafkas:
 ```rust
 #[tokio::main]
 async fn main() -> Result<(), Box<Error>> {
-    let client = Kafka::new("127.0.0.1:9092", KafkaOptions::new(), TokioExecutor).await?;
+    let client = Kafka::new("127.0.0.1:9092", KafkaOptions::default(), TokioExecutor).await?;
 
     let producer = Producer::new(client, ProducerOptions::default()).await?;
 
@@ -59,13 +59,12 @@ async fn main() -> Result<(), Box<Error>> {
 ```rust
 #[tokio::main]
 async fn main() -> Result<(), Box<Error>> {
-    let client = Kafka::new("127.0.0.1:9092", KafkaOptions::new(), TokioExecutor).await?;
+    let client = Kafka::new("127.0.0.1:9092", KafkaOptions::default(), TokioExecutor).await?;
 
     let consumer_options = ConsumerOptions::new("app");
     let mut consumer = Consumer::new(kafka_client, consumer_options).await?;
-    consumer.subscribe(vec!["kafka"]).await?;
 
-    let consume_stream = consumer.stream()?;
+    let consume_stream = consumer.subscribe(vec!["kafka"]).await?;
     pin_mut!(consume_stream);
 
     while let Some(Ok(record)) = consume_stream.next().await {

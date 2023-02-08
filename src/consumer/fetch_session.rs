@@ -351,35 +351,38 @@ impl FetchRequestDataBuilder {
 
         let mut session_remove = Vec::new();
         for (tp, prev_data) in session.session_partitions.iter_mut() {
-            if let Some(next_data) = self.next.remove(tp) {
-                if prev_data.topic_id != next_data.topic_id
-                    && !prev_data.topic_id.is_nil()
-                    && !next_data.topic_id.is_nil()
-                {
-                    let topic_id = prev_data.topic_id;
-                    prev_data.copied_from(&next_data);
-                    self.next.insert(tp.clone(), next_data);
-                    replaced.push(TopicIdPartition {
-                        topic_id,
-                        partition: tp.clone(),
-                    });
-                } else if prev_data != &next_data {
-                    let topic_id = next_data.topic_id;
-                    prev_data.copied_from(&next_data);
-                    self.next.insert(tp.clone(), next_data);
-                    altered.push(TopicIdPartition {
-                        topic_id,
-                        partition: tp.clone(),
-                    });
+            match self.next.remove(tp) {
+                Some(next_data) => {
+                    if prev_data.topic_id != next_data.topic_id
+                        && !prev_data.topic_id.is_nil()
+                        && !next_data.topic_id.is_nil()
+                    {
+                        let topic_id = prev_data.topic_id;
+                        prev_data.copied_from(&next_data);
+                        self.next.insert(tp.clone(), next_data);
+                        replaced.push(TopicIdPartition {
+                            topic_id,
+                            partition: tp.clone(),
+                        });
+                    } else if prev_data != &next_data {
+                        let topic_id = next_data.topic_id;
+                        prev_data.copied_from(&next_data);
+                        self.next.insert(tp.clone(), next_data);
+                        altered.push(TopicIdPartition {
+                            topic_id,
+                            partition: tp.clone(),
+                        });
+                    }
                 }
-            } else {
-                session_remove.push(tp.clone());
-                removed.push(TopicIdPartition {
-                    topic_id: prev_data.topic_id,
-                    partition: tp.clone(),
-                });
-                if can_use_topic_ids && prev_data.topic_id.is_nil() {
-                    can_use_topic_ids = false;
+                None => {
+                    session_remove.push(tp.clone());
+                    removed.push(TopicIdPartition {
+                        topic_id: prev_data.topic_id,
+                        partition: tp.clone(),
+                    });
+                    if can_use_topic_ids && prev_data.topic_id.is_nil() {
+                        can_use_topic_ids = false;
+                    }
                 }
             }
         }

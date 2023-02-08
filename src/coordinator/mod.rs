@@ -1,4 +1,5 @@
 mod consumer;
+mod transaction;
 
 pub use consumer::ConsumerCoordinator;
 use kafka_protocol::{
@@ -15,8 +16,6 @@ use crate::{
     metadata::Node,
     Error,
 };
-
-pub mod transaction;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CoordinatorType {

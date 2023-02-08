@@ -4,7 +4,12 @@ use std::{
     time::Duration,
 };
 
-use futures::{lock::Mutex, StreamExt};
+use async_lock::RwLock;
+use futures::{
+    future::{select, Either},
+    lock::Mutex,
+    pin_mut, StreamExt,
+};
 use indexmap::IndexMap;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
@@ -24,16 +29,18 @@ use kafka_protocol::{
     protocol::{Message, StrBytes},
     ResponseError,
 };
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::{
     client::Kafka,
     consumer::{
         partition_assignor::{
-            Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, RangeAssignor,
-            Subscription,
+            Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, Subscription,
+            SUPPORTED_PARTITION_ASSIGNORS,
         },
-        ConsumerGroupMetadata, ConsumerOptions, SubscriptionState, TopicPartitionState,
+        subscription_state::{SubscriptionState, TopicPartitionState},
+        ConsumerGroupMetadata, ConsumerOptions,
     },
     coordinator::{find_coordinator, CoordinatorType},
     error::{ConsumeError, Result},
@@ -48,10 +55,10 @@ macro_rules! offset_fetch_block {
     ($self:ident, $source:ident) => {
         for topic in $source.topics {
             for partition in topic.partitions {
-                let tp = TopicPartition::new(topic.name.clone(), partition.partition_index);
+                let tp = TopicPartition::new0(topic.name.clone(), partition.partition_index);
                 if partition.error_code.is_ok() {
                     if let Some(partition_state) =
-                        $self.subscriptions.lock().await.assignments.get_mut(&tp)
+                        $self.subscriptions.write().await.assignments.get_mut(&tp)
                     {
                         partition_state.position.offset = partition.committed_offset;
                         partition_state.position.offset_epoch =
@@ -69,9 +76,63 @@ macro_rules! offset_fetch_block {
                 }
             }
         }
+
+        let seek_offsets: HashMap<TopicPartition, i64> =
+            HashMap::from_iter($self.subscriptions.write().await.seek_offsets.drain());
+        for (tp, offset) in seek_offsets {
+            if let Some(tp_state) = $self.subscriptions.write().await.assignments.get_mut(&tp) {
+                tp_state.position.offset = offset;
+                tp_state.position.offset_epoch = None;
+                tp_state.position.current_leader = $self.client.cluster_meta.current_leader(&tp);
+                info!("Seek {tp} with offset: {offset}",);
+            }
+        }
     };
 }
 
+macro_rules! coordinator_task {
+    ($self:ident, $interval_ms:ident, $task:ident) => {
+        let mut interval = $self
+            .client
+            .executor
+            .interval(Duration::from_millis($interval_ms as u64));
+
+        let weak_inner = Arc::downgrade(&$self.inner);
+
+        let mut shutdown = $self.notify_shutdown.subscribe();
+        let res = $self.client.executor.spawn(Box::pin(async move {
+            while interval.next().await.is_some() {
+                match weak_inner.upgrade() {
+                    Some(strong_inner) => {
+                        let mut lock = strong_inner.lock().await;
+                        let task = lock.$task();
+                        let shutdown = shutdown.recv();
+
+                        pin_mut!(task);
+                        pin_mut!(shutdown);
+
+                        match select(task, shutdown).await {
+                            Either::Left((Err(err), _)) => {
+                                error!("{} failed, {}", stringify!($task), err);
+                            }
+                            Either::Left((Ok(_), _)) => {}
+                            Either::Right(_) => break,
+                        }
+                    }
+                    None => break,
+                }
+            }
+            info!("{} task finished.", stringify!(task));
+        }));
+
+        if res.is_err() {
+            return Err(Error::Custom(format!(
+                "The executor could not spawn the {} task",
+                stringify!(task)
+            )));
+        }
+    };
+}
 #[derive(Debug, Copy, Clone)]
 enum MemberState {
     // the client is not part of a group
@@ -88,28 +149,36 @@ pub struct ConsumerCoordinator<Exe: Executor> {
     client: Kafka<Exe>,
     inner: Arc<Mutex<Inner<Exe>>>,
     options: Arc<ConsumerOptions>,
+    notify_shutdown: broadcast::Sender<()>,
 }
 
 impl<Exe: Executor> ConsumerCoordinator<Exe> {
     pub async fn new(
         client: Kafka<Exe>,
         options: Arc<ConsumerOptions>,
+        notify: broadcast::Sender<()>,
     ) -> Result<ConsumerCoordinator<Exe>> {
         let inner = Inner::new(client.clone(), options.clone()).await?;
         let inner = Arc::new(Mutex::new(inner));
+
         Ok(Self {
             inner,
             client,
             options,
+            notify_shutdown: notify,
         })
     }
 
-    pub async fn subscribe(&self, topic: TopicName) -> Result<()> {
-        self.inner.lock().await.subscribe(topic).await
+    pub async fn subscribe(&self, topics: Vec<TopicName>) -> Result<()> {
+        self.inner.lock().await.subscribe(topics).await
     }
 
-    pub async fn subscriptions(&self) -> Arc<Mutex<SubscriptionState>> {
+    pub async fn subscriptions(&self) -> Arc<RwLock<SubscriptionState>> {
         self.inner.lock().await.subscriptions.clone()
+    }
+
+    pub async fn current_generation(&self) -> i32 {
+        self.inner.lock().await.group_meta.generation_id
     }
 
     pub async fn join_group(&self) -> Result<()> {
@@ -124,37 +193,8 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.inner.lock().await.offset_fetch().await
     }
 
-    async fn auto_commit(&self) -> Result<()> {
-        let mut auto_commit_interval = self.client.executor.interval(Duration::from_millis(
-            self.options.auto_commit_interval_ms as u64,
-        ));
-
-        let weak_inner = Arc::downgrade(&self.inner);
-
-        let res = self.client.executor.spawn(Box::pin(async move {
-            while auto_commit_interval.next().await.is_some() {
-                if let Some(strong_inner) = weak_inner.upgrade() {
-                    let _ = strong_inner.lock().await.offset_commit().await;
-                }
-            }
-        }));
-
-        if res.is_err() {
-            error!("the executor could not spawn the offset_commit task");
-            return Err(ConsumeError::Custom(
-                "the executor could not spawn the offset_commit task".to_string(),
-            )
-            .into());
-        }
-
-        Ok(())
-    }
-
     pub async fn offset_commit(&mut self) -> Result<()> {
-        if !self.options.auto_commit_enabled {
-            self.inner.lock().await.offset_commit().await?;
-        }
-        Ok(())
+        self.inner.lock().await.offset_commit().await
     }
 
     pub async fn prepare_fetch(&self) -> Result<()> {
@@ -163,30 +203,13 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.offset_fetch().await?;
 
         if self.options.auto_commit_enabled {
-            self.auto_commit().await?;
+            // auto commit offset
+            let interval_ms = self.options.auto_commit_interval_ms;
+            coordinator_task!(self, interval_ms, offset_commit);
         }
-
-        let mut heartbeat_interval = self.client.executor.interval(Duration::from_millis(
-            self.options.rebalance_options.heartbeat_interval_ms as u64,
-        ));
-
-        let weak_inner = Arc::downgrade(&self.inner);
-
-        let res = self.client.executor.spawn(Box::pin(async move {
-            while heartbeat_interval.next().await.is_some() {
-                if let Some(strong_inner) = weak_inner.upgrade() {
-                    let _ = strong_inner.lock().await.heartbeat().await;
-                }
-            }
-        }));
-
-        if res.is_err() {
-            error!("the executor could not spawn the heartbeat task");
-            return Err(ConsumeError::Custom(
-                "the executor could not spawn the heartbeat task".to_string(),
-            )
-            .into());
-        }
+        // heartbeat
+        let interval_ms = self.options.rebalance_options.heartbeat_interval_ms;
+        coordinator_task!(self, interval_ms, heartbeat);
         Ok(())
     }
 }
@@ -194,10 +217,10 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 struct Inner<Exe: Executor> {
     client: Kafka<Exe>,
     node: Node,
-    group_meta: ConsumerGroupMetadata,
+    pub group_meta: ConsumerGroupMetadata,
     group_subscription: GroupSubscription,
     consumer_options: Arc<ConsumerOptions>,
-    pub subscriptions: Arc<Mutex<SubscriptionState>>,
+    pub subscriptions: Arc<RwLock<SubscriptionState>>,
     assignors: Vec<PartitionAssignor>,
     state: MemberState,
 }
@@ -213,23 +236,53 @@ impl<Exe: Executor> Inner<Exe> {
             group_id, node
         );
 
+        // TODO: check consumer options
+        let assignors: Vec<_> = options.partition_assignment_strategy.split(',').collect();
+        let assignors: Vec<PartitionAssignor> = SUPPORTED_PARTITION_ASSIGNORS
+            .iter()
+            .filter(|assignor| assignors.contains(&assignor.name()))
+            .cloned()
+            .collect();
+
         Ok(Self {
             client,
             node,
-            subscriptions: Arc::new(Mutex::new(SubscriptionState::default())),
+            subscriptions: Arc::new(RwLock::new(SubscriptionState::default())),
             group_meta: ConsumerGroupMetadata::new(group_id.into()),
             group_subscription: GroupSubscription::default(),
             consumer_options: options,
-            assignors: vec![PartitionAssignor::Range(RangeAssignor)],
+            assignors,
             state: MemberState::UnJoined,
         })
     }
 
-    pub async fn subscribe(&self, topic: TopicName) -> Result<()> {
-        self.subscriptions.lock().await.topics.insert(topic.clone());
+    pub async fn subscribe(&self, topics: Vec<TopicName>) -> Result<()> {
+        self.subscriptions
+            .write()
+            .await
+            .topics
+            .extend(topics.clone());
         // TODO: remove it
-        self.client.topics_metadata(vec![topic]).await?;
+        self.client.update_metadata(topics).await?;
         Ok(())
+    }
+
+    async fn rejoin_group(&mut self) -> Result<()> {
+        self.join_group().await?;
+        self.sync_group().await?;
+        self.offset_fetch().await
+    }
+
+    fn reset_state(&mut self, should_reset_member_id: bool) {
+        self.state = MemberState::UnJoined;
+        if should_reset_member_id {
+            self.group_meta.generation_id = DEFAULT_GENERATION_ID;
+            self.group_meta.member_id = StrBytes::default();
+            self.group_meta.protocol_name = None;
+        } else {
+            self.group_meta.generation_id = DEFAULT_GENERATION_ID;
+            self.group_meta.protocol_name = None;
+        }
     }
 
     pub async fn describe_groups(&mut self) -> Result<()> {
@@ -249,7 +302,7 @@ impl<Exe: Executor> Inner<Exe> {
         }
     }
 
-    #[async_recursion::async_recursion(? Send)]
+    #[async_recursion::async_recursion]
     pub async fn join_group(&mut self) -> Result<()> {
         self.state = MemberState::PreparingRebalance;
         if let Some(version_range) = self.client.version_range(ApiKey::JoinGroupKey) {
@@ -271,7 +324,7 @@ impl<Exe: Executor> Inner<Exe> {
                     );
                     self.join_group().await
                 }
-                Some(error) => Err(Error::Response { error, msg: None }),
+                Some(error) => Err(error.into()),
                 None => {
                     self.group_meta.member_id = join_group_response.member_id;
                     self.group_meta.generation_id = join_group_response.generation_id;
@@ -304,31 +357,38 @@ impl<Exe: Executor> Inner<Exe> {
             .leave_group(&self.node, self.leave_group_builder()?)
             .await?;
 
-        if leave_group_response.error_code.is_ok() {
-            for member in leave_group_response.members {
-                if member.error_code.is_ok() {
-                    debug!(
-                        "Member {} leave group {:?} success.",
-                        member.member_id, self.group_meta.group_id
-                    );
-                } else {
-                    error!(
-                        "Member {} leave group {:?} failed.",
-                        member.member_id, self.group_meta.group_id
-                    );
+        match leave_group_response.error_code.err() {
+            None => {
+                for member in leave_group_response.members {
+                    if member.error_code.is_ok() {
+                        debug!(
+                            "Member {} leave group {:?} success.",
+                            member.member_id, self.group_meta.group_id
+                        );
+                    } else {
+                        error!(
+                            "Member {} leave group {:?} failed.",
+                            member.member_id, self.group_meta.group_id
+                        );
+                    }
                 }
+                info!(
+                    "Leave group {:?} success, member: {}",
+                    self.group_meta.group_id, self.group_meta.member_id
+                );
+                Ok(())
             }
-            info!(
-                "Leave group {:?} success, member: {}",
-                self.group_meta.group_id, self.group_meta.member_id
-            );
-            Ok(())
-        } else {
-            Err(Error::Response {
-                error: leave_group_response.error_code.err().unwrap(),
-                msg: None,
-            })
+            Some(error) => Err(error.into()),
         }
+    }
+
+    fn has_generation_reset(&self) -> bool {
+        self.group_meta.generation_id == DEFAULT_GENERATION_ID
+            && self.group_meta.protocol_name.is_none()
+    }
+
+    fn is_protocol_type_inconsistent(&self, protocol_type: &Option<StrBytes>) -> bool {
+        protocol_type.is_some() && protocol_type != &self.group_meta.protocol_type
     }
 
     pub async fn sync_group(&mut self) -> Result<()> {
@@ -337,45 +397,53 @@ impl<Exe: Executor> Inner<Exe> {
                 .client
                 .sync_group(&self.node, self.sync_group_builder(version_range.max)?)
                 .await?;
-            if sync_group_response.error_code.is_ok() {
-                if self.group_meta.protocol_name.is_none() {
-                    self.group_meta.protocol_name = sync_group_response.protocol_name;
-                }
-                if self.group_meta.protocol_type.is_none() {
-                    self.group_meta.protocol_type = sync_group_response.protocol_type;
-                }
-                let assignment =
-                    Assignment::deserialize_from_bytes(&mut sync_group_response.assignment)?;
-                for (topic, partitions) in assignment.partitions {
-                    for partition in partitions.iter() {
-                        let tp = TopicPartition::new(topic.clone(), *partition);
-                        let mut tp_state = TopicPartitionState::new(*partition);
-                        tp_state.position.current_leader =
-                            self.client.cluster_meta.current_leader(&tp);
-                        self.subscriptions
-                            .lock()
-                            .await
-                            .assignments
-                            .insert(tp, tp_state);
+            match sync_group_response.error_code.err() {
+                None => {
+                    if self.is_protocol_type_inconsistent(&sync_group_response.protocol_type) {
+                        error!(
+                            "JoinGroup failed: Inconsistent Protocol Type, received {:?} but \
+                             expected {:?}",
+                            sync_group_response.protocol_type, self.group_meta.protocol_type
+                        );
+                        return Err(ResponseError::InconsistentGroupProtocol.into());
                     }
+
+                    if self.group_meta.protocol_name.is_none() {
+                        self.group_meta.protocol_name = sync_group_response.protocol_name;
+                    }
+                    if self.group_meta.protocol_type.is_none() {
+                        self.group_meta.protocol_type = sync_group_response.protocol_type;
+                    }
+                    let assignment =
+                        Assignment::deserialize_from_bytes(&mut sync_group_response.assignment)?;
+                    self.subscriptions.write().await.assignments.clear();
+                    for (topic, partitions) in assignment.partitions {
+                        for partition in partitions.iter() {
+                            let tp = TopicPartition::new0(topic.clone(), *partition);
+                            let mut tp_state = TopicPartitionState::new(*partition);
+                            tp_state.position.current_leader =
+                                self.client.cluster_meta.current_leader(&tp);
+                            self.subscriptions
+                                .write()
+                                .await
+                                .assignments
+                                .insert(tp, tp_state);
+                        }
+                    }
+                    self.state = MemberState::Stable;
+                    info!(
+                        "Sync group [{}] success, leader = {}, member_id = {}, generation_id = \
+                         {}, protocol_type = {:?}, protocol_name = {:?}",
+                        self.group_meta.group_id.0,
+                        self.group_meta.leader,
+                        self.group_meta.member_id,
+                        self.group_meta.generation_id,
+                        self.group_meta.protocol_type.as_ref(),
+                        self.group_meta.protocol_name.as_ref(),
+                    );
+                    Ok(())
                 }
-                self.state = MemberState::Stable;
-                info!(
-                    "Sync group [{}] success, leader = {}, member_id = {}, generation_id = {}, \
-                     protocol_type = {:?}, protocol_name = {:?}",
-                    self.group_meta.group_id.0,
-                    self.group_meta.leader,
-                    self.group_meta.member_id,
-                    self.group_meta.generation_id,
-                    self.group_meta.protocol_type.as_ref(),
-                    self.group_meta.protocol_name.as_ref(),
-                );
-                Ok(())
-            } else {
-                Err(Error::Response {
-                    error: sync_group_response.error_code.err().unwrap(),
-                    msg: None,
-                })
+                Some(error) => Err(error.into()),
             }
         } else {
             Err(Error::InvalidApiRequest(ApiKey::SyncGroupKey))
@@ -391,18 +459,16 @@ impl<Exe: Executor> Inner<Exe> {
                     self.offset_fetch_builder(version_range.max).await?,
                 )
                 .await?;
-            if offset_fetch_response.error_code.is_ok() {
-                if let Some(group) = offset_fetch_response.groups.pop() {
-                    offset_fetch_block!(self, group);
-                } else {
-                    offset_fetch_block!(self, offset_fetch_response);
+            match offset_fetch_response.error_code.err() {
+                None => {
+                    if let Some(group) = offset_fetch_response.groups.pop() {
+                        offset_fetch_block!(self, group);
+                    } else {
+                        offset_fetch_block!(self, offset_fetch_response);
+                    }
+                    Ok(())
                 }
-                Ok(())
-            } else {
-                Err(Error::Response {
-                    error: offset_fetch_response.error_code.err().unwrap(),
-                    msg: None,
-                })
+                Some(error) => Err(error.into()),
             }
         } else {
             Err(Error::InvalidApiRequest(ApiKey::OffsetFetchKey))
@@ -459,12 +525,13 @@ impl<Exe: Executor> Inner<Exe> {
                          or not valid",
                         self.node.id
                     );
-                    Err(Error::Response { error, msg: None })
+                    Err(error.into())
                 }
                 Some(error @ ResponseError::RebalanceInProgress) => {
                     if matches!(self.state, MemberState::Stable) {
-                        // TODO: request rejoin group
-                        Err(Error::Response { error, msg: None })
+                        warn!("Request joining group due to: group is already rebalancing");
+                        self.rejoin_group().await?;
+                        Err(error.into())
                     } else {
                         debug!(
                             "Ignoring heartbeat response with error {error} during {:?} state",
@@ -484,17 +551,9 @@ impl<Exe: Executor> Inner<Exe> {
                              failed due to {error}, resetting generation",
                             self.group_meta.generation_id, self.group_meta.group_instance_id
                         );
-                        self.state = MemberState::UnJoined;
-                        if !matches!(error, ResponseError::IllegalGeneration) {
-                            self.group_meta.generation_id = DEFAULT_GENERATION_ID;
-                            self.group_meta.member_id = MemberId::default();
-                            self.group_meta.protocol_name = None;
-                        } else {
-                            self.group_meta.generation_id = DEFAULT_GENERATION_ID;
-                            self.group_meta.protocol_name = None;
-                        }
-                        // TODO: rejoin group
-                        Err(Error::Response { error, msg: None })
+                        self.reset_state(matches!(error, ResponseError::IllegalGeneration));
+                        self.rejoin_group().await?;
+                        Err(error.into())
                     } else {
                         info!(
                             "Attempt to heartbeat with stale generation {} and group instance id \
@@ -504,14 +563,8 @@ impl<Exe: Executor> Inner<Exe> {
                         Ok(())
                     }
                 }
-                Some(error @ ResponseError::GroupAuthorizationFailed) => Err(Error::Response {
-                    error,
-                    msg: Some(format!("group: {}", self.group_meta.group_id.0)),
-                }),
-                Some(error) => Err(Error::Response {
-                    error,
-                    msg: Some(format!("Unexpected error in heartbeat response: {error}")),
-                }),
+                Some(error @ ResponseError::GroupAuthorizationFailed) => Err(error.into()),
+                Some(error) => Err(error.into()),
             }
         } else {
             Err(Error::InvalidApiRequest(ApiKey::HeartbeatKey))
@@ -522,21 +575,20 @@ impl<Exe: Executor> Inner<Exe> {
 /// for request builder and response handler
 impl<Exe: Executor> Inner<Exe> {
     async fn join_group_protocol(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
-        let mut topics = HashSet::with_capacity(self.subscriptions.lock().await.topics.len());
-        self.subscriptions
-            .lock()
+        let topics = self
+            .subscriptions
+            .read()
             .await
             .topics
             .iter()
-            .for_each(|topic| {
-                topics.insert(topic.clone());
-            });
+            .cloned()
+            .collect::<HashSet<TopicName>>();
         let mut protocols = IndexMap::with_capacity(topics.len());
         for assignor in self.assignors.iter() {
             let subscription = Subscription::new(
                 topics.clone(),
                 assignor.subscription_user_data(&topics)?,
-                self.subscriptions.lock().await.partitions(),
+                self.subscriptions.read().await.partitions(),
             );
             let metadata = subscription.serialize_to_bytes()?;
             protocols.insert(
@@ -616,11 +668,22 @@ impl<Exe: Executor> Inner<Exe> {
             request.member_id = self.group_meta.member_id.clone();
             request.generation_id = self.group_meta.generation_id;
 
-            let assignor = self.look_up_assignor("range")?;
             if self.group_meta.member_id == self.group_meta.leader {
-                let cluster = self.client.cluster_meta.clone();
-                request.assignments =
-                    serialize_assignments(assignor.assign(cluster, &self.group_subscription)?)?;
+                match self.group_meta.protocol_name {
+                    Some(ref protocol) => {
+                        let assignor = self.look_up_assignor(&protocol.to_string())?;
+                        let cluster = self.client.cluster_meta.clone();
+                        request.assignments = serialize_assignments(
+                            assignor.assign(cluster, &self.group_subscription)?,
+                        )?;
+                    }
+                    None => {
+                        return Err(Error::Custom(format!(
+                            "Group leader {} has no partition assignor protocol",
+                            self.group_meta.leader
+                        )));
+                    }
+                }
             }
 
             if version >= 3 {
@@ -638,8 +701,8 @@ impl<Exe: Executor> Inner<Exe> {
     pub async fn offset_fetch_builder(&self, version: i16) -> Result<OffsetFetchRequest> {
         let mut request = OffsetFetchRequest::default();
         if version <= 7 {
-            let mut topics = Vec::with_capacity(self.subscriptions.lock().await.topics.len());
-            for assign in self.subscriptions.lock().await.topics.iter() {
+            let mut topics = Vec::with_capacity(self.subscriptions.read().await.topics.len());
+            for assign in self.subscriptions.read().await.topics.iter() {
                 let partitions = self.client.cluster_meta.partitions(assign)?;
                 let topic = OffsetFetchRequestTopic {
                     name: assign.clone(),
@@ -651,8 +714,8 @@ impl<Exe: Executor> Inner<Exe> {
             request.group_id = self.group_meta.group_id.clone();
             request.topics = Some(topics);
         } else {
-            let mut topics = Vec::with_capacity(self.subscriptions.lock().await.topics.len());
-            for assign in self.subscriptions.lock().await.topics.iter() {
+            let mut topics = Vec::with_capacity(self.subscriptions.read().await.topics.len());
+            for assign in self.subscriptions.read().await.topics.iter() {
                 let partitions = self.client.cluster_meta.partitions(assign)?;
                 let topic = OffsetFetchRequestTopics {
                     name: assign.clone(),
@@ -679,8 +742,8 @@ impl<Exe: Executor> Inner<Exe> {
             request.group_id = self.group_meta.group_id.clone();
 
             let mut topics: HashMap<TopicName, Vec<OffsetCommitRequestPartition>> =
-                HashMap::with_capacity(self.subscriptions.lock().await.topics.len());
-            let all_consumed = self.subscriptions.lock().await.all_consumed();
+                HashMap::with_capacity(self.subscriptions.read().await.topics.len());
+            let all_consumed = self.subscriptions.read().await.all_consumed();
             for (tp, meta) in all_consumed.iter() {
                 let partition = OffsetCommitRequestPartition {
                     partition_index: tp.partition,

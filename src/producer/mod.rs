@@ -27,7 +27,7 @@ use kafka_protocol::{
         NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE,
     },
 };
-use tracing::{error, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::{
     client::{Kafka, SerializeMessage},
@@ -53,10 +53,9 @@ impl Future for SendFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match Pin::new(&mut self.0).poll(cx) {
             Poll::Ready(Ok(r)) => Poll::Ready(r),
-            Poll::Ready(Err(_canceled)) => Poll::Ready(Err(ProduceError::Custom(
-                "producer unexpectedly disconnected".into(),
-            )
-            .into())),
+            Poll::Ready(Err(_canceled)) => Poll::Ready(Err(Error::Custom(
+                "Producer unexpectedly disconnected".into(),
+            ))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -196,7 +195,7 @@ impl<Exe: Executor> Producer<Exe> {
             Partitioner::RoundRobin => {
                 PartitionerSelector::RoundRobin(RoundRobinPartitioner::new())
             }
-            _ => unimplemented!("only support roundbin partitioner"),
+            _ => unimplemented!("Only support roundbin partitioner"),
         };
 
         let encode_options = RecordEncodeOptions {
@@ -220,28 +219,24 @@ impl<Exe: Executor> Producer<Exe> {
             .executor
             .interval(producer.options.linger_ms);
 
-        let res = producer.client.executor.spawn(Box::pin(async move {
+        producer.client.executor.spawn(Box::pin(async move {
             while interval.next().await.is_some() {
-                if let Some(strong_producer) = weak_producer.upgrade() {
-                    if let Err(e) = strong_producer
-                        .send_raw(&strong_producer.options, &strong_producer.encode_options)
-                        .await
-                    {
-                        error!("send failed!, error: {e}");
+                match weak_producer.upgrade() {
+                    Some(strong_producer) => {
+                        if let Err(err) = strong_producer
+                            .send_raw(&strong_producer.options, &strong_producer.encode_options)
+                            .await
+                        {
+                            error!("Send failed!, error: {err}");
+                        }
                     }
-                } else {
-                    break;
+                    None => {
+                        info!("Producer is shutting down.");
+                        break;
+                    }
                 }
             }
-        }));
-
-        if res.is_err() {
-            error!("the executor could not spawn the linger task");
-            return Err(ProduceError::Custom(
-                "the executor could not spawn the linger task".to_string(),
-            )
-            .into());
-        }
+        }))?;
 
         Ok(producer)
     }
@@ -250,13 +245,14 @@ impl<Exe: Executor> Producer<Exe> {
     where
         T: SerializeMessage + Sized,
     {
-        let fut = if let Some(producer) = self.producers.get(topic) {
-            producer.try_push(&self.partitioner, record).await
-        } else {
-            let producer = TopicProducer::new(self.client.clone(), topic.clone()).await?;
-            let fut = producer.try_push(&self.partitioner, record).await;
-            self.producers.insert(topic.clone(), producer);
-            fut
+        let fut = match self.producers.get(topic) {
+            Some(producer) => producer.try_push(&self.partitioner, record).await,
+            None => {
+                let producer = TopicProducer::new(self.client.clone(), topic.clone()).await?;
+                let fut = producer.try_push(&self.partitioner, record).await;
+                self.producers.insert(topic.clone(), producer);
+                fut
+            }
         };
 
         return match fut {
@@ -383,30 +379,34 @@ impl<Exe: Executor> Producer<Exe> {
                     .flush_partition(batch.value_mut(), encode_options)
                     .await?
                 {
-                    if let Some(topic_data) = topics_data.get_mut(&partition.topic) {
-                        topic_data.partition_data.push(partition_produce_data);
-                    } else {
-                        let topic_data = vec![partition_produce_data];
-                        topics_data.insert(
-                            partition.topic.clone(),
-                            TopicProduceData {
-                                partition_data: topic_data,
-                                ..Default::default()
-                            },
-                        );
+                    match topics_data.get_mut(&partition.topic) {
+                        Some(topic_data) => topic_data.partition_data.push(partition_produce_data),
+                        None => {
+                            let topic_data = vec![partition_produce_data];
+                            topics_data.insert(
+                                partition.topic.clone(),
+                                TopicProduceData {
+                                    partition_data: topic_data,
+                                    ..Default::default()
+                                },
+                            );
+                        }
                     }
 
-                    if let Some(topic_thunks) = topics_thunks.get_mut(&partition.topic) {
-                        topic_thunks
-                            .partitions_thunks
-                            .insert(batch.partition, thunks);
-                    } else {
-                        let mut partitions_thunks = BTreeMap::new();
-                        partitions_thunks.insert(partition.partition, thunks);
-                        topics_thunks.insert(
-                            partition.topic.clone(),
-                            PartitionsFlush { partitions_thunks },
-                        );
+                    match topics_thunks.get_mut(&partition.topic) {
+                        Some(topic_thunks) => {
+                            topic_thunks
+                                .partitions_thunks
+                                .insert(batch.partition, thunks);
+                        }
+                        None => {
+                            let mut partitions_thunks = BTreeMap::new();
+                            partitions_thunks.insert(partition.partition, thunks);
+                            topics_thunks.insert(
+                                partition.topic.clone(),
+                                PartitionsFlush { partitions_thunks },
+                            );
+                        }
                     }
                 }
             }
@@ -446,14 +446,15 @@ struct TopicProducer<Exe: Executor> {
 
 impl<Exe: Executor> TopicProducer<Exe> {
     pub async fn new(client: Arc<Kafka<Exe>>, topic: TopicName) -> Result<Arc<TopicProducer<Exe>>> {
-        client.topics_metadata(vec![topic.clone()]).await?;
+        client.update_metadata(vec![topic.clone()]).await?;
 
         let partitions = client.cluster_meta.partitions(&topic)?;
         let partitions = partitions.value();
         let num_partitions = partitions.len();
         let batches = DashMap::with_capacity_and_hasher(num_partitions, FxBuildHasher::default());
         for partition in partitions {
-            batches.insert(*partition, ProducerBatch::new(1024 * 1024, *partition));
+            // TODO: split batch when got `MessageTooLarge` error
+            batches.insert(*partition, ProducerBatch::new(100 * 1024, *partition));
         }
 
         let producer = Self {

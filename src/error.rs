@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use futures::channel::mpsc::SendError;
+use futures::channel::mpsc::{SendError, TryRecvError};
 use kafka_protocol::{
     messages::{ApiKey, TopicName},
     protocol::{buf::NotEnoughBytesError, DecodeError, EncodeError},
@@ -24,25 +24,24 @@ pub enum Error {
     Connection(ConnectionError),
     InvalidVersion(i16),
     InvalidApiRequest(ApiKey),
-    TopicNotAvailable {
-        topic: TopicName,
-    },
-    TopicAuthorizationError {
-        topics: Vec<TopicName>,
-    },
-    PartitionNotAvailable {
-        topic: TopicName,
-        partition: i32,
-    },
-    NodeNotAvailable {
-        node: NodeId,
-    },
+    TopicNotAvailable { topic: TopicName },
+    TopicAuthorizationError { topics: Vec<TopicName> },
+    PartitionNotAvailable { topic: TopicName, partition: i32 },
+    NodeNotAvailable { node: NodeId },
     Produce(ProduceError),
     Consume(ConsumeError),
-    Response {
-        error: ResponseError,
-        msg: Option<String>,
-    },
+}
+
+impl From<()> for Error {
+    fn from(_: ()) -> Self {
+        Self::Custom("The executor could not spawn the task".to_string())
+    }
+}
+
+impl From<ResponseError> for Error {
+    fn from(value: ResponseError) -> Self {
+        Error::Custom(value.to_string())
+    }
 }
 
 impl From<FromUtf8Error> for Error {
@@ -99,6 +98,11 @@ impl From<DecodeError> for Error {
     }
 }
 
+impl From<TryRecvError> for Error {
+    fn from(value: TryRecvError) -> Self {
+        Error::Custom(value.to_string())
+    }
+}
 impl From<SendError> for Error {
     fn from(value: SendError) -> Self {
         Error::Custom(value.to_string())
@@ -109,7 +113,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Error::Custom(e) => write!(f, "{e}"),
-            Error::Connection(e) => write!(f, "Connection error: {e}"),
+            Error::Connection(e) => write!(f, "{e}"),
             Error::InvalidVersion(v) => write!(f, "Invalid version: {v}"),
             Error::InvalidApiRequest(v) => write!(f, "Invalid Api Request: {v:?}"),
             Error::Produce(e) => write!(f, "Produce error: {e}"),
@@ -126,7 +130,6 @@ impl std::fmt::Display for Error {
             Error::NodeNotAvailable { node } => {
                 write!(f, "Node not available, node: {node:?}")
             }
-            Error::Response { error, msg } => write!(f, "Error code: {error:?}, msg: {msg:?}"),
         }
     }
 }
@@ -200,7 +203,6 @@ impl std::fmt::Display for ConnectionError {
 
 pub enum ProduceError {
     Connection(ConnectionError),
-    Custom(String),
     Io(std::io::Error),
     PartialSend(Vec<Result<SendFuture>>),
     /// Indiciates the error was part of sending a batch, and thus shared across the batch
@@ -217,7 +219,6 @@ impl std::fmt::Display for ProduceError {
         match self {
             ProduceError::Connection(e) => write!(f, "Connection error: {e}"),
             ProduceError::Io(e) => write!(f, "Compression error: {e}"),
-            ProduceError::Custom(e) => write!(f, "{e}"),
             ProduceError::Batch(e) => write!(f, "Batch error: {e}"),
             ProduceError::PartialSend(e) => {
                 let (successes, failures) = e.iter().fold((0, 0), |(s, f), r| match r {
@@ -252,7 +253,6 @@ impl std::fmt::Debug for ProduceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProduceError::Connection(e) => write!(f, "Connection({e})"),
-            ProduceError::Custom(msg) => write!(f, "Custom({msg})"),
             ProduceError::Io(e) => write!(f, "Io({e})"),
             ProduceError::Batch(e) => write!(f, "Batch({e})"),
             ProduceError::PartialSend(parts) => {
@@ -289,7 +289,6 @@ impl From<std::io::Error> for ProduceError {
 
 pub enum ConsumeError {
     Connection(ConnectionError),
-    Custom(String),
     Io(std::io::Error),
     CoordinatorNotAvailable,
     PartitionAssignorNotAvailable(String),
@@ -300,7 +299,6 @@ impl std::fmt::Display for ConsumeError {
         match self {
             ConsumeError::Connection(e) => write!(f, "Connection error: {e}"),
             ConsumeError::Io(e) => write!(f, "Decompression error: {e}"),
-            ConsumeError::Custom(e) => write!(f, "{e}"),
             ConsumeError::CoordinatorNotAvailable => write!(f, "Coordinator not available"),
             ConsumeError::PartitionAssignorNotAvailable(name) => {
                 write!(f, "PartitionAssignor: {name} not available")
@@ -313,7 +311,6 @@ impl std::fmt::Debug for ConsumeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConsumeError::Connection(e) => write!(f, "Connection({e})"),
-            ConsumeError::Custom(msg) => write!(f, "Custom({msg})"),
             ConsumeError::Io(e) => write!(f, "Io({e})"),
             ConsumeError::CoordinatorNotAvailable => write!(f, "CoordinatorNotAvailable"),
             ConsumeError::PartitionAssignorNotAvailable(name) => {

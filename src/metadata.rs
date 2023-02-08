@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     consumer::LeaderAndEpoch,
     error::{Error, Result},
-    NodeId, NodeRef, PartitionId, PartitionRef,
+    NodeId, NodeRef, PartitionId, PartitionRef, ToStrBytes,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -105,8 +105,15 @@ pub struct TopicPartition {
 }
 
 impl TopicPartition {
-    pub fn new(topic: TopicName, partition: PartitionId) -> Self {
+    pub(crate) fn new0(topic: TopicName, partition: PartitionId) -> Self {
         Self { topic, partition }
+    }
+
+    pub fn new<S: AsRef<str>>(topic: S, partition: PartitionId) -> Self {
+        Self {
+            topic: topic.as_ref().to_string().to_str_bytes().into(),
+            partition,
+        }
     }
 }
 
@@ -293,7 +300,7 @@ impl Cluster {
             let mut topic_partitions = Vec::new();
             for topic_entry in self.topics.iter() {
                 for partition in topic_entry.partitions.iter() {
-                    topic_partitions.push(TopicPartition::new(
+                    topic_partitions.push(TopicPartition::new0(
                         topic_entry.key().clone(),
                         partition.partition,
                     ));

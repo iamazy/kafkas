@@ -47,10 +47,10 @@ impl tokio_util::codec::Decoder for KafkaCodec {
     type Error = ConnectionError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if let Some(mut bytes) = self.length_codec.decode(src)? {
-            return self.decode_response(&mut bytes);
+        match self.length_codec.decode(src)? {
+            Some(mut bytes) => self.decode_response(&mut bytes),
+            None => Ok(None),
         }
-        Ok(None)
     }
 }
 
@@ -74,10 +74,9 @@ impl asynchronous_codec::Decoder for KafkaCodec {
     type Error = ConnectionError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if let Some(mut bytes) = self.length_codec.decode(src)? {
-            self.decode_response(&mut bytes)
-        } else {
-            Ok(None)
+        match self.length_codec.decode(src)? {
+            Some(mut bytes) => self.decode_response(&mut bytes),
+            None => Ok(None),
         }
     }
 }

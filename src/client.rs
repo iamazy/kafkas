@@ -16,7 +16,7 @@ use kafka_protocol::{
     protocol::VersionRange,
     records::Record,
 };
-use tracing::error;
+use uuid::Uuid;
 
 use crate::{
     connection::Connection,
@@ -62,17 +62,13 @@ pub struct KafkaOptions {
 impl Default for KafkaOptions {
     fn default() -> Self {
         Self {
-            client_id: Some("default_client_id".into()),
+            client_id: Some("default".into()),
             request_timeout_ms: 1,
         }
     }
 }
 
 impl KafkaOptions {
-    pub fn new() -> Self {
-        Default::default()
-    }
-
     pub fn client_id<S: Into<String>>(&mut self, client_id: S) {
         self.client_id = Some(client_id.into());
     }
@@ -113,22 +109,14 @@ impl<Exe: Executor> Kafka<Exe> {
 
         let weak_manager = Arc::downgrade(&manager);
         let mut interval = executor.interval(std::time::Duration::from_secs(60));
-        let res = executor.spawn(Box::pin(async move {
+        executor.spawn(Box::pin(async move {
             while let Some(()) = interval.next().await {
-                if let Some(strong_manager) = weak_manager.upgrade() {
-                    strong_manager.check_connections().await;
-                } else {
-                    // if all the strong references to the manager were dropped,
-                    // we can stop the task.
-                    break;
+                match weak_manager.upgrade() {
+                    Some(strong_manager) => strong_manager.check_connections().await,
+                    None => break,
                 }
             }
-        }));
-
-        if res.is_err() {
-            error!("the executor could not spawn the check connection task");
-            return Err(ConnectionError::Shutdown.into());
-        }
+        }))?;
 
         Ok(Kafka {
             manager,
@@ -137,6 +125,13 @@ impl<Exe: Executor> Kafka<Exe> {
             cluster_meta: Arc::new(Cluster::new()),
             supported_versions,
         })
+    }
+
+    pub fn topic_id(&self, topic_name: &TopicName) -> Uuid {
+        match self.cluster_meta.topic_id(topic_name) {
+            Some(topic_id) => topic_id,
+            None => Uuid::nil(),
+        }
     }
 
     pub fn partitions(&self, topic: &TopicName) -> Result<PartitionRef> {
@@ -148,29 +143,35 @@ impl<Exe: Executor> Kafka<Exe> {
     }
 }
 
+macro_rules! invoke_request {
+    ($manager:ident, $request:ident, $response:ident) => {
+        match $manager.invoke(&$manager.url, $request).await? {
+            ResponseKind::$response(response) => Ok(response),
+            res => Err(Error::Connection(ConnectionError::UnexpectedResponse(
+                format!("{res:?}"),
+            ))),
+        }
+    };
+    ($self:ident, $addr:ident, $request:ident, $response:ident) => {
+        match $self.manager.invoke(&$addr, $request).await? {
+            ResponseKind::$response(response) => Ok(response),
+            res => Err(Error::Connection(ConnectionError::UnexpectedResponse(
+                format!("{res:?}"),
+            ))),
+        }
+    };
+}
+
 impl<Exe: Executor> Kafka<Exe> {
     async fn api_version(manager: &ConnectionManager<Exe>) -> Result<ApiVersionsResponse> {
         let request = RequestKind::ApiVersionsRequest(Self::api_version_builder()?);
-        let response = manager.invoke(&manager.url, request).await?;
-        if let ResponseKind::ApiVersionsResponse(response) = response {
-            Ok(response)
-        } else {
-            Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                format!("{response:?}"),
-            )))
-        }
+        invoke_request!(manager, request, ApiVersionsResponse)
     }
 
     pub async fn produce(&self, node: &Node, request: ProduceRequest) -> Result<ProduceResponse> {
         let request = RequestKind::ProduceRequest(request);
-        let response = self.manager.invoke(node.address(), request).await?;
-        if let ResponseKind::ProduceResponse(response) = response {
-            Ok(response)
-        } else {
-            Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                format!("{response:?}"),
-            )))
-        }
+        let addr = node.address();
+        invoke_request!(self, addr, request, ProduceResponse)
     }
 
     pub async fn find_coordinator(
@@ -178,14 +179,8 @@ impl<Exe: Executor> Kafka<Exe> {
         request: FindCoordinatorRequest,
     ) -> Result<FindCoordinatorResponse> {
         let request = RequestKind::FindCoordinatorRequest(request);
-        let response = self.manager.invoke(&self.manager.url, request).await?;
-        if let ResponseKind::FindCoordinatorResponse(response) = response {
-            Ok(response)
-        } else {
-            Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                format!("{response:?}"),
-            )))
-        }
+        let addr = &self.manager.url;
+        invoke_request!(self, addr, request, FindCoordinatorResponse)
     }
 
     pub async fn describe_groups(
@@ -194,14 +189,8 @@ impl<Exe: Executor> Kafka<Exe> {
         request: DescribeGroupsRequest,
     ) -> Result<DescribeGroupsResponse> {
         let request = RequestKind::DescribeGroupsRequest(request);
-        let response = self.manager.invoke(node.address(), request).await?;
-        if let ResponseKind::DescribeGroupsResponse(response) = response {
-            Ok(response)
-        } else {
-            Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                format!("{response:?}"),
-            )))
-        }
+        let addr = node.address();
+        invoke_request!(self, addr, request, DescribeGroupsResponse)
     }
 
     pub async fn join_group(
@@ -210,14 +199,8 @@ impl<Exe: Executor> Kafka<Exe> {
         request: JoinGroupRequest,
     ) -> Result<JoinGroupResponse> {
         let request = RequestKind::JoinGroupRequest(request);
-        let response = self.manager.invoke(node.address(), request).await?;
-        if let ResponseKind::JoinGroupResponse(response) = response {
-            Ok(response)
-        } else {
-            Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                format!("{response:?}"),
-            )))
-        }
+        let addr = node.address();
+        invoke_request!(self, addr, request, JoinGroupResponse)
     }
 
     pub async fn leave_group(
@@ -226,14 +209,8 @@ impl<Exe: Executor> Kafka<Exe> {
         request: LeaveGroupRequest,
     ) -> Result<LeaveGroupResponse> {
         let request = RequestKind::LeaveGroupRequest(request);
-        let response = self.manager.invoke(node.address(), request).await?;
-        if let ResponseKind::LeaveGroupResponse(response) = response {
-            Ok(response)
-        } else {
-            Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                format!("{response:?}"),
-            )))
-        }
+        let addr = node.address();
+        invoke_request!(self, addr, request, LeaveGroupResponse)
     }
 
     pub async fn sync_group(
@@ -242,14 +219,8 @@ impl<Exe: Executor> Kafka<Exe> {
         request: SyncGroupRequest,
     ) -> Result<SyncGroupResponse> {
         let request = RequestKind::SyncGroupRequest(request);
-        let response = self.manager.invoke(node.address(), request).await?;
-        if let ResponseKind::SyncGroupResponse(response) = response {
-            Ok(response)
-        } else {
-            Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                format!("{response:?}"),
-            )))
-        }
+        let addr = node.address();
+        invoke_request!(self, addr, request, SyncGroupResponse)
     }
 
     pub async fn offset_fetch(
@@ -258,14 +229,8 @@ impl<Exe: Executor> Kafka<Exe> {
         request: OffsetFetchRequest,
     ) -> Result<OffsetFetchResponse> {
         let request = RequestKind::OffsetFetchRequest(request);
-        let response = self.manager.invoke(node.address(), request).await?;
-        if let ResponseKind::OffsetFetchResponse(response) = response {
-            Ok(response)
-        } else {
-            Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                format!("{response:?}"),
-            )))
-        }
+        let addr = node.address();
+        invoke_request!(self, addr, request, OffsetFetchResponse)
     }
 
     pub async fn offset_commit(
@@ -274,14 +239,8 @@ impl<Exe: Executor> Kafka<Exe> {
         request: OffsetCommitRequest,
     ) -> Result<OffsetCommitResponse> {
         let request = RequestKind::OffsetCommitRequest(request);
-        let response = self.manager.invoke(node.address(), request).await?;
-        if let ResponseKind::OffsetCommitResponse(response) = response {
-            Ok(response)
-        } else {
-            Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                format!("{response:?}"),
-            )))
-        }
+        let addr = node.address();
+        invoke_request!(self, addr, request, OffsetCommitResponse)
     }
 
     pub async fn list_offsets(
@@ -290,14 +249,8 @@ impl<Exe: Executor> Kafka<Exe> {
         request: ListOffsetsRequest,
     ) -> Result<ListOffsetsResponse> {
         let request = RequestKind::ListOffsetsRequest(request);
-        let response = self.manager.invoke(node.address(), request).await?;
-        if let ResponseKind::ListOffsetsResponse(response) = response {
-            Ok(response)
-        } else {
-            Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                format!("{response:?}"),
-            )))
-        }
+        let addr = node.address();
+        invoke_request!(self, addr, request, ListOffsetsResponse)
     }
 
     pub async fn heartbeat(
@@ -306,29 +259,17 @@ impl<Exe: Executor> Kafka<Exe> {
         request: HeartbeatRequest,
     ) -> Result<HeartbeatResponse> {
         let request = RequestKind::HeartbeatRequest(request);
-        let response = self.manager.invoke(node.address(), request).await?;
-        if let ResponseKind::HeartbeatResponse(response) = response {
-            Ok(response)
-        } else {
-            Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                format!("{response:?}"),
-            )))
-        }
+        let addr = node.address();
+        invoke_request!(self, addr, request, HeartbeatResponse)
     }
 
     pub async fn fetch(&self, node: &Node, request: FetchRequest) -> Result<FetchResponse> {
         let request = RequestKind::FetchRequest(request);
-        let response = self.manager.invoke(node.address(), request).await?;
-        if let ResponseKind::FetchResponse(response) = response {
-            Ok(response)
-        } else {
-            Err(Error::Connection(ConnectionError::UnexpectedResponse(
-                format!("{response:?}"),
-            )))
-        }
+        let addr = node.address();
+        invoke_request!(self, addr, request, FetchResponse)
     }
 
-    pub async fn topics_metadata(&self, topics: Vec<TopicName>) -> Result<()> {
+    pub async fn update_metadata(&self, topics: Vec<TopicName>) -> Result<()> {
         let mut request = MetadataRequest::default();
         let mut metadata_topics = Vec::with_capacity(topics.len());
         for topic_name in topics {
@@ -349,6 +290,14 @@ impl<Exe: Executor> Kafka<Exe> {
                 format!("{response:?}"),
             )))
         }
+    }
+
+    pub async fn update_full_metadata(&self) -> Result<()> {
+        let mut topics = Vec::with_capacity(self.cluster_meta.topics.len());
+        for topic in self.cluster_meta.topics.iter() {
+            topics.push(topic.key().clone());
+        }
+        self.update_metadata(topics).await
     }
 }
 
