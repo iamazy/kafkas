@@ -88,7 +88,9 @@ impl<Exe: Executor> Fetcher<Exe> {
                 if let Some(node) = self.client.cluster_meta.nodes.get(&node) {
                     let fetch_request =
                         self.fetch_builder(&mut fetch_request_data, version).await?;
+                    trace!("Send fetch request: {:?}", fetch_request);
                     let fetch_response = self.client.fetch(node.value(), fetch_request).await?;
+                    trace!("Receive fetch response: {:?}", fetch_response);
                     match self.sessions.get_mut(node.key()) {
                         Some(mut session) => {
                             if !session
@@ -339,7 +341,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         offset_data: ListOffsetData,
     ) -> Result<()> {
         let position = FetchPosition {
-            offset: offset_data.offset,
+            offset: offset_data.offset - 1,
             offset_epoch: None,
             current_leader: self.client.cluster_meta.current_leader(&partition),
         };
