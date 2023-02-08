@@ -89,6 +89,12 @@ impl<Exe: Executor> Fetcher<Exe> {
                     let fetch_request =
                         self.fetch_builder(&mut fetch_request_data, version).await?;
                     trace!("Send fetch request: {:?}", fetch_request);
+                    // We add the node to the set of nodes with pending fetch requests before adding
+                    // the listener because the future may have been fulfilled
+                    // on another thread (e.g. during a disconnection being
+                    // handled by the heartbeat thread) which will mean the listener
+                    // will be invoked synchronously.
+                    self.nodes_with_pending_fetch_requests.insert(node.id);
                     let fetch_response = self.client.fetch(node.value(), fetch_request).await?;
                     trace!("Receive fetch response: {:?}", fetch_response);
                     match self.sessions.get_mut(node.key()) {
@@ -99,7 +105,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                             {
                                 if let Some(error) = fetch_response.error_code.err() {
                                     if error == ResponseError::FetchSessionTopicIdError {
-                                        // TODO: update metadata
+                                        self.client.update_full_metadata().await?;
                                     }
                                     continue;
                                 }
@@ -177,6 +183,8 @@ impl<Exe: Executor> Fetcher<Exe> {
                             continue;
                         }
                     }
+                    // TODO: How to ensure that `node.id` will be removed
+                    self.nodes_with_pending_fetch_requests.remove(&node.id);
                 }
             }
             Ok(())
@@ -220,54 +228,58 @@ impl<Exe: Executor> Fetcher<Exe> {
 
         let fetchable_partitions = self.fetchable_partitions().await;
         for tp in fetchable_partitions.iter() {
-            if let Some(position) = self.subscription.read().await.position(tp) {
-                if let Some(node) = position.current_leader.leader {
-                    if self.nodes_with_pending_fetch_requests.contains(&node) {
-                        trace!(
-                            "Skipping fetch for {tp} because previous request to {node} has not \
-                             been processed"
-                        );
-                    } else {
-                        let data = FetchRequestPartitionData {
-                            topic_id: self.client.topic_id(&tp.topic),
-                            fetch_offset: position.offset,
-                            log_start_offset: INVALID_LOG_START_OFFSET,
-                            max_bytes: self.options.max_partition_fetch_bytes,
-                            current_leader_epoch: position.offset_epoch,
-                            last_fetched_epoch: None,
-                        };
-                        match fetchable.get_mut(&node) {
-                            Some(builder) => builder.add(tp.clone(), data),
-                            None => {
-                                if self.sessions.get_mut(&node).is_none() {
-                                    let session = FetchSession::new(node);
-                                    self.sessions.insert(node, session);
-                                }
+            match self.subscription.read().await.position(tp) {
+                Some(position) => match position.current_leader.leader {
+                    Some(node) => {
+                        if self.nodes_with_pending_fetch_requests.contains(&node) {
+                            trace!(
+                                "Skipping fetch for {tp} because previous request to {node} has \
+                                 not been processed"
+                            );
+                        } else {
+                            let data = FetchRequestPartitionData {
+                                topic_id: self.client.topic_id(&tp.topic),
+                                fetch_offset: position.offset,
+                                log_start_offset: INVALID_LOG_START_OFFSET,
+                                max_bytes: self.options.max_partition_fetch_bytes,
+                                current_leader_epoch: position.offset_epoch,
+                                last_fetched_epoch: None,
+                            };
+                            match fetchable.get_mut(&node) {
+                                Some(builder) => builder.add(tp.clone(), data),
+                                None => {
+                                    if self.sessions.get_mut(&node).is_none() {
+                                        let session = FetchSession::new(node);
+                                        self.sessions.insert(node, session);
+                                    }
 
-                                let mut builder = FetchRequestDataBuilder::new();
-                                builder.add(tp.clone(), data);
-                                fetchable.insert(node, builder);
-                                debug!(
-                                    "Added {:?} fetch request for {tp} at position {} to node \
-                                     {node}",
-                                    self.options.isolation_level, position.offset
-                                );
+                                    let mut builder = FetchRequestDataBuilder::new();
+                                    builder.add(tp.clone(), data);
+                                    fetchable.insert(node, builder);
+                                    debug!(
+                                        "Added {:?} fetch request for {tp} at position {} to node \
+                                         {node}",
+                                        self.options.isolation_level, position.offset
+                                    );
+                                }
                             }
                         }
                     }
-                } else {
-                    debug!(
-                        "Requesting metadata update for {} since the position {:?} is missing the \
-                         current leader node",
-                        tp, position
-                    );
-                    // TODO: metadata update
-                    continue;
+                    None => {
+                        debug!(
+                            "Requesting metadata update for {} since the position {:?} is missing \
+                             the current leader node",
+                            tp, position
+                        );
+                        self.client.update_full_metadata().await?;
+                        continue;
+                    }
+                },
+                None => {
+                    return Err(Error::Custom(format!(
+                        "Missing position for fetchable {tp}"
+                    )))
                 }
-            } else {
-                return Err(Error::Custom(format!(
-                    "Missing position for fetchable {tp}"
-                )));
             }
         }
 
@@ -313,7 +325,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                         list_offset_result.partitions_to_retry,
                         self.timestamp + self.options.retry_backoff_ms,
                     );
-                    // TODO: update metadata
+                    self.client.update_full_metadata().await?;
                 }
 
                 for (tp, list_offsets_data) in list_offset_result.fetched_offsets {

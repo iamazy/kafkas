@@ -292,6 +292,7 @@ impl<Exe: Executor> Consumer<Exe> {
         )))?;
 
         Ok(fetch_stream(
+            self.client.clone(),
             self.options.clone(),
             self.fetches_rx.take().unwrap(),
             self.coordinator.subscriptions().await,
@@ -327,7 +328,8 @@ async fn do_fetch<Exe: Executor>(mut fetcher: Fetcher<Exe>, mut rx: broadcast::R
     info!("Fetch task finished.");
 }
 
-fn fetch_stream(
+fn fetch_stream<Exe: Executor>(
+    client: Kafka<Exe>,
     options: Arc<ConsumerOptions>,
     mut completed_fetches_rx: mpsc::UnboundedReceiver<CompletedFetch>,
     subscription: Arc<RwLock<SubscriptionState>>,
@@ -344,6 +346,7 @@ fn fetch_stream(
                 .get_mut(&completed_fetch.partition)
             {
                 let records_fut = handle_partition_response(
+                    &client,
                     &mut reset_offset_tx,
                     completed_fetch,
                     &options,
@@ -373,7 +376,8 @@ fn fetch_stream(
     }
 }
 
-async fn handle_partition_response(
+async fn handle_partition_response<Exe: Executor>(
+    client: &Kafka<Exe>,
     reset_offset_tx: &mut mpsc::UnboundedSender<()>,
     completed_fetch: CompletedFetch,
     options: &Arc<ConsumerOptions>,
@@ -390,28 +394,28 @@ async fn handle_partition_response(
             | error @ ResponseError::OffsetNotAvailable,
         ) => {
             debug!("Error in fetch for {}: {error}", completed_fetch.partition);
-            // TODO: update metadata
+            client.update_full_metadata().await?;
         }
         Some(ResponseError::UnknownTopicOrPartition) => {
             warn!(
                 "Received unknown topic or partition error in fetch for {}",
                 completed_fetch.partition
             );
-            // TODO: update metadata
+            client.update_full_metadata().await?;
         }
         Some(ResponseError::UnknownTopicId) => {
             warn!(
                 "Received unknown topic ID error in fetch for {}",
                 completed_fetch.partition
             );
-            // TODO: update metadata
+            client.update_full_metadata().await?;
         }
         Some(ResponseError::InconsistentTopicId) => {
             warn!(
                 "Received inconsistent topic ID error in fetch for {}",
                 completed_fetch.partition
             );
-            // TODO: update metadata
+            client.update_full_metadata().await?;
         }
         Some(error @ ResponseError::OffsetOutOfRange) => {
             let error_msg = format!(

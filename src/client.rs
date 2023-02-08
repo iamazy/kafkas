@@ -291,6 +291,14 @@ impl<Exe: Executor> Kafka<Exe> {
             )))
         }
     }
+
+    pub async fn update_full_metadata(&self) -> Result<()> {
+        let mut topics = Vec::with_capacity(self.cluster_meta.topics.len());
+        for topic in self.cluster_meta.topics.iter() {
+            topics.push(topic.key().clone());
+        }
+        self.update_metadata(topics).await
+    }
 }
 
 impl<Exe: Executor> Kafka<Exe> {
