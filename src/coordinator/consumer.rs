@@ -237,7 +237,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.commit_offset_tx = Some(commit_offset_tx);
         let weak_inner = Arc::downgrade(&self.inner);
         let mut shutdown = self.notify_shutdown.subscribe();
-        let spawn_ret = self.client.executor.spawn(Box::pin(async move {
+        self.client.executor.spawn(Box::pin(async move {
             while commit_offset_rx.next().await.is_some() {
                 match weak_inner.upgrade() {
                     Some(strong_inner) => {
@@ -260,14 +260,8 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                 }
             }
             info!("async commit offset task finished.");
-        }));
-
-        return match spawn_ret {
-            Ok(_) => Ok(()),
-            Err(_) => Err(Error::Custom(format!(
-                "The executor could not spawn the async commit offset task",
-            ))),
-        };
+        }))?;
+        Ok(())
     }
 }
 
@@ -657,13 +651,9 @@ impl<Exe: Executor> Inner<Exe> {
                 self.subscriptions.read().await.partitions(),
             );
             let metadata = subscription.serialize_to_bytes()?;
-            protocols.insert(
-                assignor.name().to_string().to_str_bytes(),
-                JoinGroupRequestProtocol {
-                    metadata,
-                    ..Default::default()
-                },
-            );
+            let mut protocol = JoinGroupRequestProtocol::default();
+            protocol.metadata = metadata;
+            protocols.insert(assignor.name().to_string().to_str_bytes(), protocol);
         }
         Ok(protocols)
     }
@@ -709,11 +699,9 @@ impl<Exe: Executor> Inner<Exe> {
     }
 
     fn leave_group_builder(&self) -> Result<LeaveGroupRequest> {
-        let request = LeaveGroupRequest {
-            group_id: self.group_meta.group_id.clone(),
-            member_id: self.group_meta.member_id.clone(),
-            ..Default::default()
-        };
+        let mut request = LeaveGroupRequest::default();
+        request.group_id = self.group_meta.group_id.clone();
+        request.member_id = self.group_meta.member_id.clone();
 
         // let mut members = Vec::new();
         // let member = MemberIdentity {
@@ -770,11 +758,10 @@ impl<Exe: Executor> Inner<Exe> {
             let mut topics = Vec::with_capacity(self.subscriptions.read().await.topics.len());
             for assign in self.subscriptions.read().await.topics.iter() {
                 let partitions = self.client.cluster_meta.partitions(assign)?;
-                let topic = OffsetFetchRequestTopic {
-                    name: assign.clone(),
-                    partition_indexes: partitions.value().clone(),
-                    ..Default::default()
-                };
+
+                let mut topic = OffsetFetchRequestTopic::default();
+                topic.name = assign.clone();
+                topic.partition_indexes = partitions.value().clone();
                 topics.push(topic);
             }
             request.group_id = self.group_meta.group_id.clone();
@@ -783,19 +770,16 @@ impl<Exe: Executor> Inner<Exe> {
             let mut topics = Vec::with_capacity(self.subscriptions.read().await.topics.len());
             for assign in self.subscriptions.read().await.topics.iter() {
                 let partitions = self.client.cluster_meta.partitions(assign)?;
-                let topic = OffsetFetchRequestTopics {
-                    name: assign.clone(),
-                    partition_indexes: partitions.value().clone(),
-                    ..Default::default()
-                };
+
+                let mut topic = OffsetFetchRequestTopics::default();
+                topic.name = assign.clone();
+                topic.partition_indexes = partitions.value().clone();
                 topics.push(topic);
             }
 
-            let group = OffsetFetchRequestGroup {
-                group_id: self.group_meta.group_id.clone(),
-                topics: Some(topics),
-                ..Default::default()
-            };
+            let mut group = OffsetFetchRequestGroup::default();
+            group.group_id = self.group_meta.group_id.clone();
+            group.topics = Some(topics);
             request.groups = vec![group];
         }
 
@@ -806,19 +790,15 @@ impl<Exe: Executor> Inner<Exe> {
         &self,
         all_consumed: HashMap<TopicPartition, OffsetMetadata>,
     ) -> Result<OffsetCommitRequest> {
-        let mut request = OffsetCommitRequest::default();
-
         let mut topics: HashMap<TopicName, Vec<OffsetCommitRequestPartition>> =
             HashMap::with_capacity(self.subscriptions.read().await.topics.len());
         for (tp, meta) in all_consumed.iter() {
-            let partition = OffsetCommitRequestPartition {
-                partition_index: tp.partition,
-                committed_offset: meta.committed_offset,
-                committed_leader_epoch: meta.committed_leader_epoch.unwrap_or(-1),
-                commit_timestamp: -1,
-                committed_metadata: meta.metadata.clone(),
-                ..Default::default()
-            };
+            let mut partition = OffsetCommitRequestPartition::default();
+            partition.partition_index = tp.partition;
+            partition.committed_offset = meta.committed_offset;
+            partition.committed_leader_epoch = meta.committed_leader_epoch.unwrap_or(-1);
+            partition.commit_timestamp = -1;
+            partition.committed_metadata = meta.metadata.clone();
 
             match topics.get_mut(&tp.topic) {
                 Some(partitions) => partitions.push(partition),
@@ -831,13 +811,13 @@ impl<Exe: Executor> Inner<Exe> {
 
         let mut offset_commit_topics = Vec::with_capacity(topics.len());
         for (topic, partitions) in topics {
-            offset_commit_topics.push(OffsetCommitRequestTopic {
-                name: topic,
-                partitions,
-                ..Default::default()
-            })
+            let mut request_topic = OffsetCommitRequestTopic::default();
+            request_topic.name = topic;
+            request_topic.partitions = partitions;
+            offset_commit_topics.push(request_topic);
         }
 
+        let mut request = OffsetCommitRequest::default();
         request.topics = offset_commit_topics;
 
         let mut generation = self.group_meta.generation_id;
@@ -920,21 +900,21 @@ fn serialize_assignments(
     for (member_id, assignment) in assignments {
         let mut assigned_partitions = IndexMap::with_capacity(assignment.partitions.len());
         for (topic, partitions) in assignment.partitions {
-            assigned_partitions.insert(topic, CpaTopicPartition { partitions });
+            let mut tp = CpaTopicPartition::default();
+            tp.partitions = partitions;
+            assigned_partitions.insert(topic, tp);
         }
-        let assignment = to_version_prefixed_bytes(
-            version,
-            ConsumerProtocolAssignment {
-                assigned_partitions,
-                user_data: assignment.user_data,
-            },
-        )?;
 
-        sync_group_assignments.push(SyncGroupRequestAssignment {
-            member_id,
-            assignment,
-            ..Default::default()
-        });
+        let mut assignment = ConsumerProtocolAssignment::default();
+        assignment.assigned_partitions = assigned_partitions;
+        assignment.user_data = assignment.user_data;
+
+        let assignment = to_version_prefixed_bytes(version, assignment)?;
+
+        let mut request_assignment = SyncGroupRequestAssignment::default();
+        request_assignment.member_id = member_id;
+        request_assignment.assignment = assignment;
+        sync_group_assignments.push(request_assignment);
     }
     Ok(sync_group_assignments)
 }

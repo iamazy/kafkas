@@ -144,14 +144,15 @@ impl Subscription {
         });
         let mut owned_partitions = IndexMap::with_capacity(self.topics.len());
         for (topic, partitions) in self.owned_partitions {
-            owned_partitions.insert(topic, TopicPartition { partitions });
+            let mut tp = TopicPartition::default();
+            tp.partitions = partitions;
+            owned_partitions.insert(topic, tp);
         }
 
-        let protocol_subscription = ConsumerProtocolSubscription {
-            topics,
-            user_data: self.user_data,
-            owned_partitions,
-        };
+        let mut protocol_subscription = ConsumerProtocolSubscription::default();
+        protocol_subscription.topics = topics;
+        protocol_subscription.user_data = self.user_data;
+        protocol_subscription.owned_partitions = owned_partitions;
 
         to_version_prefixed_bytes(version, protocol_subscription)
     }

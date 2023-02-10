@@ -245,7 +245,7 @@ impl<Exe: Executor> Connection<Exe> {
                 return Err(ConnectionError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "timeout connecting to the kafka server.",
-                )))
+                )));
             }
         };
 
@@ -362,11 +362,10 @@ impl<Exe: Executor> Connection<Exe> {
     const PKG_NAME: &'static str = env!("CARGO_PKG_NAME");
 
     async fn api_version(&self) -> Result<(), ConnectionError> {
-        let request = ApiVersionsRequest {
-            client_software_name: Self::PKG_NAME.to_string().to_str_bytes(),
-            client_software_version: Self::PKG_VERSION.to_string().to_str_bytes(),
-            ..Default::default()
-        };
+        let mut request = ApiVersionsRequest::default();
+        request.client_software_name = Self::PKG_NAME.to_string().to_str_bytes();
+        request.client_software_version = Self::PKG_VERSION.to_string().to_str_bytes();
+
         let request = RequestKind::ApiVersionsRequest(request);
         self.sender().send(request).await?;
         Ok(())

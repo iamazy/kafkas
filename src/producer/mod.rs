@@ -290,12 +290,11 @@ impl<Exe: Executor> Producer<Exe> {
         }
         if let Ok(flush_list) = self.flush(encode_options).await {
             for (node, mut result) in flush_list {
-                let request = ProduceRequest {
-                    topic_data: result.data,
-                    acks: options.acks,
-                    timeout_ms: self.client.manager.options().request_timeout_ms,
-                    ..Default::default()
-                };
+                let mut request = ProduceRequest::default();
+                request.topic_data = result.data;
+                request.acks = options.acks;
+                request.timeout_ms = self.client.manager.options().request_timeout_ms;
+
                 if let Ok(res) = self.client.produce(&node, request).await {
                     for (key, value) in res.responses {
                         if let Some(mut partitions_flush) = result.topics_thunks.remove(&key.0) {
@@ -383,13 +382,9 @@ impl<Exe: Executor> Producer<Exe> {
                         Some(topic_data) => topic_data.partition_data.push(partition_produce_data),
                         None => {
                             let topic_data = vec![partition_produce_data];
-                            topics_data.insert(
-                                partition.topic.clone(),
-                                TopicProduceData {
-                                    partition_data: topic_data,
-                                    ..Default::default()
-                                },
-                            );
+                            let mut produce_data = TopicProduceData::default();
+                            produce_data.partition_data = topic_data;
+                            topics_data.insert(partition.topic.clone(), produce_data);
                         }
                     }
 
@@ -425,14 +420,10 @@ impl<Exe: Executor> Producer<Exe> {
         if !records.is_empty() {
             let mut buf = BytesMut::new();
             RecordBatchEncoder::encode(&mut buf, records.iter(), encode_options)?;
-            return Ok(Some((
-                thunks,
-                PartitionProduceData {
-                    index: partition,
-                    records: Some(buf.freeze()),
-                    ..Default::default()
-                },
-            )));
+            let mut produce_data = PartitionProduceData::default();
+            produce_data.index = partition;
+            produce_data.records = Some(buf.freeze());
+            return Ok(Some((thunks, produce_data)));
         }
         Ok(None)
     }

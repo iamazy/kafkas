@@ -273,10 +273,8 @@ impl<Exe: Executor> Kafka<Exe> {
         let mut request = MetadataRequest::default();
         let mut metadata_topics = Vec::with_capacity(topics.len());
         for topic_name in topics {
-            let metadata_topic = MetadataRequestTopic {
-                name: Some(topic_name),
-                ..Default::default()
-            };
+            let mut metadata_topic = MetadataRequestTopic::default();
+            metadata_topic.name = Some(topic_name);
             metadata_topics.push(metadata_topic);
         }
 
@@ -306,11 +304,9 @@ impl<Exe: Executor> Kafka<Exe> {
     const PKG_NAME: &'static str = env!("CARGO_PKG_NAME");
 
     pub fn api_version_builder() -> Result<ApiVersionsRequest> {
-        let request = ApiVersionsRequest {
-            client_software_name: Self::PKG_NAME.to_string().to_str_bytes(),
-            client_software_version: Self::PKG_VERSION.to_string().to_str_bytes(),
-            ..Default::default()
-        };
+        let mut request = ApiVersionsRequest::default();
+        request.client_software_name = Self::PKG_NAME.to_string().to_str_bytes();
+        request.client_software_version = Self::PKG_VERSION.to_string().to_str_bytes();
         Ok(request)
     }
 }
