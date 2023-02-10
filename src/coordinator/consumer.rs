@@ -6,9 +6,10 @@ use std::{
 
 use async_lock::RwLock;
 use futures::{
+    channel::mpsc::{unbounded, UnboundedSender},
     future::{select, Either},
     lock::Mutex,
-    pin_mut, StreamExt,
+    pin_mut, SinkExt, StreamExt,
 };
 use indexmap::IndexMap;
 use kafka_protocol::{
@@ -39,7 +40,9 @@ use crate::{
             Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, Subscription,
             SUPPORTED_PARTITION_ASSIGNORS,
         },
-        subscription_state::{SubscriptionState, TopicPartitionState},
+        subscription_state::{
+            OffsetMetadata, SubscriptionState, SubscriptionType, TopicPartitionState,
+        },
         ConsumerGroupMetadata, ConsumerOptions,
     },
     coordinator::{find_coordinator, CoordinatorType},
@@ -133,7 +136,7 @@ macro_rules! coordinator_task {
         }
     };
 }
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum MemberState {
     // the client is not part of a group
     UnJoined,
@@ -149,6 +152,7 @@ pub struct ConsumerCoordinator<Exe: Executor> {
     client: Kafka<Exe>,
     inner: Arc<Mutex<Inner<Exe>>>,
     options: Arc<ConsumerOptions>,
+    commit_offset_tx: Option<UnboundedSender<()>>,
     notify_shutdown: broadcast::Sender<()>,
 }
 
@@ -166,6 +170,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             client,
             options,
             notify_shutdown: notify,
+            commit_offset_tx: None,
         })
     }
 
@@ -193,11 +198,13 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.inner.lock().await.offset_fetch().await
     }
 
-    pub async fn offset_commit(&mut self) -> Result<()> {
-        self.inner.lock().await.offset_commit().await
+    pub async fn offset_async(&mut self) {
+        if let Some(ref mut tx) = self.commit_offset_tx {
+            let _ = tx.send(()).await;
+        }
     }
 
-    pub async fn prepare_fetch(&self) -> Result<()> {
+    pub async fn prepare_fetch(&mut self) -> Result<()> {
         self.join_group().await?;
         self.sync_group().await?;
         self.offset_fetch().await?;
@@ -206,11 +213,61 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             // auto commit offset
             let interval_ms = self.options.auto_commit_interval_ms;
             coordinator_task!(self, interval_ms, offset_commit);
+            info!(
+                "Auto commit offset task is started, which group is {}.",
+                self.options.group_id
+            );
+        } else {
+            self.async_commit_offset().await?;
         }
         // heartbeat
         let interval_ms = self.options.rebalance_options.heartbeat_interval_ms;
         coordinator_task!(self, interval_ms, heartbeat);
+        info!(
+            "Heartbeat task is started, which group is {}.",
+            self.options.group_id
+        );
         Ok(())
+    }
+}
+
+impl<Exe: Executor> ConsumerCoordinator<Exe> {
+    async fn async_commit_offset(&mut self) -> Result<()> {
+        let (commit_offset_tx, mut commit_offset_rx) = unbounded();
+        self.commit_offset_tx = Some(commit_offset_tx);
+        let weak_inner = Arc::downgrade(&self.inner);
+        let mut shutdown = self.notify_shutdown.subscribe();
+        let spawn_ret = self.client.executor.spawn(Box::pin(async move {
+            while commit_offset_rx.next().await.is_some() {
+                match weak_inner.upgrade() {
+                    Some(strong_inner) => {
+                        let mut lock = strong_inner.lock().await;
+                        let offset_commit = lock.offset_commit();
+                        let shutdown = shutdown.recv();
+
+                        pin_mut!(offset_commit);
+                        pin_mut!(shutdown);
+
+                        match select(offset_commit, shutdown).await {
+                            Either::Left((Err(err), _)) => {
+                                error!("async commit offset failed, {}", err);
+                            }
+                            Either::Left((Ok(_), _)) => {}
+                            Either::Right(_) => break,
+                        }
+                    }
+                    None => break,
+                }
+            }
+            info!("async commit offset task finished.");
+        }));
+
+        return match spawn_ret {
+            Ok(_) => Ok(()),
+            Err(_) => Err(Error::Custom(format!(
+                "The executor could not spawn the async commit offset task",
+            ))),
+        };
     }
 }
 
@@ -232,8 +289,9 @@ impl<Exe: Executor> Inner<Exe> {
         let node = find_coordinator(&client, group_id.clone(), CoordinatorType::Group).await?;
 
         info!(
-            "Find coordinator success, group {:?}, node: {:?}",
-            group_id, node
+            "Find coordinator success, group {:?}, node: {}",
+            group_id,
+            node.address()
         );
 
         // TODO: check consumer options
@@ -262,6 +320,7 @@ impl<Exe: Executor> Inner<Exe> {
             .await
             .topics
             .extend(topics.clone());
+        self.subscriptions.write().await.subscription_type = SubscriptionType::AutoTopics;
         // TODO: remove it
         self.client.update_metadata(topics).await?;
         Ok(())
@@ -476,28 +535,30 @@ impl<Exe: Executor> Inner<Exe> {
     }
 
     pub async fn offset_commit(&mut self) -> Result<()> {
-        if let Some(version_range) = self.client.version_range(ApiKey::OffsetCommitKey) {
-            let offset_commit_response = self
-                .client
-                .offset_commit(
-                    &self.node,
-                    self.offset_commit_builder(version_range.max).await?,
-                )
-                .await?;
-            for topic in offset_commit_response.topics {
-                for partition in topic.partitions {
-                    if !partition.error_code.is_ok() {
-                        error!(
-                            "Failed to commit offset for partition {}",
-                            partition.partition_index
-                        );
-                    }
+        let all_consumed = self.subscriptions.read().await.all_consumed();
+        if all_consumed.is_empty() {
+            return Ok(());
+        }
+
+        let offset_commit_request = self.offset_commit_builder(all_consumed).await?;
+        debug!("Send offset commit request: {:?}", offset_commit_request);
+
+        let offset_commit_response = self
+            .client
+            .offset_commit(&self.node, offset_commit_request)
+            .await?;
+
+        for topic in offset_commit_response.topics {
+            for partition in topic.partitions {
+                if let Some(err) = partition.error_code.err() {
+                    error!(
+                        "Failed to commit offset for partition {}, error: {err}",
+                        partition.partition_index
+                    );
                 }
             }
-            Ok(())
-        } else {
-            Err(Error::InvalidApiRequest(ApiKey::OffsetCommitKey))
         }
+        Ok(())
     }
 
     pub async fn heartbeat(&mut self) -> Result<()> {
@@ -574,6 +635,11 @@ impl<Exe: Executor> Inner<Exe> {
 
 /// for request builder and response handler
 impl<Exe: Executor> Inner<Exe> {
+    fn rebalance_in_progress(&self) -> bool {
+        self.state == MemberState::PreparingRebalance
+            || self.state == MemberState::CompletingRebalance
+    }
+
     async fn join_group_protocol(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
         let topics = self
             .subscriptions
@@ -736,56 +802,86 @@ impl<Exe: Executor> Inner<Exe> {
         Ok(request)
     }
 
-    pub async fn offset_commit_builder(&self, version: i16) -> Result<OffsetCommitRequest> {
+    pub async fn offset_commit_builder(
+        &self,
+        all_consumed: HashMap<TopicPartition, OffsetMetadata>,
+    ) -> Result<OffsetCommitRequest> {
         let mut request = OffsetCommitRequest::default();
-        if version <= 8 {
-            request.group_id = self.group_meta.group_id.clone();
 
-            let mut topics: HashMap<TopicName, Vec<OffsetCommitRequestPartition>> =
-                HashMap::with_capacity(self.subscriptions.read().await.topics.len());
-            let all_consumed = self.subscriptions.read().await.all_consumed();
-            for (tp, meta) in all_consumed.iter() {
-                let partition = OffsetCommitRequestPartition {
-                    partition_index: tp.partition,
-                    committed_offset: meta.committed_offset,
-                    committed_leader_epoch: meta.committed_leader_epoch.unwrap_or(-1),
-                    commit_timestamp: -1,
-                    committed_metadata: meta.metadata.clone(),
-                    ..Default::default()
-                };
+        let mut topics: HashMap<TopicName, Vec<OffsetCommitRequestPartition>> =
+            HashMap::with_capacity(self.subscriptions.read().await.topics.len());
+        for (tp, meta) in all_consumed.iter() {
+            let partition = OffsetCommitRequestPartition {
+                partition_index: tp.partition,
+                committed_offset: meta.committed_offset,
+                committed_leader_epoch: meta.committed_leader_epoch.unwrap_or(-1),
+                commit_timestamp: -1,
+                committed_metadata: meta.metadata.clone(),
+                ..Default::default()
+            };
 
-                if let Some(partitions) = topics.get_mut(&tp.topic) {
-                    partitions.push(partition);
-                } else {
+            match topics.get_mut(&tp.topic) {
+                Some(partitions) => partitions.push(partition),
+                None => {
                     let partitions = vec![partition];
                     topics.insert(tp.topic.clone(), partitions);
                 }
             }
-
-            let mut offset_commit_topics = Vec::with_capacity(topics.len());
-            for (topic, partitions) in topics {
-                offset_commit_topics.push(OffsetCommitRequestTopic {
-                    name: topic,
-                    partitions,
-                    ..Default::default()
-                })
-            }
-
-            request.topics = offset_commit_topics;
-
-            if version >= 1 {
-                request.generation_id = self.group_meta.generation_id;
-                request.member_id = self.group_meta.member_id.clone();
-            }
-
-            if version >= 7 {
-                request.group_instance_id = self.group_meta.group_instance_id.clone();
-            }
-
-            if (2..=4).contains(&version) {
-                request.retention_time_ms = -1;
-            }
         }
+
+        let mut offset_commit_topics = Vec::with_capacity(topics.len());
+        for (topic, partitions) in topics {
+            offset_commit_topics.push(OffsetCommitRequestTopic {
+                name: topic,
+                partitions,
+                ..Default::default()
+            })
+        }
+
+        request.topics = offset_commit_topics;
+
+        let mut generation = self.group_meta.generation_id;
+        let mut member = self.group_meta.member_id.clone();
+        if self
+            .subscriptions
+            .read()
+            .await
+            .has_auto_assigned_partitions()
+        {
+            // if the generation is null, we are not part of an active group (and we expect to be).
+            // the only thing we can do is fail the commit and let the user rejoin the group in
+            // poll().
+            if self.state != MemberState::Stable {
+                info!(
+                    "Failing OffsetCommit request since the consumer is not part of an active \
+                     group"
+                );
+                return if self.rebalance_in_progress() {
+                    Err(Error::Custom(
+                        "Offset commit cannot be completed since the consumer is undergoing a \
+                         rebalance for auto partition assignment. You can try completing the \
+                         rebalance by calling poll() and then retry the operation."
+                            .into(),
+                    ))
+                } else {
+                    Err(Error::Custom(
+                        "Offset commit cannot be completed since the consumer is not part of an \
+                         active group for auto partition assignment; it is likely that the \
+                         consumer was kicked out of the group."
+                            .into(),
+                    ))
+                };
+            }
+        } else {
+            generation = DEFAULT_GENERATION_ID;
+            member = StrBytes::from_str("");
+        }
+
+        request.group_id = self.group_meta.group_id.clone();
+        request.generation_id = generation;
+        request.member_id = member;
+        request.group_instance_id = self.group_meta.group_instance_id.clone();
+        request.retention_time_ms = -1;
 
         Ok(request)
     }

@@ -115,10 +115,10 @@ impl Default for ConsumerOptions {
     fn default() -> Self {
         Self {
             max_poll_records: 500,
-            max_poll_interval_ms: 300000,
-            auto_commit_interval_ms: 5000,
+            max_poll_interval_ms: 300_000,
+            auto_commit_interval_ms: 5_000,
             auto_commit_enabled: true,
-            request_timeout_ms: 30000,
+            request_timeout_ms: 30_000,
             check_crcs: false,
             fetch_min_bytes: 1,
             fetch_max_bytes: 52428800, // 50 * 1024 * 1024,
@@ -152,7 +152,7 @@ impl Default for RebalanceOptions {
         Self {
             session_timeout_ms: 30_000,
             rebalance_timeout_ms: 300_000,
-            heartbeat_interval_ms: 3000,
+            heartbeat_interval_ms: 3_000,
             retry_backoff_ms: 100,
             leave_group_on_close: true,
         }
@@ -259,14 +259,14 @@ impl<Exe: Executor> Consumer<Exe> {
             .insert(partition, offset);
     }
 
-    pub async fn commit_ack(&mut self) -> Result<()> {
-        self.coordinator.offset_commit().await
+    pub async fn commit_async(&mut self) {
+        self.coordinator.offset_async().await
     }
 
     pub async fn subscribe<S: AsRef<str>>(
         &mut self,
         topics: Vec<S>,
-    ) -> Result<impl Stream<Item = Record>> {
+    ) -> Result<impl Stream<Item = Vec<Record>>> {
         self.coordinator
             .subscribe(
                 topics
@@ -336,7 +336,7 @@ fn fetch_stream<Exe: Executor>(
     completed_partitions: Arc<DashSet<TopicPartition>>,
     mut reset_offset_tx: mpsc::UnboundedSender<()>,
     mut shutdown_rx: broadcast::Receiver<()>,
-) -> impl Stream<Item = Record> {
+) -> impl Stream<Item = Vec<Record>> {
     stream! {
         while let Some(completed_fetch) = completed_fetches_rx.next().await {
             if let Some(partition_state) = subscription
@@ -360,9 +360,7 @@ fn fetch_stream<Exe: Executor>(
 
                 match select(records_fut, shutdown).await {
                     Either::Left((Ok(Some(records)), _)) => {
-                        for record in records {
-                            yield record;
-                        }
+                        yield records;
                     }
                     Either::Left((Ok(None), _)) => {},
                     Either::Left((Err(err), _)) => error!("Fetch error: {}", err),
