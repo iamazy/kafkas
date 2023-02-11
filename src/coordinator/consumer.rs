@@ -11,6 +11,7 @@ use futures::{
     lock::Mutex,
     pin_mut, SinkExt, StreamExt,
 };
+use heck::ToUpperCamelCase;
 use indexmap::IndexMap;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
@@ -105,6 +106,7 @@ macro_rules! coordinator_task {
 
         let mut shutdown = $self.notify_shutdown.subscribe();
         let res = $self.client.executor.spawn(Box::pin(async move {
+            let task_name = stringify!($task).to_upper_camel_case();
             while interval.next().await.is_some() {
                 match weak_inner.upgrade() {
                     Some(strong_inner) => {
@@ -117,7 +119,7 @@ macro_rules! coordinator_task {
 
                         match select(task, shutdown).await {
                             Either::Left((Err(err), _)) => {
-                                error!("{} failed, {}", stringify!($task), err);
+                                error!("{} failed, {}", task_name, err);
                             }
                             Either::Left((Ok(_), _)) => {}
                             Either::Right(_) => break,
@@ -126,7 +128,7 @@ macro_rules! coordinator_task {
                     None => break,
                 }
             }
-            info!("{} task finished.", stringify!($task));
+            info!("{} task finished.", task_name);
         }));
 
         if res.is_err() {
