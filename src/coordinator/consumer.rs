@@ -18,6 +18,7 @@ use kafka_protocol::{
         consumer_protocol_assignment::TopicPartition as CpaTopicPartition,
         join_group_request::JoinGroupRequestProtocol,
         join_group_response::JoinGroupResponseMember,
+        leave_group_request::MemberIdentity,
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
         offset_fetch_request::{
             OffsetFetchRequestGroup, OffsetFetchRequestTopic, OffsetFetchRequestTopics,
@@ -125,7 +126,7 @@ macro_rules! coordinator_task {
                     None => break,
                 }
             }
-            info!("{} task finished.", stringify!(task));
+            info!("{} task finished.", stringify!($task));
         }));
 
         if res.is_err() {
@@ -194,6 +195,10 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.inner.lock().await.sync_group().await
     }
 
+    pub async fn maybe_leave_group(&self, reason: StrBytes) -> Result<()> {
+        self.inner.lock().await.maybe_leave_group(reason).await
+    }
+
     pub async fn offset_fetch(&self) -> Result<()> {
         self.inner.lock().await.offset_fetch().await
     }
@@ -250,7 +255,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 
                         match select(offset_commit, shutdown).await {
                             Either::Left((Err(err), _)) => {
-                                error!("async commit offset failed, {}", err);
+                                error!("Async commit offset failed, {}", err);
                             }
                             Either::Left((Ok(_), _)) => {}
                             Either::Right(_) => break,
@@ -259,7 +264,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
                     None => break,
                 }
             }
-            info!("async commit offset task finished.");
+            info!("Async commit offset task finished.");
         }))?;
         Ok(())
     }
@@ -404,34 +409,53 @@ impl<Exe: Executor> Inner<Exe> {
         }
     }
 
-    pub async fn leave_group(&mut self) -> Result<()> {
-        let leave_group_response = self
-            .client
-            .leave_group(&self.node, self.leave_group_builder()?)
-            .await?;
+    pub async fn leave_group(&mut self, reason: StrBytes) -> Result<()> {
+        if let Some(version_range) = self.client.version_range(ApiKey::LeaveGroupKey) {
 
-        match leave_group_response.error_code.err() {
-            None => {
-                for member in leave_group_response.members {
-                    if member.error_code.is_ok() {
-                        debug!(
-                            "Member {} leave group {:?} success.",
-                            member.member_id, self.group_meta.group_id
-                        );
-                    } else {
-                        error!(
-                            "Member {} leave group {:?} failed.",
-                            member.member_id, self.group_meta.group_id
-                        );
+            debug!(
+                "Member {} send LeaveGroup request to coordinator {} due to {reason}",
+                self.group_meta.member_id,
+                self.node.address(),
+            );
+
+            let leave_group_request = self.leave_group_builder(version_range.max, reason)?;
+
+            let leave_group_response = self
+                .client
+                .leave_group(&self.node, leave_group_request)
+                .await?;
+
+            match leave_group_response.error_code.err() {
+                None => {
+                    for member in leave_group_response.members {
+                        if member.error_code.is_ok() {
+                            debug!(
+                                "Member {} leave group {} success.",
+                                member.member_id, self.group_meta.group_id.0
+                            );
+                        } else {
+                            error!(
+                                "Member {} leave group {} failed.",
+                                member.member_id, self.group_meta.group_id.0
+                            );
+                        }
                     }
+                    info!(
+                        "Leave group [{}] success, member: {}",
+                        self.group_meta.group_id.0, self.group_meta.member_id
+                    );
+                    Ok(())
                 }
-                info!(
-                    "Leave group {:?} success, member: {}",
-                    self.group_meta.group_id, self.group_meta.member_id
-                );
-                Ok(())
+                Some(error) => {
+                    error!(
+                        "Leave group [{}] failed, error: {error}",
+                        self.group_meta.group_id.0
+                    );
+                    Err(error.into())
+                }
             }
-            Some(error) => Err(error.into()),
+        } else {
+            Err(Error::InvalidApiRequest(ApiKey::LeaveGroupKey))
         }
     }
 
@@ -634,6 +658,26 @@ impl<Exe: Executor> Inner<Exe> {
             || self.state == MemberState::CompletingRebalance
     }
 
+    pub async fn maybe_leave_group(&mut self, reason: StrBytes) -> Result<()> {
+        // Starting from 2.3, only dynamic members will send LeaveGroupRequest to the broker,
+        // consumer with valid group.instance.id is viewed as static member that never sends
+        // LeaveGroup, and the membership expiration is only controlled by session timeout.
+        if self.group_meta.group_instance_id.is_none()
+            && self.state != MemberState::UnJoined
+            && !self.group_meta.member_id.is_empty()
+        {
+            // this is a minimal effort attempt to leave the group. we do not
+            // attempt any resending if the request fails or times out.
+            self.leave_group(reason).await?;
+        }
+
+        self.state = MemberState::UnJoined;
+        self.group_meta.generation_id = DEFAULT_GENERATION_ID;
+        self.group_meta.member_id = StrBytes::default();
+
+        Ok(())
+    }
+
     async fn join_group_protocol(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
         let topics = self
             .subscriptions
@@ -698,19 +742,21 @@ impl<Exe: Executor> Inner<Exe> {
         Ok(request)
     }
 
-    fn leave_group_builder(&self) -> Result<LeaveGroupRequest> {
+    fn leave_group_builder(&self, version: i16, reason: StrBytes) -> Result<LeaveGroupRequest> {
         let mut request = LeaveGroupRequest::default();
-        request.group_id = self.group_meta.group_id.clone();
-        request.member_id = self.group_meta.member_id.clone();
 
-        // let mut members = Vec::new();
-        // let member = MemberIdentity {
-        //     member_id: self.group_meta.member_id.clone(),
-        //     group_instance_id: self.group_meta.group_instance_id.clone(),
-        //     ..Default::default()
-        // };
-        // members.push(member);
-        // builder.members(members);
+        request.group_id = self.group_meta.group_id.clone();
+        if version >= 3 {
+            let mut members = Vec::with_capacity(1);
+            let mut member = MemberIdentity::default();
+            member.member_id = self.group_meta.member_id.clone();
+            member.group_instance_id = self.group_meta.group_instance_id.clone();
+            member.reason = Some(reason);
+            members.push(member);
+            request.members = members;
+        } else {
+            request.member_id = self.group_meta.member_id.clone();
+        }
 
         Ok(request)
     }

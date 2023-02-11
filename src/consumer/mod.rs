@@ -301,6 +301,23 @@ impl<Exe: Executor> Consumer<Exe> {
             self.notify_shutdown.subscribe(),
         ))
     }
+
+    pub async fn unsubscribe(&mut self) -> Result<()> {
+        self.coordinator
+            .maybe_leave_group(StrBytes::from_str(
+                "the consumer unsubscribed from all topics",
+            ))
+            .await?;
+        let _ = self.notify_shutdown.send(());
+        self.subscriptions.write().await.unsubscribe();
+        info!("Unsubscribed all topics or patterns and assigned partitions");
+        Ok(())
+    }
+
+    // pub fn assign(&mut self, partitions: Vec<TopicPartition>) -> Result<impl Stream<Item =
+    // Vec<Record>>> {
+    //
+    // }
 }
 
 impl<Exe: Executor> Drop for Consumer<Exe> {

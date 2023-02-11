@@ -19,6 +19,13 @@ pub struct SubscriptionState {
 }
 
 impl SubscriptionState {
+    pub fn unsubscribe(&mut self) {
+        self.subscription_type = SubscriptionType::None;
+        self.topics.clear();
+        self.assignments.clear();
+        self.seek_offsets.clear();
+    }
+
     pub fn has_auto_assigned_partitions(&self) -> bool {
         self.subscription_type == SubscriptionType::AutoTopics
             || self.subscription_type == SubscriptionType::AutoPattern
