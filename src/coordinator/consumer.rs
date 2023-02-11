@@ -203,7 +203,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.inner.lock().await.offset_fetch().await
     }
 
-    pub async fn offset_async(&mut self) {
+    pub async fn commit_async(&mut self) {
         if let Some(ref mut tx) = self.commit_offset_tx {
             let _ = tx.send(()).await;
         }
