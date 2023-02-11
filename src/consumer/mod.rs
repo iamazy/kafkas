@@ -260,7 +260,7 @@ impl<Exe: Executor> Consumer<Exe> {
     }
 
     pub async fn commit_async(&mut self) {
-        self.coordinator.offset_async().await
+        self.coordinator.commit_async().await
     }
 
     pub async fn subscribe<S: AsRef<str>>(
@@ -524,23 +524,24 @@ async fn reset_offset<Exe: Executor>(
     mut reset_offset_rx: mpsc::UnboundedReceiver<()>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    debug!("Start the reset offset task");
-    while reset_offset_rx.next().await.is_some() {
-        let reset_fut = fetcher.reset_offset();
+    info!("Start the reset offset task.");
+    loop {
+        let next_reset_offset = reset_offset_rx.next();
         let shutdown = shutdown_rx.recv();
 
-        pin_mut!(reset_fut);
+        pin_mut!(next_reset_offset);
         pin_mut!(shutdown);
 
-        match select(reset_fut, shutdown).await {
-            Either::Left((Err(err), _)) => {
-                error!("Reset offset failed, {}", err);
+        match select(next_reset_offset, shutdown).await {
+            Either::Left((Some(_), _)) => {
+                if let Err(err) = fetcher.reset_offset().await {
+                    error!("Reset offset failed, {}", err);
+                }
             }
-            Either::Left(_) => {}
-            Either::Right(_) => {
-                info!("Reset offset task is shutting down");
+            Either::Left((None, _)) | Either::Right(_) => {
                 break;
             }
         }
     }
+    info!("Reset offset task finished.");
 }
