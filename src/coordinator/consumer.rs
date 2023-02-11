@@ -905,11 +905,11 @@ fn serialize_assignments(
             assigned_partitions.insert(topic, tp);
         }
 
-        let mut assignment = ConsumerProtocolAssignment::default();
-        assignment.assigned_partitions = assigned_partitions;
-        assignment.user_data = assignment.user_data;
+        let mut protocol_assignment = ConsumerProtocolAssignment::default();
+        protocol_assignment.assigned_partitions = assigned_partitions;
+        protocol_assignment.user_data = assignment.user_data;
 
-        let assignment = to_version_prefixed_bytes(version, assignment)?;
+        let assignment = to_version_prefixed_bytes(version, protocol_assignment)?;
 
         let mut request_assignment = SyncGroupRequestAssignment::default();
         request_assignment.member_id = member_id;
