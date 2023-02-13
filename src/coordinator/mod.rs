@@ -1,19 +1,27 @@
 mod consumer;
 mod transaction;
 
+use std::sync::Arc;
+
+use async_lock::RwLock;
 pub use consumer::ConsumerCoordinator;
+use futures::channel::oneshot;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
-    messages::{ApiKey, FindCoordinatorRequest},
+    messages::{ApiKey, FindCoordinatorRequest, TopicName},
     protocol::StrBytes,
 };
 use tracing::error;
 
 use crate::{
     client::Kafka,
+    consumer::{
+        subscription_state::{FetchPosition, SubscriptionState},
+        OffsetResetStrategy,
+    },
     error::{ConsumeError, Result},
     executor::Executor,
-    metadata::Node,
+    metadata::{Node, TopicPartition},
     Error,
 };
 
@@ -30,6 +38,34 @@ impl From<CoordinatorType> for i8 {
             CoordinatorType::Transaction => 1,
         }
     }
+}
+
+pub enum CoordinatorEvent {
+    JoinGroup,
+    SyncGroup,
+    LeaveGroup(StrBytes),
+    OffsetFetch,
+    OffsetCommit,
+    ResetOffset {
+        partition: TopicPartition,
+        strategy: OffsetResetStrategy,
+    },
+    Heartbeat,
+    Subscribe(Vec<TopicName>),
+    Unsubscribe,
+    TopicPartitionState {
+        partition: TopicPartition,
+        position: Option<FetchPosition>,
+        last_stable_offset: i64,
+        log_start_offset: i64,
+        high_water_mark: i64,
+    },
+    SeekOffset {
+        partition: TopicPartition,
+        offset: i64,
+    },
+    GetSubscriptionsRef(oneshot::Sender<Arc<RwLock<SubscriptionState>>>),
+    Shutdown,
 }
 
 async fn find_coordinator<Exe: Executor>(

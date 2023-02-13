@@ -17,7 +17,10 @@ pub enum ExecutorKind {
 pub trait Executor: Clone + Send + Sync + 'static {
     /// spawns a new task
     #[allow(clippy::result_unit_err)]
-    fn spawn(&self, f: Pin<Box<dyn Future<Output = ()> + Send>>) -> Result<(), ()>;
+    fn spawn<Res>(&self, f: Pin<Box<dyn Future<Output = Res> + Send>>) -> JoinHandle<Res>
+    where
+        Res: Send + 'static;
+
     /// spawns a new blocking task
     fn spawn_blocking<F, Res>(&self, f: F) -> JoinHandle<Res>
     where
@@ -47,9 +50,11 @@ pub struct TokioExecutor;
 
 #[cfg(feature = "tokio-runtime")]
 impl Executor for TokioExecutor {
-    fn spawn(&self, f: Pin<Box<dyn Future<Output = ()> + Send>>) -> Result<(), ()> {
-        tokio::task::spawn(f);
-        Ok(())
+    fn spawn<Res>(&self, f: Pin<Box<dyn Future<Output = Res> + Send>>) -> JoinHandle<Res>
+    where
+        Res: Send + 'static,
+    {
+        JoinHandle::Tokio(tokio::task::spawn(f))
     }
 
     fn spawn_blocking<F, Res>(&self, f: F) -> JoinHandle<Res>
@@ -87,9 +92,11 @@ pub struct AsyncStdExecutor;
 
 #[cfg(feature = "async-std-runtime")]
 impl Executor for AsyncStdExecutor {
-    fn spawn(&self, f: Pin<Box<dyn Future<Output = ()> + Send>>) -> Result<(), ()> {
-        async_std::task::spawn(f);
-        Ok(())
+    fn spawn<Res>(&self, f: Pin<Box<dyn Future<Output = Res> + Send>>) -> JoinHandle<Res>
+    where
+        Res: Send + 'static,
+    {
+        JoinHandle::AsyncStd(async_std::task::spawn(f))
     }
 
     fn spawn_blocking<F, Res>(&self, f: F) -> JoinHandle<Res>
@@ -122,7 +129,10 @@ impl Executor for AsyncStdExecutor {
 }
 
 impl<Exe: Executor> Executor for Arc<Exe> {
-    fn spawn(&self, f: Pin<Box<dyn Future<Output = ()> + Send>>) -> Result<(), ()> {
+    fn spawn<Res>(&self, f: Pin<Box<dyn Future<Output = Res> + Send>>) -> JoinHandle<Res>
+    where
+        Res: Send + 'static,
+    {
         self.deref().spawn(f)
     }
 

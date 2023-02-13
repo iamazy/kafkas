@@ -5,7 +5,6 @@ pub mod subscription_state;
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use async_lock::RwLock;
 use async_stream::stream;
 use chrono::Local;
 use dashmap::DashSet;
@@ -28,9 +27,9 @@ use crate::{
     client::Kafka,
     consumer::{
         fetcher::{CompletedFetch, Fetcher},
-        subscription_state::{SubscriptionState, TopicPartitionState},
+        subscription_state::{FetchPosition, SubscriptionState},
     },
-    coordinator::ConsumerCoordinator,
+    coordinator::{ConsumerCoordinator, CoordinatorEvent},
     executor::Executor,
     metadata::TopicPartition,
     NodeId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
@@ -210,7 +209,6 @@ pub struct Consumer<Exe: Executor> {
     coordinator: ConsumerCoordinator<Exe>,
     fetcher: Fetcher<Exe>,
     options: Arc<ConsumerOptions>,
-    subscriptions: Arc<RwLock<SubscriptionState>>,
     notify_shutdown: broadcast::Sender<()>,
     fetches_rx: Option<mpsc::UnboundedReceiver<CompletedFetch>>,
 }
@@ -220,7 +218,7 @@ impl<Exe: Executor> Consumer<Exe> {
         let options = Arc::new(options);
 
         let (notify_shutdown, _) = broadcast::channel(1);
-        let coordinator =
+        let mut coordinator =
             ConsumerCoordinator::new(client.clone(), options.clone(), notify_shutdown.clone())
                 .await?;
 
@@ -234,14 +232,11 @@ impl<Exe: Executor> Consumer<Exe> {
             tx,
         );
 
-        let subscriptions = coordinator.subscriptions().await;
-
         Ok(Self {
             client,
             coordinator,
             fetcher,
             options,
-            subscriptions,
             notify_shutdown,
             fetches_rx: Some(rx),
         })
@@ -252,11 +247,11 @@ impl<Exe: Executor> Consumer<Exe> {
             debug!("offset {} is less than 0, which is invalid", offset);
             return;
         }
-        self.subscriptions
-            .write()
-            .await
-            .seek_offsets
-            .insert(partition, offset);
+        let _ = self
+            .coordinator
+            .event_tx
+            .send(CoordinatorEvent::SeekOffset { partition, offset })
+            .await;
     }
 
     pub async fn commit_async(&mut self) {
@@ -274,14 +269,14 @@ impl<Exe: Executor> Consumer<Exe> {
                     .map(|topic| topic.as_ref().to_string().to_str_bytes().into())
                     .collect(),
             )
-            .await?;
+            .await;
         self.coordinator.prepare_fetch().await?;
 
         // fetch records task
         self.client.executor.spawn(Box::pin(do_fetch(
             self.fetcher.clone(),
             self.notify_shutdown.subscribe(),
-        )))?;
+        )));
 
         // reset offset task
         let (reset_offset_tx, reset_offset_rx) = mpsc::unbounded();
@@ -289,13 +284,15 @@ impl<Exe: Executor> Consumer<Exe> {
             self.fetcher.clone(),
             reset_offset_rx,
             self.notify_shutdown.subscribe(),
-        )))?;
+        )));
+
+        let event_tx = self.coordinator.event_tx.clone();
 
         Ok(fetch_stream(
             self.client.clone(),
             self.options.clone(),
+            event_tx,
             self.fetches_rx.take().unwrap(),
-            self.coordinator.subscriptions().await,
             self.fetcher.completed_partitions.clone(),
             reset_offset_tx,
             self.notify_shutdown.subscribe(),
@@ -307,9 +304,13 @@ impl<Exe: Executor> Consumer<Exe> {
             .maybe_leave_group(StrBytes::from_str(
                 "the consumer unsubscribed from all topics",
             ))
-            .await?;
+            .await;
         let _ = self.notify_shutdown.send(());
-        self.subscriptions.write().await.unsubscribe();
+        let _ = self
+            .coordinator
+            .event_tx
+            .send(CoordinatorEvent::Unsubscribe)
+            .await;
         info!("Unsubscribed all topics or patterns and assigned partitions");
         Ok(())
     }
@@ -348,43 +349,36 @@ async fn do_fetch<Exe: Executor>(mut fetcher: Fetcher<Exe>, mut rx: broadcast::R
 fn fetch_stream<Exe: Executor>(
     client: Kafka<Exe>,
     options: Arc<ConsumerOptions>,
+    mut event_tx: mpsc::UnboundedSender<CoordinatorEvent>,
     mut completed_fetches_rx: mpsc::UnboundedReceiver<CompletedFetch>,
-    subscription: Arc<RwLock<SubscriptionState>>,
     completed_partitions: Arc<DashSet<TopicPartition>>,
     mut reset_offset_tx: mpsc::UnboundedSender<()>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> impl Stream<Item = Vec<Record>> {
     stream! {
-        while let Some(completed_fetch) = completed_fetches_rx.next().await {
-            if let Some(partition_state) = subscription
-                .write()
-                .await
-                .assignments
-                .get_mut(&completed_fetch.partition)
-            {
-                let records_fut = handle_partition_response(
-                    &client,
-                    &mut reset_offset_tx,
-                    completed_fetch,
-                    &options,
-                    partition_state,
-                    &completed_partitions,
-                );
-                let shutdown = shutdown_rx.recv();
+    while let Some(completed_fetch) = completed_fetches_rx.next().await {
+        let records_fut = handle_partition_response(
+                &client,
+                &mut reset_offset_tx,
+                completed_fetch,
+                &options,
+                &mut event_tx,
+                &completed_partitions,
+            );
+            let shutdown = shutdown_rx.recv();
 
-                pin_mut!(records_fut);
-                pin_mut!(shutdown);
+            pin_mut!(records_fut);
+            pin_mut!(shutdown);
 
-                match select(records_fut, shutdown).await {
-                    Either::Left((Ok(Some(records)), _)) => {
-                        yield records;
-                    }
-                    Either::Left((Ok(None), _)) => {},
-                    Either::Left((Err(err), _)) => error!("Fetch error: {}", err),
-                    Either::Right(_) => {
-                        info!("Fetch task is shutting down");
-                        break
-                    },
+            match select(records_fut, shutdown).await {
+                Either::Left((Ok(Some(records)), _)) => {
+                    yield records;
+                }
+                Either::Left((Ok(None), _)) => {},
+                Either::Left((Err(err), _)) => error!("Fetch error: {}", err),
+                Either::Right(_) => {
+                    info!("Fetch task is shutting down");
+                    break
                 }
             }
         }
@@ -396,7 +390,7 @@ async fn handle_partition_response<Exe: Executor>(
     reset_offset_tx: &mut mpsc::UnboundedSender<()>,
     completed_fetch: CompletedFetch,
     options: &Arc<ConsumerOptions>,
-    partition_state: &mut TopicPartitionState,
+    event_tx: &mut mpsc::UnboundedSender<CoordinatorEvent>,
     completed_partitions: &Arc<DashSet<TopicPartition>>,
 ) -> Result<Option<Vec<Record>>> {
     let mut partition = completed_fetch.partition_data;
@@ -433,14 +427,16 @@ async fn handle_partition_response<Exe: Executor>(
             client.update_full_metadata().await?;
         }
         Some(error @ ResponseError::OffsetOutOfRange) => {
-            let error_msg = format!(
-                "Fetch position {} is out of range for {}",
-                partition_state.position.offset, completed_fetch.partition
-            );
+            let error_msg = format!("{} is out of range.", completed_fetch.partition);
             let strategy = options.auto_offset_reset;
             if !matches!(strategy, OffsetResetStrategy::None) {
                 info!("{error_msg}, resetting offset");
-                partition_state.reset(strategy)?;
+                let _ = event_tx
+                    .send(CoordinatorEvent::ResetOffset {
+                        partition: completed_fetch.partition.clone(),
+                        strategy,
+                    })
+                    .await;
                 let _ = reset_offset_tx.send(()).await;
                 completed_partitions.remove(&completed_fetch.partition);
             } else {
@@ -475,15 +471,6 @@ async fn handle_partition_response<Exe: Executor>(
             return Err(error.into());
         }
         None => {
-            if partition.last_stable_offset >= 0 {
-                partition_state.last_stable_offset = partition.last_stable_offset;
-            }
-            if partition.log_start_offset >= 0 {
-                partition_state.log_start_offset = partition.log_start_offset;
-            }
-            if partition.high_watermark >= 0 {
-                partition_state.high_water_mark = partition.high_watermark;
-            }
             debug!(
                 "Fetch {} success, last stable offset: {}, log start offset: {}, high_water_mark: \
                  {}",
@@ -492,22 +479,43 @@ async fn handle_partition_response<Exe: Executor>(
                 partition.log_start_offset,
                 partition.high_watermark
             );
+
+            let mut position = None;
             // decode record batch
             if let Some(ref mut records) = partition.records {
                 let records = RecordBatchDecoder::decode(records)?;
                 if let Some(record) = records.last() {
-                    partition_state.position.offset = record.offset;
-                    partition_state.position.current_leader.epoch =
-                        Some(record.partition_leader_epoch);
+                    let mut fetch_position = FetchPosition::new(record.offset, None);
+                    fetch_position.current_leader.epoch = Some(record.partition_leader_epoch);
+                    position = Some(fetch_position);
                 }
                 debug!(
                     "Fetch {} records success, records size: {}",
                     completed_fetch.partition,
                     records.len()
                 );
+                let _ = event_tx
+                    .send(CoordinatorEvent::TopicPartitionState {
+                        partition: completed_fetch.partition.clone(),
+                        position,
+                        log_start_offset: partition.log_start_offset,
+                        last_stable_offset: partition.last_stable_offset,
+                        high_water_mark: partition.high_watermark,
+                    })
+                    .await;
                 completed_partitions.remove(&completed_fetch.partition);
                 return Ok(Some(records));
             }
+
+            let _ = event_tx
+                .send(CoordinatorEvent::TopicPartitionState {
+                    partition: completed_fetch.partition.clone(),
+                    position,
+                    log_start_offset: partition.log_start_offset,
+                    last_stable_offset: partition.last_stable_offset,
+                    high_water_mark: partition.high_watermark,
+                })
+                .await;
         }
         Some(error) => {
             error!(

@@ -6,12 +6,13 @@ use std::{
 
 use async_lock::RwLock;
 use futures::{
-    channel::mpsc::{unbounded, UnboundedSender},
+    channel::{
+        mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
     future::{select, Either},
-    lock::Mutex,
     pin_mut, SinkExt, StreamExt,
 };
-use heck::ToUpperCamelCase;
 use indexmap::IndexMap;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
@@ -47,9 +48,9 @@ use crate::{
         },
         ConsumerGroupMetadata, ConsumerOptions,
     },
-    coordinator::{find_coordinator, CoordinatorType},
+    coordinator::{find_coordinator, CoordinatorEvent, CoordinatorType},
     error::{ConsumeError, Result},
-    executor::Executor,
+    executor::{Executor, JoinHandle},
     metadata::{Node, TopicPartition},
     to_version_prefixed_bytes, Error, MemberId, ToStrBytes, DEFAULT_GENERATION_ID,
 };
@@ -96,47 +97,37 @@ macro_rules! offset_fetch_block {
 }
 
 macro_rules! coordinator_task {
-    ($self:ident, $interval_ms:ident, $task:ident) => {
+    ($self:ident, $interval_ms:ident, $event:ident) => {
         let mut interval = $self
             .client
             .executor
             .interval(Duration::from_millis($interval_ms as u64));
 
-        let weak_inner = Arc::downgrade(&$self.inner);
-
         let mut shutdown = $self.notify_shutdown.subscribe();
-        let res = $self.client.executor.spawn(Box::pin(async move {
-            let task_name = stringify!($task).to_upper_camel_case();
-            while interval.next().await.is_some() {
-                match weak_inner.upgrade() {
-                    Some(strong_inner) => {
-                        let mut lock = strong_inner.lock().await;
-                        let task = lock.$task();
-                        let shutdown = shutdown.recv();
+        let mut event_tx = $self.event_tx.clone();
 
-                        pin_mut!(task);
-                        pin_mut!(shutdown);
+        $self.client.executor.spawn(Box::pin(async move {
+            let task_name = stringify!($event);
 
-                        match select(task, shutdown).await {
-                            Either::Left((Err(err), _)) => {
-                                error!("{} failed, {}", task_name, err);
-                            }
-                            Either::Left((Ok(_), _)) => {}
-                            Either::Right(_) => break,
-                        }
+            loop {
+                let interval_fut = interval.next();
+                let shutdown = shutdown.recv();
+
+                pin_mut!(interval_fut);
+                pin_mut!(shutdown);
+
+                match select(interval_fut, shutdown).await {
+                    Either::Left((Some(_), _)) => {
+                        let _ = event_tx.send(CoordinatorEvent::$event).await;
                     }
-                    None => break,
+                    Either::Left((None, _)) | Either::Right(_) => {
+                        break;
+                    }
                 }
             }
+
             info!("{} task finished.", task_name);
         }));
-
-        if res.is_err() {
-            return Err(Error::Custom(format!(
-                "The executor could not spawn the {} task",
-                stringify!(task)
-            )));
-        }
     };
 }
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -153,7 +144,9 @@ enum MemberState {
 
 pub struct ConsumerCoordinator<Exe: Executor> {
     client: Kafka<Exe>,
-    inner: Arc<Mutex<Inner<Exe>>>,
+    inner: Option<Inner<Exe>>,
+    inner_handle: Option<JoinHandle<Inner<Exe>>>,
+    pub(crate) event_tx: UnboundedSender<CoordinatorEvent>,
     options: Arc<ConsumerOptions>,
     commit_offset_tx: Option<UnboundedSender<()>>,
     notify_shutdown: broadcast::Sender<()>,
@@ -165,11 +158,15 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         options: Arc<ConsumerOptions>,
         notify: broadcast::Sender<()>,
     ) -> Result<ConsumerCoordinator<Exe>> {
-        let inner = Inner::new(client.clone(), options.clone()).await?;
-        let inner = Arc::new(Mutex::new(inner));
+        let (event_tx, event_rx) = unbounded();
+
+        let inner = Inner::new(client.clone(), options.clone(), event_rx).await?;
+        let handle = client.executor.spawn(Box::pin(coordinator_loop(inner)));
 
         Ok(Self {
-            inner,
+            inner: None,
+            inner_handle: Some(handle),
+            event_tx,
             client,
             options,
             notify_shutdown: notify,
@@ -177,32 +174,39 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         })
     }
 
-    pub async fn subscribe(&self, topics: Vec<TopicName>) -> Result<()> {
-        self.inner.lock().await.subscribe(topics).await
+    pub async fn subscribe(&mut self, topics: Vec<TopicName>) {
+        let _ = self
+            .event_tx
+            .send(CoordinatorEvent::Subscribe(topics))
+            .await;
     }
 
-    pub async fn subscriptions(&self) -> Arc<RwLock<SubscriptionState>> {
-        self.inner.lock().await.subscriptions.clone()
+    pub async fn subscriptions(&mut self) -> Arc<RwLock<SubscriptionState>> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .event_tx
+            .send(CoordinatorEvent::GetSubscriptionsRef(tx))
+            .await;
+        rx.await.unwrap()
     }
 
-    pub async fn current_generation(&self) -> i32 {
-        self.inner.lock().await.group_meta.generation_id
+    pub async fn join_group(&mut self) {
+        let _ = self.event_tx.send(CoordinatorEvent::JoinGroup).await;
     }
 
-    pub async fn join_group(&self) -> Result<()> {
-        self.inner.lock().await.join_group().await
+    pub async fn sync_group(&mut self) {
+        let _ = self.event_tx.send(CoordinatorEvent::SyncGroup).await;
     }
 
-    pub async fn sync_group(&self) -> Result<()> {
-        self.inner.lock().await.sync_group().await
+    pub async fn maybe_leave_group(&mut self, reason: StrBytes) {
+        let _ = self
+            .event_tx
+            .send(CoordinatorEvent::LeaveGroup(reason))
+            .await;
     }
 
-    pub async fn maybe_leave_group(&self, reason: StrBytes) -> Result<()> {
-        self.inner.lock().await.maybe_leave_group(reason).await
-    }
-
-    pub async fn offset_fetch(&self) -> Result<()> {
-        self.inner.lock().await.offset_fetch().await
+    pub async fn offset_fetch(&mut self) {
+        let _ = self.event_tx.send(CoordinatorEvent::OffsetFetch).await;
     }
 
     pub async fn commit_async(&mut self) {
@@ -212,14 +216,14 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     }
 
     pub async fn prepare_fetch(&mut self) -> Result<()> {
-        self.join_group().await?;
-        self.sync_group().await?;
-        self.offset_fetch().await?;
+        self.join_group().await;
+        self.sync_group().await;
+        self.offset_fetch().await;
 
         if self.options.auto_commit_enabled {
             // auto commit offset
             let interval_ms = self.options.auto_commit_interval_ms;
-            coordinator_task!(self, interval_ms, offset_commit);
+            coordinator_task!(self, interval_ms, OffsetCommit);
             info!(
                 "Auto commit offset task is started, which group is {}.",
                 self.options.group_id
@@ -229,7 +233,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         }
         // heartbeat
         let interval_ms = self.options.rebalance_options.heartbeat_interval_ms;
-        coordinator_task!(self, interval_ms, heartbeat);
+        coordinator_task!(self, interval_ms, Heartbeat);
         info!(
             "Heartbeat task is started, which group is {}.",
             self.options.group_id
@@ -242,32 +246,27 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     async fn async_commit_offset(&mut self) -> Result<()> {
         let (commit_offset_tx, mut commit_offset_rx) = unbounded();
         self.commit_offset_tx = Some(commit_offset_tx);
-        let weak_inner = Arc::downgrade(&self.inner);
         let mut shutdown = self.notify_shutdown.subscribe();
+        let mut event_tx = self.event_tx.clone();
         self.client.executor.spawn(Box::pin(async move {
-            while commit_offset_rx.next().await.is_some() {
-                match weak_inner.upgrade() {
-                    Some(strong_inner) => {
-                        let mut lock = strong_inner.lock().await;
-                        let offset_commit = lock.offset_commit();
-                        let shutdown = shutdown.recv();
+            loop {
+                let offset_commit = commit_offset_rx.next();
+                let shutdown = shutdown.recv();
 
-                        pin_mut!(offset_commit);
-                        pin_mut!(shutdown);
+                pin_mut!(offset_commit);
+                pin_mut!(shutdown);
 
-                        match select(offset_commit, shutdown).await {
-                            Either::Left((Err(err), _)) => {
-                                error!("Async commit offset failed, {}", err);
-                            }
-                            Either::Left((Ok(_), _)) => {}
-                            Either::Right(_) => break,
-                        }
+                match select(offset_commit, shutdown).await {
+                    Either::Left((Some(_), _)) => {
+                        let _ = event_tx.send(CoordinatorEvent::OffsetCommit).await;
                     }
-                    None => break,
+                    Either::Left((None, _)) | Either::Right(_) => {
+                        break;
+                    }
                 }
             }
             info!("Async commit offset task finished.");
-        }))?;
+        }));
         Ok(())
     }
 }
@@ -275,6 +274,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 struct Inner<Exe: Executor> {
     client: Kafka<Exe>,
     node: Node,
+    event_rx: UnboundedReceiver<CoordinatorEvent>,
     pub group_meta: ConsumerGroupMetadata,
     group_subscription: GroupSubscription,
     consumer_options: Arc<ConsumerOptions>,
@@ -284,7 +284,11 @@ struct Inner<Exe: Executor> {
 }
 
 impl<Exe: Executor> Inner<Exe> {
-    pub async fn new(client: Kafka<Exe>, options: Arc<ConsumerOptions>) -> Result<Inner<Exe>> {
+    pub async fn new(
+        client: Kafka<Exe>,
+        options: Arc<ConsumerOptions>,
+        event_rx: UnboundedReceiver<CoordinatorEvent>,
+    ) -> Result<Inner<Exe>> {
         let group_id = options.group_id.clone().to_str_bytes();
 
         let node = find_coordinator(&client, group_id.clone(), CoordinatorType::Group).await?;
@@ -306,6 +310,7 @@ impl<Exe: Executor> Inner<Exe> {
         Ok(Self {
             client,
             node,
+            event_rx,
             subscriptions: Arc::new(RwLock::new(SubscriptionState::default())),
             group_meta: ConsumerGroupMetadata::new(group_id.into()),
             group_subscription: GroupSubscription::default(),
@@ -413,7 +418,6 @@ impl<Exe: Executor> Inner<Exe> {
 
     pub async fn leave_group(&mut self, reason: StrBytes) -> Result<()> {
         if let Some(version_range) = self.client.version_range(ApiKey::LeaveGroupKey) {
-
             debug!(
                 "Member {} send LeaveGroup request to coordinator {} due to {reason}",
                 self.group_meta.member_id,
@@ -927,6 +931,101 @@ impl<Exe: Executor> Inner<Exe> {
         }
         Ok(request)
     }
+}
+
+async fn coordinator_loop<Exe: Executor>(mut coordinator: Inner<Exe>) -> Inner<Exe> {
+    while let Some(event) = coordinator.event_rx.next().await {
+        match event {
+            CoordinatorEvent::JoinGroup => {
+                let _ = coordinator.join_group().await;
+            }
+            CoordinatorEvent::SyncGroup => {
+                let _ = coordinator.sync_group().await;
+            }
+            CoordinatorEvent::LeaveGroup(reason) => {
+                let _ = coordinator.maybe_leave_group(reason).await;
+            }
+            CoordinatorEvent::OffsetFetch => {
+                let _ = coordinator.offset_fetch().await;
+            }
+            CoordinatorEvent::OffsetCommit => {
+                let _ = coordinator.offset_commit().await;
+            }
+            CoordinatorEvent::SeekOffset { partition, offset } => {
+                let _ = coordinator
+                    .subscriptions
+                    .write()
+                    .await
+                    .seek_offsets
+                    .insert(partition, offset);
+            }
+            CoordinatorEvent::ResetOffset {
+                partition,
+                strategy,
+            } => {
+                if let Some(tp_state) = coordinator
+                    .subscriptions
+                    .write()
+                    .await
+                    .assignments
+                    .get_mut(&partition)
+                {
+                    if let Err(err) = tp_state.reset(strategy) {
+                        error!("{err}");
+                    }
+                }
+            }
+            CoordinatorEvent::Heartbeat => {
+                let _ = coordinator.heartbeat().await;
+            }
+            CoordinatorEvent::Subscribe(topics) => {
+                let _ = coordinator.subscribe(topics).await;
+            }
+            CoordinatorEvent::Unsubscribe => {
+                coordinator.subscriptions.write().await.unsubscribe();
+            }
+            CoordinatorEvent::TopicPartitionState {
+                partition,
+                position,
+                log_start_offset,
+                last_stable_offset,
+                high_water_mark,
+            } => {
+                if let Some(tp_state) = coordinator
+                    .subscriptions
+                    .write()
+                    .await
+                    .assignments
+                    .get_mut(&partition)
+                {
+                    if let Some(position) = position {
+                        tp_state.position.offset = position.offset;
+                        tp_state.position.offset_epoch = position.offset_epoch;
+
+                        if let Some(epoch) = position.current_leader.epoch {
+                            tp_state.position.current_leader.epoch = Some(epoch);
+                        }
+                    }
+
+                    if log_start_offset >= 0 {
+                        tp_state.log_start_offset = log_start_offset;
+                    }
+                    if last_stable_offset >= 0 {
+                        tp_state.last_stable_offset = last_stable_offset;
+                    }
+                    if high_water_mark >= 0 {
+                        tp_state.high_water_mark = high_water_mark;
+                    }
+                }
+            }
+            CoordinatorEvent::GetSubscriptionsRef(tx) => {
+                let subscriptions = coordinator.subscriptions.clone();
+                let _ = tx.send(subscriptions);
+            }
+            CoordinatorEvent::Shutdown => break,
+        }
+    }
+    coordinator
 }
 
 fn deserialize_member(members: Vec<JoinGroupResponseMember>) -> Result<GroupSubscription> {
