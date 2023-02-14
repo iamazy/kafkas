@@ -529,8 +529,8 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                         self.group_meta.leader,
                         self.group_meta.member_id,
                         self.group_meta.generation_id,
-                        self.group_meta.protocol_type.as_ref(),
-                        self.group_meta.protocol_name.as_ref(),
+                        self.group_meta.protocol_type.as_ref().unwrap(),
+                        self.group_meta.protocol_name.as_ref().unwrap(),
                     );
                     Ok(())
                 }
