@@ -118,7 +118,9 @@ macro_rules! coordinator_task {
 
                 match select(interval_fut, shutdown).await {
                     Either::Left((Some(_), _)) => {
-                        let _ = event_tx.send(CoordinatorEvent::$event).await;
+                        if let Err(err) = event_tx.send(CoordinatorEvent::$event).await {
+                            error!("{task_name} error: {err}");
+                        }
                     }
                     Either::Left((None, _)) | Either::Right(_) => {
                         break;
@@ -144,8 +146,8 @@ enum MemberState {
 
 pub struct ConsumerCoordinator<Exe: Executor> {
     client: Kafka<Exe>,
-    inner: Option<Inner<Exe>>,
-    inner_handle: Option<JoinHandle<Inner<Exe>>>,
+    inner: Option<CoordinatorInner<Exe>>,
+    inner_handle: Option<JoinHandle<CoordinatorInner<Exe>>>,
     pub(crate) event_tx: UnboundedSender<CoordinatorEvent>,
     options: Arc<ConsumerOptions>,
     commit_offset_tx: Option<UnboundedSender<()>>,
@@ -160,7 +162,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     ) -> Result<ConsumerCoordinator<Exe>> {
         let (event_tx, event_rx) = unbounded();
 
-        let inner = Inner::new(client.clone(), options.clone(), event_rx).await?;
+        let inner = CoordinatorInner::new(client.clone(), options.clone(), event_rx).await?;
         let handle = client.executor.spawn(Box::pin(coordinator_loop(inner)));
 
         Ok(Self {
@@ -174,58 +176,61 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         })
     }
 
-    pub async fn subscribe(&mut self, topics: Vec<TopicName>) {
-        let _ = self
-            .event_tx
+    pub async fn subscribe(&mut self, topics: Vec<TopicName>) -> Result<()> {
+        self.event_tx
             .send(CoordinatorEvent::Subscribe(topics))
-            .await;
+            .await?;
+        Ok(())
     }
 
-    pub async fn subscriptions(&mut self) -> Arc<RwLock<SubscriptionState>> {
+    pub async fn subscriptions(&mut self) -> Result<Arc<RwLock<SubscriptionState>>> {
         let (tx, rx) = oneshot::channel();
-        let _ = self
-            .event_tx
+        self.event_tx
             .send(CoordinatorEvent::GetSubscriptionsRef(tx))
-            .await;
-        rx.await.unwrap()
+            .await?;
+        Ok(rx.await?)
     }
 
-    pub async fn join_group(&mut self) {
-        let _ = self.event_tx.send(CoordinatorEvent::JoinGroup).await;
+    pub async fn join_group(&mut self) -> Result<()> {
+        self.event_tx.send(CoordinatorEvent::JoinGroup).await?;
+        Ok(())
     }
 
-    pub async fn sync_group(&mut self) {
-        let _ = self.event_tx.send(CoordinatorEvent::SyncGroup).await;
+    pub async fn sync_group(&mut self) -> Result<()> {
+        self.event_tx.send(CoordinatorEvent::SyncGroup).await?;
+        Ok(())
     }
 
-    pub async fn maybe_leave_group(&mut self, reason: StrBytes) {
-        let _ = self
-            .event_tx
+    pub async fn maybe_leave_group(&mut self, reason: StrBytes) -> Result<()> {
+        self.event_tx
             .send(CoordinatorEvent::LeaveGroup(reason))
-            .await;
+            .await?;
+        Ok(())
     }
 
-    pub async fn offset_fetch(&mut self) {
-        let _ = self.event_tx.send(CoordinatorEvent::OffsetFetch).await;
+    pub async fn offset_fetch(&mut self) -> Result<()> {
+        self.event_tx.send(CoordinatorEvent::OffsetFetch).await?;
+        Ok(())
     }
 
-    pub async fn commit_async(&mut self) {
+    pub async fn commit_async(&mut self) -> Result<()> {
         if let Some(ref mut tx) = self.commit_offset_tx {
-            let _ = tx.send(()).await;
+            tx.send(()).await?;
         }
+        Ok(())
     }
 
     pub async fn prepare_fetch(&mut self) -> Result<()> {
-        self.join_group().await;
-        self.sync_group().await;
-        self.offset_fetch().await;
+        self.join_group().await?;
+        self.sync_group().await?;
+        self.offset_fetch().await?;
 
         if self.options.auto_commit_enabled {
             // auto commit offset
             let interval_ms = self.options.auto_commit_interval_ms;
             coordinator_task!(self, interval_ms, OffsetCommit);
             info!(
-                "Auto commit offset task is started, which group is {}.",
+                "Auto commit offset task is started, which group is [{}].",
                 self.options.group_id
             );
         } else {
@@ -246,8 +251,10 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     async fn async_commit_offset(&mut self) -> Result<()> {
         let (commit_offset_tx, mut commit_offset_rx) = unbounded();
         self.commit_offset_tx = Some(commit_offset_tx);
+
         let mut shutdown = self.notify_shutdown.subscribe();
         let mut event_tx = self.event_tx.clone();
+
         self.client.executor.spawn(Box::pin(async move {
             loop {
                 let offset_commit = commit_offset_rx.next();
@@ -258,7 +265,9 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 
                 match select(offset_commit, shutdown).await {
                     Either::Left((Some(_), _)) => {
-                        let _ = event_tx.send(CoordinatorEvent::OffsetCommit).await;
+                        if let Err(err) = event_tx.send(CoordinatorEvent::OffsetCommit).await {
+                            error!("Offset commit error: {err}");
+                        }
                     }
                     Either::Left((None, _)) | Either::Right(_) => {
                         break;
@@ -271,7 +280,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     }
 }
 
-struct Inner<Exe: Executor> {
+struct CoordinatorInner<Exe: Executor> {
     client: Kafka<Exe>,
     node: Node,
     event_rx: UnboundedReceiver<CoordinatorEvent>,
@@ -283,16 +292,15 @@ struct Inner<Exe: Executor> {
     state: MemberState,
 }
 
-impl<Exe: Executor> Inner<Exe> {
+impl<Exe: Executor> CoordinatorInner<Exe> {
     pub async fn new(
         client: Kafka<Exe>,
         options: Arc<ConsumerOptions>,
         event_rx: UnboundedReceiver<CoordinatorEvent>,
-    ) -> Result<Inner<Exe>> {
+    ) -> Result<CoordinatorInner<Exe>> {
         let group_id = options.group_id.clone().to_str_bytes();
 
         let node = find_coordinator(&client, group_id.clone(), CoordinatorType::Group).await?;
-
         info!(
             "Find coordinator success, group {:?}, node: {}",
             group_id,
@@ -658,7 +666,7 @@ impl<Exe: Executor> Inner<Exe> {
 }
 
 /// for request builder and response handler
-impl<Exe: Executor> Inner<Exe> {
+impl<Exe: Executor> CoordinatorInner<Exe> {
     fn rebalance_in_progress(&self) -> bool {
         self.state == MemberState::PreparingRebalance
             || self.state == MemberState::CompletingRebalance
@@ -933,24 +941,16 @@ impl<Exe: Executor> Inner<Exe> {
     }
 }
 
-async fn coordinator_loop<Exe: Executor>(mut coordinator: Inner<Exe>) -> Inner<Exe> {
+async fn coordinator_loop<Exe: Executor>(
+    mut coordinator: CoordinatorInner<Exe>,
+) -> CoordinatorInner<Exe> {
     while let Some(event) = coordinator.event_rx.next().await {
-        match event {
-            CoordinatorEvent::JoinGroup => {
-                let _ = coordinator.join_group().await;
-            }
-            CoordinatorEvent::SyncGroup => {
-                let _ = coordinator.sync_group().await;
-            }
-            CoordinatorEvent::LeaveGroup(reason) => {
-                let _ = coordinator.maybe_leave_group(reason).await;
-            }
-            CoordinatorEvent::OffsetFetch => {
-                let _ = coordinator.offset_fetch().await;
-            }
-            CoordinatorEvent::OffsetCommit => {
-                let _ = coordinator.offset_commit().await;
-            }
+        let ret = match event {
+            CoordinatorEvent::JoinGroup => coordinator.join_group().await,
+            CoordinatorEvent::SyncGroup => coordinator.sync_group().await,
+            CoordinatorEvent::LeaveGroup(reason) => coordinator.maybe_leave_group(reason).await,
+            CoordinatorEvent::OffsetFetch => coordinator.offset_fetch().await,
+            CoordinatorEvent::OffsetCommit => coordinator.offset_commit().await,
             CoordinatorEvent::SeekOffset { partition, offset } => {
                 let _ = coordinator
                     .subscriptions
@@ -958,38 +958,34 @@ async fn coordinator_loop<Exe: Executor>(mut coordinator: Inner<Exe>) -> Inner<E
                     .await
                     .seek_offsets
                     .insert(partition, offset);
+                Ok(())
             }
             CoordinatorEvent::ResetOffset {
                 partition,
                 strategy,
             } => {
-                if let Some(tp_state) = coordinator
+                match coordinator
                     .subscriptions
                     .write()
                     .await
                     .assignments
                     .get_mut(&partition)
                 {
-                    if let Err(err) = tp_state.reset(strategy) {
-                        error!("{err}");
-                    }
+                    Some(tp_state) => tp_state.reset(strategy),
+                    None => Ok(()),
                 }
             }
-            CoordinatorEvent::Heartbeat => {
-                let _ = coordinator.heartbeat().await;
-            }
-            CoordinatorEvent::Subscribe(topics) => {
-                let _ = coordinator.subscribe(topics).await;
-            }
+            CoordinatorEvent::Heartbeat => coordinator.heartbeat().await,
+            CoordinatorEvent::Subscribe(topics) => coordinator.subscribe(topics).await,
             CoordinatorEvent::Unsubscribe => {
                 coordinator.subscriptions.write().await.unsubscribe();
+                Ok(())
             }
-            CoordinatorEvent::TopicPartitionState {
+            CoordinatorEvent::PartitionData {
                 partition,
                 position,
-                log_start_offset,
-                last_stable_offset,
-                high_water_mark,
+                data,
+                notify,
             } => {
                 if let Some(tp_state) = coordinator
                     .subscriptions
@@ -1007,22 +1003,28 @@ async fn coordinator_loop<Exe: Executor>(mut coordinator: Inner<Exe>) -> Inner<E
                         }
                     }
 
-                    if log_start_offset >= 0 {
-                        tp_state.log_start_offset = log_start_offset;
+                    if data.log_start_offset >= 0 {
+                        tp_state.log_start_offset = data.log_start_offset;
                     }
-                    if last_stable_offset >= 0 {
-                        tp_state.last_stable_offset = last_stable_offset;
+                    if data.last_stable_offset >= 0 {
+                        tp_state.last_stable_offset = data.last_stable_offset;
                     }
-                    if high_water_mark >= 0 {
-                        tp_state.high_water_mark = high_water_mark;
+                    if data.high_watermark >= 0 {
+                        tp_state.high_water_mark = data.high_watermark;
                     }
+                    let _ = notify.send(());
                 }
+                Ok(())
             }
             CoordinatorEvent::GetSubscriptionsRef(tx) => {
                 let subscriptions = coordinator.subscriptions.clone();
                 let _ = tx.send(subscriptions);
+                Ok(())
             }
             CoordinatorEvent::Shutdown => break,
+        };
+        if let Err(err) = ret {
+            error!("CoordinatorEvent handled error: {err}");
         }
     }
     coordinator

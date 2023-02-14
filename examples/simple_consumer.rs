@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use futures::{pin_mut, StreamExt};
 use kafkas::{
     client::{Kafka, KafkaOptions},
@@ -23,11 +21,12 @@ async fn main() -> Result<(), Box<Error>> {
 
     let kafka_client = Kafka::new("127.0.0.1:9092", KafkaOptions::default(), TokioExecutor).await?;
 
-    let mut consumer_options = ConsumerOptions::new("app");
+    let mut consumer_options = ConsumerOptions::new("default");
     consumer_options.auto_commit_enabled = false;
 
     let mut consumer = Consumer::new(kafka_client, consumer_options).await?;
 
+    // seek offset
     // consumer.seek(TopicPartition::new("kafka", 0), 100000).await;
 
     let consume_stream = consumer.subscribe(vec!["kafka"]).await?;
@@ -43,10 +42,9 @@ async fn main() -> Result<(), Box<Error>> {
                 );
             }
         }
-
-        consumer.commit_async().await;
+        // needed only when `auto_commit_enabled` is false
+        consumer.commit_async().await?;
     }
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
     Ok(())
 }

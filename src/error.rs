@@ -6,7 +6,10 @@ use std::{
     },
 };
 
-use futures::channel::mpsc::{SendError, TryRecvError};
+use futures::channel::{
+    mpsc::{SendError, TryRecvError},
+    oneshot::Canceled,
+};
 use kafka_protocol::{
     messages::{ApiKey, TopicName},
     protocol::{buf::NotEnoughBytesError, DecodeError, EncodeError},
@@ -32,9 +35,21 @@ pub enum Error {
     Consume(ConsumeError),
 }
 
+impl<T> From<tokio::sync::broadcast::error::SendError<T>> for Error {
+    fn from(value: tokio::sync::broadcast::error::SendError<T>) -> Self {
+        Self::Custom(format!("{value}"))
+    }
+}
+
+impl From<Canceled> for Error {
+    fn from(_: Canceled) -> Self {
+        Self::Custom("The channel is canceled.".into())
+    }
+}
+
 impl From<()> for Error {
     fn from(_: ()) -> Self {
-        Self::Custom("The executor could not spawn the task".to_string())
+        Self::Custom("The executor could not spawn the task".into())
     }
 }
 

@@ -9,7 +9,7 @@ use async_stream::stream;
 use chrono::Local;
 use dashmap::DashSet;
 use futures::{
-    channel::mpsc,
+    channel::{mpsc, oneshot},
     future::{select, Either},
     pin_mut, SinkExt, Stream, StreamExt,
 };
@@ -32,7 +32,7 @@ use crate::{
     coordinator::{ConsumerCoordinator, CoordinatorEvent},
     executor::Executor,
     metadata::TopicPartition,
-    NodeId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
+    Error, NodeId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
 };
 
 const INITIAL_EPOCH: i32 = 0;
@@ -227,7 +227,7 @@ impl<Exe: Executor> Consumer<Exe> {
         let fetcher = Fetcher::new(
             client.clone(),
             Local::now().timestamp(),
-            coordinator.subscriptions().await,
+            coordinator.subscriptions().await?,
             options.clone(),
             tx,
         );
@@ -242,19 +242,24 @@ impl<Exe: Executor> Consumer<Exe> {
         })
     }
 
-    pub async fn seek(&mut self, partition: TopicPartition, offset: i64) {
+    pub async fn seek(&mut self, partition: TopicPartition, offset: i64) -> Result<()> {
         if offset < 0 {
-            debug!("offset {} is less than 0, which is invalid", offset);
-            return;
+            return Err(Error::Custom(format!(
+                "offset {offset} is less than 0, which is invalid"
+            )));
         }
-        let _ = self
-            .coordinator
+        self.coordinator
             .event_tx
             .send(CoordinatorEvent::SeekOffset { partition, offset })
-            .await;
+            .await?;
+        Ok(())
     }
 
-    pub async fn commit_async(&mut self) {
+    pub fn notify_shutdown(&self) -> broadcast::Receiver<()> {
+        self.notify_shutdown.subscribe()
+    }
+
+    pub async fn commit_async(&mut self) -> Result<()> {
         self.coordinator.commit_async().await
     }
 
@@ -269,7 +274,7 @@ impl<Exe: Executor> Consumer<Exe> {
                     .map(|topic| topic.as_ref().to_string().to_str_bytes().into())
                     .collect(),
             )
-            .await;
+            .await?;
         self.coordinator.prepare_fetch().await?;
 
         // fetch records task
@@ -304,21 +309,15 @@ impl<Exe: Executor> Consumer<Exe> {
             .maybe_leave_group(StrBytes::from_str(
                 "the consumer unsubscribed from all topics",
             ))
-            .await;
-        let _ = self.notify_shutdown.send(());
-        let _ = self
-            .coordinator
+            .await?;
+        self.coordinator
             .event_tx
             .send(CoordinatorEvent::Unsubscribe)
-            .await;
+            .await?;
+        self.notify_shutdown.send(())?;
         info!("Unsubscribed all topics or patterns and assigned partitions");
         Ok(())
     }
-
-    // pub fn assign(&mut self, partitions: Vec<TopicPartition>) -> Result<impl Stream<Item =
-    // Vec<Record>>> {
-    //
-    // }
 }
 
 impl<Exe: Executor> Drop for Consumer<Exe> {
@@ -431,13 +430,13 @@ async fn handle_partition_response<Exe: Executor>(
             let strategy = options.auto_offset_reset;
             if !matches!(strategy, OffsetResetStrategy::None) {
                 info!("{error_msg}, resetting offset");
-                let _ = event_tx
+                event_tx
                     .send(CoordinatorEvent::ResetOffset {
                         partition: completed_fetch.partition.clone(),
                         strategy,
                     })
-                    .await;
-                let _ = reset_offset_tx.send(()).await;
+                    .await?;
+                reset_offset_tx.send(()).await?;
                 completed_partitions.remove(&completed_fetch.partition);
             } else {
                 info!(
@@ -481,41 +480,45 @@ async fn handle_partition_response<Exe: Executor>(
             );
 
             let mut position = None;
+            let (tx, rx) = oneshot::channel();
             // decode record batch
-            if let Some(ref mut records) = partition.records {
-                let records = RecordBatchDecoder::decode(records)?;
-                if let Some(record) = records.last() {
-                    let mut fetch_position = FetchPosition::new(record.offset, None);
-                    fetch_position.current_leader.epoch = Some(record.partition_leader_epoch);
-                    position = Some(fetch_position);
+            match partition.records {
+                Some(ref mut records) => {
+                    let records = RecordBatchDecoder::decode(records)?;
+                    if let Some(record) = records.last() {
+                        let mut fetch_position = FetchPosition::new(record.offset, None);
+                        fetch_position.current_leader.epoch = Some(record.partition_leader_epoch);
+                        position = Some(fetch_position);
+                    }
+                    debug!(
+                        "Fetch {} records success, records size: {}",
+                        completed_fetch.partition,
+                        records.len()
+                    );
+                    event_tx
+                        .send(CoordinatorEvent::PartitionData {
+                            partition: completed_fetch.partition.clone(),
+                            position,
+                            data: partition,
+                            notify: tx,
+                        })
+                        .await?;
+                    rx.await?;
+                    completed_partitions.remove(&completed_fetch.partition);
+                    return Ok(Some(records));
                 }
-                debug!(
-                    "Fetch {} records success, records size: {}",
-                    completed_fetch.partition,
-                    records.len()
-                );
-                let _ = event_tx
-                    .send(CoordinatorEvent::TopicPartitionState {
-                        partition: completed_fetch.partition.clone(),
-                        position,
-                        log_start_offset: partition.log_start_offset,
-                        last_stable_offset: partition.last_stable_offset,
-                        high_water_mark: partition.high_watermark,
-                    })
-                    .await;
-                completed_partitions.remove(&completed_fetch.partition);
-                return Ok(Some(records));
+                None => {
+                    event_tx
+                        .send(CoordinatorEvent::PartitionData {
+                            partition: completed_fetch.partition,
+                            position,
+                            data: partition,
+                            notify: tx,
+                        })
+                        .await?;
+                    rx.await?;
+                }
             }
-
-            let _ = event_tx
-                .send(CoordinatorEvent::TopicPartitionState {
-                    partition: completed_fetch.partition.clone(),
-                    position,
-                    log_start_offset: partition.log_start_offset,
-                    last_stable_offset: partition.last_stable_offset,
-                    high_water_mark: partition.high_watermark,
-                })
-                .await;
         }
         Some(error) => {
             error!(

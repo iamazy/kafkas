@@ -8,7 +8,7 @@ pub use consumer::ConsumerCoordinator;
 use futures::channel::oneshot;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
-    messages::{ApiKey, FindCoordinatorRequest, TopicName},
+    messages::{fetch_response::PartitionData, ApiKey, FindCoordinatorRequest, TopicName},
     protocol::StrBytes,
 };
 use tracing::error;
@@ -53,12 +53,11 @@ pub enum CoordinatorEvent {
     Heartbeat,
     Subscribe(Vec<TopicName>),
     Unsubscribe,
-    TopicPartitionState {
+    PartitionData {
         partition: TopicPartition,
         position: Option<FetchPosition>,
-        last_stable_offset: i64,
-        log_start_offset: i64,
-        high_water_mark: i64,
+        data: PartitionData,
+        notify: oneshot::Sender<()>,
     },
     SeekOffset {
         partition: TopicPartition,
