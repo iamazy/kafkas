@@ -319,7 +319,7 @@ impl<Exe: Executor> Connection<Exe> {
                 receiver_shutdown_rx,
             )
             .map(|_| ()),
-        ))?;
+        ));
 
         let err = error.clone();
         executor.spawn(Box::pin(async move {
@@ -330,7 +330,7 @@ impl<Exe: Executor> Connection<Exe> {
                     break;
                 }
             }
-        }))?;
+        }));
 
         let mut sender = ConnectionSender::new(
             tx,

@@ -206,25 +206,26 @@ impl<Exe: Executor> Fetcher<Exe> {
             .fetchable_partitions(|tp| !exclude.contains(tp))
     }
 
-    async fn validate_position_on_metadata_change(&self) {
+    async fn validate_position_on_metadata_change(&self) -> Result<()> {
         let mut tp_list = Vec::with_capacity(self.subscription.read().await.assignments.len());
         for (tp, _) in self.subscription.read().await.assignments.iter() {
             tp_list.push(tp.clone());
         }
         for tp in tp_list {
             let current_leader = self.client.cluster_meta.current_leader(&tp);
-            let _ = self
-                .subscription
+            self.subscription
                 .write()
                 .await
-                .maybe_validate_position_for_current_leader(&tp, current_leader);
+                .maybe_validate_position_for_current_leader(&tp, current_leader)?;
         }
+
+        Ok(())
     }
 
     async fn prepare_fetch_requests(&self) -> Result<HashMap<NodeId, FetchRequestData>> {
         let mut fetchable: HashMap<NodeId, FetchRequestDataBuilder> = HashMap::new();
 
-        self.validate_position_on_metadata_change().await;
+        self.validate_position_on_metadata_change().await?;
 
         let fetchable_partitions = self.fetchable_partitions().await;
         for tp in fetchable_partitions.iter() {

@@ -116,7 +116,7 @@ impl<Exe: Executor> Kafka<Exe> {
                     None => break,
                 }
             }
-        }))?;
+        }));
 
         Ok(Kafka {
             manager,

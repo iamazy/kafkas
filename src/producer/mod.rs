@@ -236,7 +236,7 @@ impl<Exe: Executor> Producer<Exe> {
                     }
                 }
             }
-        }))?;
+        }));
 
         Ok(producer)
     }
