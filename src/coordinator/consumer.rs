@@ -148,7 +148,7 @@ pub struct ConsumerCoordinator<Exe: Executor> {
     client: Kafka<Exe>,
     inner: Option<CoordinatorInner<Exe>>,
     inner_handle: Option<JoinHandle<CoordinatorInner<Exe>>>,
-    pub(crate) event_tx: UnboundedSender<CoordinatorEvent>,
+    event_tx: UnboundedSender<CoordinatorEvent>,
     options: Arc<ConsumerOptions>,
     commit_offset_tx: Option<UnboundedSender<()>>,
     notify_shutdown: broadcast::Sender<()>,
@@ -176,10 +176,19 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         })
     }
 
+    pub fn event_sender(&self) -> UnboundedSender<CoordinatorEvent> {
+        self.event_tx.clone()
+    }
+
     pub async fn subscribe(&mut self, topics: Vec<TopicName>) -> Result<()> {
         self.event_tx
             .send(CoordinatorEvent::Subscribe(topics))
             .await?;
+        Ok(())
+    }
+
+    pub async fn unsubscribe(&mut self) -> Result<()> {
+        self.event_tx.send(CoordinatorEvent::Unsubscribe).await?;
         Ok(())
     }
 
@@ -243,6 +252,18 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             "Heartbeat task is started, which group is {}.",
             self.options.group_id
         );
+        Ok(())
+    }
+
+    pub async fn seek(&mut self, partition: TopicPartition, offset: i64) -> Result<()> {
+        if offset < 0 {
+            return Err(Error::Custom(format!(
+                "offset {offset} is less than 0, which is invalid"
+            )));
+        }
+        self.event_tx
+            .send(CoordinatorEvent::SeekOffset { partition, offset })
+            .await?;
         Ok(())
     }
 }

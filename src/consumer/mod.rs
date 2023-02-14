@@ -32,7 +32,7 @@ use crate::{
     coordinator::{ConsumerCoordinator, CoordinatorEvent},
     executor::Executor,
     metadata::TopicPartition,
-    Error, NodeId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
+    NodeId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
 };
 
 const INITIAL_EPOCH: i32 = 0;
@@ -243,15 +243,7 @@ impl<Exe: Executor> Consumer<Exe> {
     }
 
     pub async fn seek(&mut self, partition: TopicPartition, offset: i64) -> Result<()> {
-        if offset < 0 {
-            return Err(Error::Custom(format!(
-                "offset {offset} is less than 0, which is invalid"
-            )));
-        }
-        self.coordinator
-            .event_tx
-            .send(CoordinatorEvent::SeekOffset { partition, offset })
-            .await?;
+        self.coordinator.seek(partition, offset).await?;
         Ok(())
     }
 
@@ -291,7 +283,7 @@ impl<Exe: Executor> Consumer<Exe> {
             self.notify_shutdown.subscribe(),
         )));
 
-        let event_tx = self.coordinator.event_tx.clone();
+        let event_tx = self.coordinator.event_sender();
 
         Ok(fetch_stream(
             self.client.clone(),
@@ -310,10 +302,7 @@ impl<Exe: Executor> Consumer<Exe> {
                 "the consumer unsubscribed from all topics",
             ))
             .await?;
-        self.coordinator
-            .event_tx
-            .send(CoordinatorEvent::Unsubscribe)
-            .await?;
+        self.coordinator.unsubscribe().await?;
         self.notify_shutdown.send(())?;
         info!("Unsubscribed all topics or patterns and assigned partitions");
         Ok(())
