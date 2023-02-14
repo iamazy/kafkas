@@ -12,13 +12,25 @@ use crate::{
 
 #[derive(Debug, Clone, Default)]
 pub struct SubscriptionState {
-    subscription_type: SubscriptionType,
+    pub subscription_type: SubscriptionType,
     pub topics: HashSet<TopicName>,
     pub assignments: HashMap<TopicPartition, TopicPartitionState>,
     pub seek_offsets: HashMap<TopicPartition, i64>,
 }
 
 impl SubscriptionState {
+    pub fn unsubscribe(&mut self) {
+        self.subscription_type = SubscriptionType::None;
+        self.topics.clear();
+        self.assignments.clear();
+        self.seek_offsets.clear();
+    }
+
+    pub fn has_auto_assigned_partitions(&self) -> bool {
+        self.subscription_type == SubscriptionType::AutoTopics
+            || self.subscription_type == SubscriptionType::AutoPattern
+    }
+
     pub fn all_consumed(&self) -> HashMap<TopicPartition, OffsetMetadata> {
         let mut all_consumed = HashMap::new();
         for (tp, tp_state) in self.assignments.iter() {
@@ -178,8 +190,8 @@ impl SubscriptionState {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-enum SubscriptionType {
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum SubscriptionType {
     #[default]
     None,
     AutoTopics,

@@ -26,8 +26,9 @@ dashmap = "5"
 fnv = "1"
 futures = "0.3"
 fxhash = "0.2"
+heck = "0.4"
 indexmap = "1"
-kafka-protocol = { git = "https://github.com/iamazy/kafka-protocol-rs", rev = "4db5630b61ff07bbeada582e83c0bfc281a1965c" }
+kafka-protocol = "0.5"
 native-tls = "0.2"
 pin-project-lite = "0.2"
 rand = "0.8"
@@ -37,12 +38,12 @@ tokio = { version = "1", features = ["full"], optional = true }
 tokio-util = { version = "0.7", features = ["codec"], optional = true }
 tokio-native-tls = { version = "0.3", optional = true }
 tracing = "0.1"
-tracing-subscriber = "0.3"
 url = "2.1"
 uuid = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+tracing-subscriber = "0.3"
 
 [features]
 default = ["tokio-runtime", "async-std-runtime"]

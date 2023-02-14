@@ -155,6 +155,7 @@ impl KafkaCodec {
                 RequestKind::DescribeTransactionsRequest(req) => self.encode_request(header, req, dst),
                 RequestKind::ListTransactionsRequest(req) => self.encode_request(header, req, dst),
                 RequestKind::AllocateProducerIdsRequest(req) => self.encode_request(header, req, dst),
+                kind => return Err(ConnectionError::Encoding(format!("Unsupported request kind: {kind:?}")))
             };
         }
         Ok(())
@@ -517,12 +518,10 @@ pub struct KafkaRequest {
 
 impl KafkaRequest {
     pub fn new(serial_id: i32, request: RequestKind) -> Result<KafkaRequest, ConnectionError> {
-        let key = request_key(&request);
-        let header = RequestHeader {
-            request_api_key: key,
-            correlation_id: serial_id,
-            ..Default::default()
-        };
+        let key = request_key(&request)?;
+        let mut header = RequestHeader::default();
+        header.request_api_key = key;
+        header.correlation_id = serial_id;
         Ok(KafkaRequest { header, request })
     }
 
@@ -550,8 +549,8 @@ pub enum Command {
 }
 
 #[rustfmt::skip]
-fn request_key(request: &RequestKind) -> i16 {
-    match request {
+fn request_key(request: &RequestKind) -> Result<i16, ConnectionError> {
+    Ok(match request {
         RequestKind::ProduceRequest(_) => <ProduceRequest as Request>::KEY,
         RequestKind::FetchRequest(_) => <FetchRequest as Request>::KEY,
         RequestKind::ListOffsetsRequest(_) => <ListOffsetsRequest as Request>::KEY,
@@ -620,5 +619,6 @@ fn request_key(request: &RequestKind) -> i16 {
         RequestKind::DescribeTransactionsRequest(_) => <DescribeTransactionsRequest as Request>::KEY,
         RequestKind::ListTransactionsRequest(_) => <ListTransactionsRequest as Request>::KEY,
         RequestKind::AllocateProducerIdsRequest(_) => <AllocateProducerIdsRequest as Request>::KEY,
-    }
+        kind => return Err(ConnectionError::Encoding(format!("Unsupported request kind: {kind:?}")))
+    })
 }

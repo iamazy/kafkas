@@ -6,9 +6,12 @@ use std::{
 
 use async_lock::RwLock;
 use futures::{
+    channel::{
+        mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
     future::{select, Either},
-    lock::Mutex,
-    pin_mut, StreamExt,
+    pin_mut, SinkExt, StreamExt,
 };
 use indexmap::IndexMap;
 use kafka_protocol::{
@@ -17,6 +20,7 @@ use kafka_protocol::{
         consumer_protocol_assignment::TopicPartition as CpaTopicPartition,
         join_group_request::JoinGroupRequestProtocol,
         join_group_response::JoinGroupResponseMember,
+        leave_group_request::MemberIdentity,
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
         offset_fetch_request::{
             OffsetFetchRequestGroup, OffsetFetchRequestTopic, OffsetFetchRequestTopics,
@@ -39,12 +43,14 @@ use crate::{
             Assignment, GroupSubscription, PartitionAssigner, PartitionAssignor, Subscription,
             SUPPORTED_PARTITION_ASSIGNORS,
         },
-        subscription_state::{SubscriptionState, TopicPartitionState},
+        subscription_state::{
+            OffsetMetadata, SubscriptionState, SubscriptionType, TopicPartitionState,
+        },
         ConsumerGroupMetadata, ConsumerOptions,
     },
-    coordinator::{find_coordinator, CoordinatorType},
+    coordinator::{find_coordinator, CoordinatorEvent, CoordinatorType},
     error::{ConsumeError, Result},
-    executor::Executor,
+    executor::{Executor, JoinHandle},
     metadata::{Node, TopicPartition},
     to_version_prefixed_bytes, Error, MemberId, ToStrBytes, DEFAULT_GENERATION_ID,
 };
@@ -91,49 +97,42 @@ macro_rules! offset_fetch_block {
 }
 
 macro_rules! coordinator_task {
-    ($self:ident, $interval_ms:ident, $task:ident) => {
+    ($self:ident, $interval_ms:ident, $event:ident) => {
         let mut interval = $self
             .client
             .executor
             .interval(Duration::from_millis($interval_ms as u64));
 
-        let weak_inner = Arc::downgrade(&$self.inner);
-
         let mut shutdown = $self.notify_shutdown.subscribe();
-        let res = $self.client.executor.spawn(Box::pin(async move {
-            while interval.next().await.is_some() {
-                match weak_inner.upgrade() {
-                    Some(strong_inner) => {
-                        let mut lock = strong_inner.lock().await;
-                        let task = lock.$task();
-                        let shutdown = shutdown.recv();
+        let mut event_tx = $self.event_tx.clone();
 
-                        pin_mut!(task);
-                        pin_mut!(shutdown);
+        $self.client.executor.spawn(Box::pin(async move {
+            let task_name = stringify!($event);
 
-                        match select(task, shutdown).await {
-                            Either::Left((Err(err), _)) => {
-                                error!("{} failed, {}", stringify!($task), err);
-                            }
-                            Either::Left((Ok(_), _)) => {}
-                            Either::Right(_) => break,
+            loop {
+                let interval_fut = interval.next();
+                let shutdown = shutdown.recv();
+
+                pin_mut!(interval_fut);
+                pin_mut!(shutdown);
+
+                match select(interval_fut, shutdown).await {
+                    Either::Left((Some(_), _)) => {
+                        if let Err(err) = event_tx.send(CoordinatorEvent::$event).await {
+                            error!("{task_name} error: {err}");
                         }
                     }
-                    None => break,
+                    Either::Left((None, _)) | Either::Right(_) => {
+                        break;
+                    }
                 }
             }
-            info!("{} task finished.", stringify!(task));
-        }));
 
-        if res.is_err() {
-            return Err(Error::Custom(format!(
-                "The executor could not spawn the {} task",
-                stringify!(task)
-            )));
-        }
+            info!("{} task finished.", task_name);
+        }));
     };
 }
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum MemberState {
     // the client is not part of a group
     UnJoined,
@@ -147,8 +146,11 @@ enum MemberState {
 
 pub struct ConsumerCoordinator<Exe: Executor> {
     client: Kafka<Exe>,
-    inner: Arc<Mutex<Inner<Exe>>>,
+    inner: Option<CoordinatorInner<Exe>>,
+    inner_handle: Option<JoinHandle<CoordinatorInner<Exe>>>,
+    pub(crate) event_tx: UnboundedSender<CoordinatorEvent>,
     options: Arc<ConsumerOptions>,
+    commit_offset_tx: Option<UnboundedSender<()>>,
     notify_shutdown: broadcast::Sender<()>,
 }
 
@@ -158,46 +160,67 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         options: Arc<ConsumerOptions>,
         notify: broadcast::Sender<()>,
     ) -> Result<ConsumerCoordinator<Exe>> {
-        let inner = Inner::new(client.clone(), options.clone()).await?;
-        let inner = Arc::new(Mutex::new(inner));
+        let (event_tx, event_rx) = unbounded();
+
+        let inner = CoordinatorInner::new(client.clone(), options.clone(), event_rx).await?;
+        let handle = client.executor.spawn(Box::pin(coordinator_loop(inner)));
 
         Ok(Self {
-            inner,
+            inner: None,
+            inner_handle: Some(handle),
+            event_tx,
             client,
             options,
             notify_shutdown: notify,
+            commit_offset_tx: None,
         })
     }
 
-    pub async fn subscribe(&self, topics: Vec<TopicName>) -> Result<()> {
-        self.inner.lock().await.subscribe(topics).await
+    pub async fn subscribe(&mut self, topics: Vec<TopicName>) -> Result<()> {
+        self.event_tx
+            .send(CoordinatorEvent::Subscribe(topics))
+            .await?;
+        Ok(())
     }
 
-    pub async fn subscriptions(&self) -> Arc<RwLock<SubscriptionState>> {
-        self.inner.lock().await.subscriptions.clone()
+    pub async fn subscriptions(&mut self) -> Result<Arc<RwLock<SubscriptionState>>> {
+        let (tx, rx) = oneshot::channel();
+        self.event_tx
+            .send(CoordinatorEvent::GetSubscriptionsRef(tx))
+            .await?;
+        Ok(rx.await?)
     }
 
-    pub async fn current_generation(&self) -> i32 {
-        self.inner.lock().await.group_meta.generation_id
+    pub async fn join_group(&mut self) -> Result<()> {
+        self.event_tx.send(CoordinatorEvent::JoinGroup).await?;
+        Ok(())
     }
 
-    pub async fn join_group(&self) -> Result<()> {
-        self.inner.lock().await.join_group().await
+    pub async fn sync_group(&mut self) -> Result<()> {
+        self.event_tx.send(CoordinatorEvent::SyncGroup).await?;
+        Ok(())
     }
 
-    pub async fn sync_group(&self) -> Result<()> {
-        self.inner.lock().await.sync_group().await
+    pub async fn maybe_leave_group(&mut self, reason: StrBytes) -> Result<()> {
+        self.event_tx
+            .send(CoordinatorEvent::LeaveGroup(reason))
+            .await?;
+        Ok(())
     }
 
-    pub async fn offset_fetch(&self) -> Result<()> {
-        self.inner.lock().await.offset_fetch().await
+    pub async fn offset_fetch(&mut self) -> Result<()> {
+        self.event_tx.send(CoordinatorEvent::OffsetFetch).await?;
+        Ok(())
     }
 
-    pub async fn offset_commit(&mut self) -> Result<()> {
-        self.inner.lock().await.offset_commit().await
+    pub async fn commit_async(&mut self) -> Result<()> {
+        if let Some(ref mut tx) = self.commit_offset_tx {
+            tx.send(()).await?;
+        }
+        Ok(())
     }
 
-    pub async fn prepare_fetch(&self) -> Result<()> {
+    pub async fn prepare_fetch(&mut self) -> Result<()> {
         self.join_group().await?;
         self.sync_group().await?;
         self.offset_fetch().await?;
@@ -205,18 +228,62 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         if self.options.auto_commit_enabled {
             // auto commit offset
             let interval_ms = self.options.auto_commit_interval_ms;
-            coordinator_task!(self, interval_ms, offset_commit);
+            coordinator_task!(self, interval_ms, OffsetCommit);
+            info!(
+                "Auto commit offset task is started, which group is [{}].",
+                self.options.group_id
+            );
+        } else {
+            self.async_commit_offset().await?;
         }
         // heartbeat
         let interval_ms = self.options.rebalance_options.heartbeat_interval_ms;
-        coordinator_task!(self, interval_ms, heartbeat);
+        coordinator_task!(self, interval_ms, Heartbeat);
+        info!(
+            "Heartbeat task is started, which group is {}.",
+            self.options.group_id
+        );
         Ok(())
     }
 }
 
-struct Inner<Exe: Executor> {
+impl<Exe: Executor> ConsumerCoordinator<Exe> {
+    async fn async_commit_offset(&mut self) -> Result<()> {
+        let (commit_offset_tx, mut commit_offset_rx) = unbounded();
+        self.commit_offset_tx = Some(commit_offset_tx);
+
+        let mut shutdown = self.notify_shutdown.subscribe();
+        let mut event_tx = self.event_tx.clone();
+
+        self.client.executor.spawn(Box::pin(async move {
+            loop {
+                let offset_commit = commit_offset_rx.next();
+                let shutdown = shutdown.recv();
+
+                pin_mut!(offset_commit);
+                pin_mut!(shutdown);
+
+                match select(offset_commit, shutdown).await {
+                    Either::Left((Some(_), _)) => {
+                        if let Err(err) = event_tx.send(CoordinatorEvent::OffsetCommit).await {
+                            error!("Offset commit error: {err}");
+                        }
+                    }
+                    Either::Left((None, _)) | Either::Right(_) => {
+                        break;
+                    }
+                }
+            }
+            info!("Async commit offset task finished.");
+        }));
+        Ok(())
+    }
+}
+
+struct CoordinatorInner<Exe: Executor> {
     client: Kafka<Exe>,
     node: Node,
+    event_rx: UnboundedReceiver<CoordinatorEvent>,
     pub group_meta: ConsumerGroupMetadata,
     group_subscription: GroupSubscription,
     consumer_options: Arc<ConsumerOptions>,
@@ -225,15 +292,19 @@ struct Inner<Exe: Executor> {
     state: MemberState,
 }
 
-impl<Exe: Executor> Inner<Exe> {
-    pub async fn new(client: Kafka<Exe>, options: Arc<ConsumerOptions>) -> Result<Inner<Exe>> {
+impl<Exe: Executor> CoordinatorInner<Exe> {
+    pub async fn new(
+        client: Kafka<Exe>,
+        options: Arc<ConsumerOptions>,
+        event_rx: UnboundedReceiver<CoordinatorEvent>,
+    ) -> Result<CoordinatorInner<Exe>> {
         let group_id = options.group_id.clone().to_str_bytes();
 
         let node = find_coordinator(&client, group_id.clone(), CoordinatorType::Group).await?;
-
         info!(
-            "Find coordinator success, group {:?}, node: {:?}",
-            group_id, node
+            "Find coordinator success, group {:?}, node: {}",
+            group_id,
+            node.address()
         );
 
         // TODO: check consumer options
@@ -247,6 +318,7 @@ impl<Exe: Executor> Inner<Exe> {
         Ok(Self {
             client,
             node,
+            event_rx,
             subscriptions: Arc::new(RwLock::new(SubscriptionState::default())),
             group_meta: ConsumerGroupMetadata::new(group_id.into()),
             group_subscription: GroupSubscription::default(),
@@ -262,6 +334,7 @@ impl<Exe: Executor> Inner<Exe> {
             .await
             .topics
             .extend(topics.clone());
+        self.subscriptions.write().await.subscription_type = SubscriptionType::AutoTopics;
         // TODO: remove it
         self.client.update_metadata(topics).await?;
         Ok(())
@@ -351,34 +424,52 @@ impl<Exe: Executor> Inner<Exe> {
         }
     }
 
-    pub async fn leave_group(&mut self) -> Result<()> {
-        let leave_group_response = self
-            .client
-            .leave_group(&self.node, self.leave_group_builder()?)
-            .await?;
+    pub async fn leave_group(&mut self, reason: StrBytes) -> Result<()> {
+        if let Some(version_range) = self.client.version_range(ApiKey::LeaveGroupKey) {
+            debug!(
+                "Member {} send LeaveGroup request to coordinator {} due to {reason}",
+                self.group_meta.member_id,
+                self.node.address(),
+            );
 
-        match leave_group_response.error_code.err() {
-            None => {
-                for member in leave_group_response.members {
-                    if member.error_code.is_ok() {
-                        debug!(
-                            "Member {} leave group {:?} success.",
-                            member.member_id, self.group_meta.group_id
-                        );
-                    } else {
-                        error!(
-                            "Member {} leave group {:?} failed.",
-                            member.member_id, self.group_meta.group_id
-                        );
+            let leave_group_request = self.leave_group_builder(version_range.max, reason)?;
+
+            let leave_group_response = self
+                .client
+                .leave_group(&self.node, leave_group_request)
+                .await?;
+
+            match leave_group_response.error_code.err() {
+                None => {
+                    for member in leave_group_response.members {
+                        if member.error_code.is_ok() {
+                            debug!(
+                                "Member {} leave group {} success.",
+                                member.member_id, self.group_meta.group_id.0
+                            );
+                        } else {
+                            error!(
+                                "Member {} leave group {} failed.",
+                                member.member_id, self.group_meta.group_id.0
+                            );
+                        }
                     }
+                    info!(
+                        "Leave group [{}] success, member: {}",
+                        self.group_meta.group_id.0, self.group_meta.member_id
+                    );
+                    Ok(())
                 }
-                info!(
-                    "Leave group {:?} success, member: {}",
-                    self.group_meta.group_id, self.group_meta.member_id
-                );
-                Ok(())
+                Some(error) => {
+                    error!(
+                        "Leave group [{}] failed, error: {error}",
+                        self.group_meta.group_id.0
+                    );
+                    Err(error.into())
+                }
             }
-            Some(error) => Err(error.into()),
+        } else {
+            Err(Error::InvalidApiRequest(ApiKey::LeaveGroupKey))
         }
     }
 
@@ -438,8 +529,8 @@ impl<Exe: Executor> Inner<Exe> {
                         self.group_meta.leader,
                         self.group_meta.member_id,
                         self.group_meta.generation_id,
-                        self.group_meta.protocol_type.as_ref(),
-                        self.group_meta.protocol_name.as_ref(),
+                        self.group_meta.protocol_type.as_ref().unwrap(),
+                        self.group_meta.protocol_name.as_ref().unwrap(),
                     );
                     Ok(())
                 }
@@ -476,28 +567,30 @@ impl<Exe: Executor> Inner<Exe> {
     }
 
     pub async fn offset_commit(&mut self) -> Result<()> {
-        if let Some(version_range) = self.client.version_range(ApiKey::OffsetCommitKey) {
-            let offset_commit_response = self
-                .client
-                .offset_commit(
-                    &self.node,
-                    self.offset_commit_builder(version_range.max).await?,
-                )
-                .await?;
-            for topic in offset_commit_response.topics {
-                for partition in topic.partitions {
-                    if !partition.error_code.is_ok() {
-                        error!(
-                            "Failed to commit offset for partition {}",
-                            partition.partition_index
-                        );
-                    }
+        let all_consumed = self.subscriptions.read().await.all_consumed();
+        if all_consumed.is_empty() {
+            return Ok(());
+        }
+
+        let offset_commit_request = self.offset_commit_builder(all_consumed).await?;
+        debug!("Send offset commit request: {:?}", offset_commit_request);
+
+        let offset_commit_response = self
+            .client
+            .offset_commit(&self.node, offset_commit_request)
+            .await?;
+
+        for topic in offset_commit_response.topics {
+            for partition in topic.partitions {
+                if let Some(err) = partition.error_code.err() {
+                    error!(
+                        "Failed to commit offset for partition {}, error: {err}",
+                        partition.partition_index
+                    );
                 }
             }
-            Ok(())
-        } else {
-            Err(Error::InvalidApiRequest(ApiKey::OffsetCommitKey))
         }
+        Ok(())
     }
 
     pub async fn heartbeat(&mut self) -> Result<()> {
@@ -573,7 +666,32 @@ impl<Exe: Executor> Inner<Exe> {
 }
 
 /// for request builder and response handler
-impl<Exe: Executor> Inner<Exe> {
+impl<Exe: Executor> CoordinatorInner<Exe> {
+    fn rebalance_in_progress(&self) -> bool {
+        self.state == MemberState::PreparingRebalance
+            || self.state == MemberState::CompletingRebalance
+    }
+
+    pub async fn maybe_leave_group(&mut self, reason: StrBytes) -> Result<()> {
+        // Starting from 2.3, only dynamic members will send LeaveGroupRequest to the broker,
+        // consumer with valid group.instance.id is viewed as static member that never sends
+        // LeaveGroup, and the membership expiration is only controlled by session timeout.
+        if self.group_meta.group_instance_id.is_none()
+            && self.state != MemberState::UnJoined
+            && !self.group_meta.member_id.is_empty()
+        {
+            // this is a minimal effort attempt to leave the group. we do not
+            // attempt any resending if the request fails or times out.
+            self.leave_group(reason).await?;
+        }
+
+        self.state = MemberState::UnJoined;
+        self.group_meta.generation_id = DEFAULT_GENERATION_ID;
+        self.group_meta.member_id = StrBytes::default();
+
+        Ok(())
+    }
+
     async fn join_group_protocol(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
         let topics = self
             .subscriptions
@@ -591,13 +709,9 @@ impl<Exe: Executor> Inner<Exe> {
                 self.subscriptions.read().await.partitions(),
             );
             let metadata = subscription.serialize_to_bytes()?;
-            protocols.insert(
-                assignor.name().to_string().to_str_bytes(),
-                JoinGroupRequestProtocol {
-                    metadata,
-                    ..Default::default()
-                },
-            );
+            let mut protocol = JoinGroupRequestProtocol::default();
+            protocol.metadata = metadata;
+            protocols.insert(assignor.name().to_string().to_str_bytes(), protocol);
         }
         Ok(protocols)
     }
@@ -642,21 +756,21 @@ impl<Exe: Executor> Inner<Exe> {
         Ok(request)
     }
 
-    fn leave_group_builder(&self) -> Result<LeaveGroupRequest> {
-        let request = LeaveGroupRequest {
-            group_id: self.group_meta.group_id.clone(),
-            member_id: self.group_meta.member_id.clone(),
-            ..Default::default()
-        };
+    fn leave_group_builder(&self, version: i16, reason: StrBytes) -> Result<LeaveGroupRequest> {
+        let mut request = LeaveGroupRequest::default();
 
-        // let mut members = Vec::new();
-        // let member = MemberIdentity {
-        //     member_id: self.group_meta.member_id.clone(),
-        //     group_instance_id: self.group_meta.group_instance_id.clone(),
-        //     ..Default::default()
-        // };
-        // members.push(member);
-        // builder.members(members);
+        request.group_id = self.group_meta.group_id.clone();
+        if version >= 3 {
+            let mut members = Vec::with_capacity(1);
+            let mut member = MemberIdentity::default();
+            member.member_id = self.group_meta.member_id.clone();
+            member.group_instance_id = self.group_meta.group_instance_id.clone();
+            member.reason = Some(reason);
+            members.push(member);
+            request.members = members;
+        } else {
+            request.member_id = self.group_meta.member_id.clone();
+        }
 
         Ok(request)
     }
@@ -704,11 +818,10 @@ impl<Exe: Executor> Inner<Exe> {
             let mut topics = Vec::with_capacity(self.subscriptions.read().await.topics.len());
             for assign in self.subscriptions.read().await.topics.iter() {
                 let partitions = self.client.cluster_meta.partitions(assign)?;
-                let topic = OffsetFetchRequestTopic {
-                    name: assign.clone(),
-                    partition_indexes: partitions.value().clone(),
-                    ..Default::default()
-                };
+
+                let mut topic = OffsetFetchRequestTopic::default();
+                topic.name = assign.clone();
+                topic.partition_indexes = partitions.value().clone();
                 topics.push(topic);
             }
             request.group_id = self.group_meta.group_id.clone();
@@ -717,75 +830,98 @@ impl<Exe: Executor> Inner<Exe> {
             let mut topics = Vec::with_capacity(self.subscriptions.read().await.topics.len());
             for assign in self.subscriptions.read().await.topics.iter() {
                 let partitions = self.client.cluster_meta.partitions(assign)?;
-                let topic = OffsetFetchRequestTopics {
-                    name: assign.clone(),
-                    partition_indexes: partitions.value().clone(),
-                    ..Default::default()
-                };
+
+                let mut topic = OffsetFetchRequestTopics::default();
+                topic.name = assign.clone();
+                topic.partition_indexes = partitions.value().clone();
                 topics.push(topic);
             }
 
-            let group = OffsetFetchRequestGroup {
-                group_id: self.group_meta.group_id.clone(),
-                topics: Some(topics),
-                ..Default::default()
-            };
+            let mut group = OffsetFetchRequestGroup::default();
+            group.group_id = self.group_meta.group_id.clone();
+            group.topics = Some(topics);
             request.groups = vec![group];
         }
 
         Ok(request)
     }
 
-    pub async fn offset_commit_builder(&self, version: i16) -> Result<OffsetCommitRequest> {
-        let mut request = OffsetCommitRequest::default();
-        if version <= 8 {
-            request.group_id = self.group_meta.group_id.clone();
+    pub async fn offset_commit_builder(
+        &self,
+        all_consumed: HashMap<TopicPartition, OffsetMetadata>,
+    ) -> Result<OffsetCommitRequest> {
+        let mut topics: HashMap<TopicName, Vec<OffsetCommitRequestPartition>> =
+            HashMap::with_capacity(self.subscriptions.read().await.topics.len());
+        for (tp, meta) in all_consumed.iter() {
+            let mut partition = OffsetCommitRequestPartition::default();
+            partition.partition_index = tp.partition;
+            partition.committed_offset = meta.committed_offset;
+            partition.committed_leader_epoch = meta.committed_leader_epoch.unwrap_or(-1);
+            partition.commit_timestamp = -1;
+            partition.committed_metadata = meta.metadata.clone();
 
-            let mut topics: HashMap<TopicName, Vec<OffsetCommitRequestPartition>> =
-                HashMap::with_capacity(self.subscriptions.read().await.topics.len());
-            let all_consumed = self.subscriptions.read().await.all_consumed();
-            for (tp, meta) in all_consumed.iter() {
-                let partition = OffsetCommitRequestPartition {
-                    partition_index: tp.partition,
-                    committed_offset: meta.committed_offset,
-                    committed_leader_epoch: meta.committed_leader_epoch.unwrap_or(-1),
-                    commit_timestamp: -1,
-                    committed_metadata: meta.metadata.clone(),
-                    ..Default::default()
-                };
-
-                if let Some(partitions) = topics.get_mut(&tp.topic) {
-                    partitions.push(partition);
-                } else {
+            match topics.get_mut(&tp.topic) {
+                Some(partitions) => partitions.push(partition),
+                None => {
                     let partitions = vec![partition];
                     topics.insert(tp.topic.clone(), partitions);
                 }
             }
-
-            let mut offset_commit_topics = Vec::with_capacity(topics.len());
-            for (topic, partitions) in topics {
-                offset_commit_topics.push(OffsetCommitRequestTopic {
-                    name: topic,
-                    partitions,
-                    ..Default::default()
-                })
-            }
-
-            request.topics = offset_commit_topics;
-
-            if version >= 1 {
-                request.generation_id = self.group_meta.generation_id;
-                request.member_id = self.group_meta.member_id.clone();
-            }
-
-            if version >= 7 {
-                request.group_instance_id = self.group_meta.group_instance_id.clone();
-            }
-
-            if (2..=4).contains(&version) {
-                request.retention_time_ms = -1;
-            }
         }
+
+        let mut offset_commit_topics = Vec::with_capacity(topics.len());
+        for (topic, partitions) in topics {
+            let mut request_topic = OffsetCommitRequestTopic::default();
+            request_topic.name = topic;
+            request_topic.partitions = partitions;
+            offset_commit_topics.push(request_topic);
+        }
+
+        let mut request = OffsetCommitRequest::default();
+        request.topics = offset_commit_topics;
+
+        let mut generation = self.group_meta.generation_id;
+        let mut member = self.group_meta.member_id.clone();
+        if self
+            .subscriptions
+            .read()
+            .await
+            .has_auto_assigned_partitions()
+        {
+            // if the generation is null, we are not part of an active group (and we expect to be).
+            // the only thing we can do is fail the commit and let the user rejoin the group in
+            // poll().
+            if self.state != MemberState::Stable {
+                info!(
+                    "Failing OffsetCommit request since the consumer is not part of an active \
+                     group"
+                );
+                return if self.rebalance_in_progress() {
+                    Err(Error::Custom(
+                        "Offset commit cannot be completed since the consumer is undergoing a \
+                         rebalance for auto partition assignment. You can try completing the \
+                         rebalance by calling poll() and then retry the operation."
+                            .into(),
+                    ))
+                } else {
+                    Err(Error::Custom(
+                        "Offset commit cannot be completed since the consumer is not part of an \
+                         active group for auto partition assignment; it is likely that the \
+                         consumer was kicked out of the group."
+                            .into(),
+                    ))
+                };
+            }
+        } else {
+            generation = DEFAULT_GENERATION_ID;
+            member = StrBytes::from_str("");
+        }
+
+        request.group_id = self.group_meta.group_id.clone();
+        request.generation_id = generation;
+        request.member_id = member;
+        request.group_instance_id = self.group_meta.group_instance_id.clone();
+        request.retention_time_ms = -1;
 
         Ok(request)
     }
@@ -803,6 +939,95 @@ impl<Exe: Executor> Inner<Exe> {
         }
         Ok(request)
     }
+}
+
+async fn coordinator_loop<Exe: Executor>(
+    mut coordinator: CoordinatorInner<Exe>,
+) -> CoordinatorInner<Exe> {
+    while let Some(event) = coordinator.event_rx.next().await {
+        let ret = match event {
+            CoordinatorEvent::JoinGroup => coordinator.join_group().await,
+            CoordinatorEvent::SyncGroup => coordinator.sync_group().await,
+            CoordinatorEvent::LeaveGroup(reason) => coordinator.maybe_leave_group(reason).await,
+            CoordinatorEvent::OffsetFetch => coordinator.offset_fetch().await,
+            CoordinatorEvent::OffsetCommit => coordinator.offset_commit().await,
+            CoordinatorEvent::SeekOffset { partition, offset } => {
+                let _ = coordinator
+                    .subscriptions
+                    .write()
+                    .await
+                    .seek_offsets
+                    .insert(partition, offset);
+                Ok(())
+            }
+            CoordinatorEvent::ResetOffset {
+                partition,
+                strategy,
+            } => {
+                match coordinator
+                    .subscriptions
+                    .write()
+                    .await
+                    .assignments
+                    .get_mut(&partition)
+                {
+                    Some(tp_state) => tp_state.reset(strategy),
+                    None => Ok(()),
+                }
+            }
+            CoordinatorEvent::Heartbeat => coordinator.heartbeat().await,
+            CoordinatorEvent::Subscribe(topics) => coordinator.subscribe(topics).await,
+            CoordinatorEvent::Unsubscribe => {
+                coordinator.subscriptions.write().await.unsubscribe();
+                Ok(())
+            }
+            CoordinatorEvent::PartitionData {
+                partition,
+                position,
+                data,
+                notify,
+            } => {
+                if let Some(tp_state) = coordinator
+                    .subscriptions
+                    .write()
+                    .await
+                    .assignments
+                    .get_mut(&partition)
+                {
+                    if let Some(position) = position {
+                        tp_state.position.offset = position.offset;
+                        tp_state.position.offset_epoch = position.offset_epoch;
+
+                        if let Some(epoch) = position.current_leader.epoch {
+                            tp_state.position.current_leader.epoch = Some(epoch);
+                        }
+                    }
+
+                    if data.log_start_offset >= 0 {
+                        tp_state.log_start_offset = data.log_start_offset;
+                    }
+                    if data.last_stable_offset >= 0 {
+                        tp_state.last_stable_offset = data.last_stable_offset;
+                    }
+                    if data.high_watermark >= 0 {
+                        tp_state.high_water_mark = data.high_watermark;
+                    }
+                    let _ = notify.send(());
+                }
+                Ok(())
+            }
+            CoordinatorEvent::GetSubscriptionsRef(tx) => {
+                let subscriptions = coordinator.subscriptions.clone();
+                let _ = tx.send(subscriptions);
+                Ok(())
+            }
+            CoordinatorEvent::Shutdown => break,
+        };
+        if let Err(err) = ret {
+            error!("CoordinatorEvent handled error: {err}");
+        }
+    }
+    coordinator
 }
 
 fn deserialize_member(members: Vec<JoinGroupResponseMember>) -> Result<GroupSubscription> {
@@ -824,21 +1049,21 @@ fn serialize_assignments(
     for (member_id, assignment) in assignments {
         let mut assigned_partitions = IndexMap::with_capacity(assignment.partitions.len());
         for (topic, partitions) in assignment.partitions {
-            assigned_partitions.insert(topic, CpaTopicPartition { partitions });
+            let mut tp = CpaTopicPartition::default();
+            tp.partitions = partitions;
+            assigned_partitions.insert(topic, tp);
         }
-        let assignment = to_version_prefixed_bytes(
-            version,
-            ConsumerProtocolAssignment {
-                assigned_partitions,
-                user_data: assignment.user_data,
-            },
-        )?;
 
-        sync_group_assignments.push(SyncGroupRequestAssignment {
-            member_id,
-            assignment,
-            ..Default::default()
-        });
+        let mut protocol_assignment = ConsumerProtocolAssignment::default();
+        protocol_assignment.assigned_partitions = assigned_partitions;
+        protocol_assignment.user_data = assignment.user_data;
+
+        let assignment = to_version_prefixed_bytes(version, protocol_assignment)?;
+
+        let mut request_assignment = SyncGroupRequestAssignment::default();
+        request_assignment.member_id = member_id;
+        request_assignment.assignment = assignment;
+        sync_group_assignments.push(request_assignment);
     }
     Ok(sync_group_assignments)
 }

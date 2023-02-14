@@ -206,25 +206,26 @@ impl<Exe: Executor> Fetcher<Exe> {
             .fetchable_partitions(|tp| !exclude.contains(tp))
     }
 
-    async fn validate_position_on_metadata_change(&self) {
+    async fn validate_position_on_metadata_change(&self) -> Result<()> {
         let mut tp_list = Vec::with_capacity(self.subscription.read().await.assignments.len());
         for (tp, _) in self.subscription.read().await.assignments.iter() {
             tp_list.push(tp.clone());
         }
         for tp in tp_list {
             let current_leader = self.client.cluster_meta.current_leader(&tp);
-            let _ = self
-                .subscription
+            self.subscription
                 .write()
                 .await
-                .maybe_validate_position_for_current_leader(&tp, current_leader);
+                .maybe_validate_position_for_current_leader(&tp, current_leader)?;
         }
+
+        Ok(())
     }
 
     async fn prepare_fetch_requests(&self) -> Result<HashMap<NodeId, FetchRequestData>> {
         let mut fetchable: HashMap<NodeId, FetchRequestDataBuilder> = HashMap::new();
 
-        self.validate_position_on_metadata_change().await;
+        self.validate_position_on_metadata_change().await?;
 
         let fetchable_partitions = self.fetchable_partitions().await;
         for tp in fetchable_partitions.iter() {
@@ -293,57 +294,51 @@ impl<Exe: Executor> Fetcher<Exe> {
     }
 
     pub(crate) async fn reset_offset(&mut self) -> Result<()> {
-        if let Some(version_range) = self.client.version_range(ApiKey::ListOffsetsKey) {
-            let version = version_range.max;
-            let partitions = self
-                .subscription
-                .read()
-                .await
-                .partitions_need_reset(self.timestamp);
-            if partitions.is_empty() {
-                return Ok(());
-            }
-
-            let mut offset_reset_timestamps = HashMap::new();
-            for partition in partitions {
-                if let Some(tp_state) = self.subscription.read().await.assignments.get(&partition) {
-                    let timestamp = tp_state.offset_strategy.strategy_timestamp();
-                    if timestamp != 0 {
-                        offset_reset_timestamps.insert(partition, timestamp);
-                    }
-                }
-            }
-
-            let requests = self
-                .group_list_offsets_request(&mut offset_reset_timestamps, version)
-                .await?;
-            for (node, request) in requests {
-                let response = self.client.list_offsets(&node, request).await?;
-                let list_offset_result = self.handle_list_offsets_response(response)?;
-                if !list_offset_result.partitions_to_retry.is_empty() {
-                    self.subscription.write().await.request_failed(
-                        list_offset_result.partitions_to_retry,
-                        self.timestamp + self.options.retry_backoff_ms,
-                    );
-                    self.client.update_full_metadata().await?;
-                }
-
-                for (tp, list_offsets_data) in list_offset_result.fetched_offsets {
-                    if let Some(timestamp) = offset_reset_timestamps.get(&tp) {
-                        self.reset_offset_if_needed(
-                            tp,
-                            OffsetResetStrategy::from_timestamp(*timestamp),
-                            list_offsets_data,
-                        )
-                        .await?;
-                    }
-                }
-            }
-
-            Ok(())
-        } else {
-            Err(Error::InvalidApiRequest(ApiKey::ListOffsetsKey))
+        let partitions = self
+            .subscription
+            .read()
+            .await
+            .partitions_need_reset(self.timestamp);
+        if partitions.is_empty() {
+            return Ok(());
         }
+
+        let mut offset_reset_timestamps = HashMap::new();
+        for partition in partitions {
+            if let Some(tp_state) = self.subscription.read().await.assignments.get(&partition) {
+                let timestamp = tp_state.offset_strategy.strategy_timestamp();
+                if timestamp != 0 {
+                    offset_reset_timestamps.insert(partition, timestamp);
+                }
+            }
+        }
+
+        let requests = self
+            .group_list_offsets_request(&mut offset_reset_timestamps)
+            .await?;
+        for (node, request) in requests {
+            let response = self.client.list_offsets(&node, request).await?;
+            let list_offset_result = self.handle_list_offsets_response(response)?;
+            if !list_offset_result.partitions_to_retry.is_empty() {
+                self.subscription.write().await.request_failed(
+                    list_offset_result.partitions_to_retry,
+                    self.timestamp + self.options.retry_backoff_ms,
+                );
+                self.client.update_full_metadata().await?;
+            }
+
+            for (tp, list_offsets_data) in list_offset_result.fetched_offsets {
+                if let Some(timestamp) = offset_reset_timestamps.get(&tp) {
+                    self.reset_offset_if_needed(
+                        tp,
+                        OffsetResetStrategy::from_timestamp(*timestamp),
+                        list_offsets_data,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn reset_offset_if_needed(
@@ -501,7 +496,6 @@ impl<Exe: Executor> Fetcher<Exe> {
     async fn group_list_offsets_request(
         &self,
         offset_reset_timestamps: &mut HashMap<TopicPartition, i64>,
-        version: i16,
     ) -> Result<HashMap<Node, ListOffsetsRequest>> {
         let mut node_request = HashMap::new();
         for node_entry in self.client.cluster_meta.nodes.iter() {
@@ -519,7 +513,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                     topics.keys(),
                     self.timestamp + self.options.request_timeout_ms as i64,
                 );
-                let request = self.list_offsets_builder(topics, version)?;
+                let request = self.list_offsets_builder(topics)?;
                 node_request.insert(node_entry.value().clone(), request);
             }
         }
@@ -530,21 +524,20 @@ impl<Exe: Executor> Fetcher<Exe> {
         &self,
         to_forget: Drain<TopicIdPartition>,
         forgotten_topics: &mut HashMap<TopicName, ForgottenTopic>,
-    ) {
+    ) -> Result<()> {
         for tp in to_forget {
             match forgotten_topics.get_mut(&tp.partition.topic) {
                 Some(topic) => topic.partitions.push(tp.partition.partition),
                 None => {
-                    let topic = ForgottenTopic {
-                        topic_id: tp.topic_id,
-                        topic: tp.partition.topic,
-                        partitions: vec![tp.partition.partition],
-                        unknown_tagged_fields: Default::default(),
-                    };
+                    let mut topic = ForgottenTopic::default();
+                    topic.topic_id = tp.topic_id;
+                    topic.topic = tp.partition.topic;
+                    topic.partitions = vec![tp.partition.partition];
                     forgotten_topics.insert(topic.topic.clone(), topic);
                 }
             }
         }
+        Ok(())
     }
 
     async fn fetch_builder(
@@ -555,39 +548,37 @@ impl<Exe: Executor> Fetcher<Exe> {
         let mut request = FetchRequest::default();
 
         let mut forgotten_topics = HashMap::new();
-        self.add_to_forgotten_topic_map(data.to_forget.drain(..), &mut forgotten_topics);
+        self.add_to_forgotten_topic_map(data.to_forget.drain(..), &mut forgotten_topics)?;
 
         // If a version older than v13 is used, topic-partition which were replaced
         // by a topic-partition with the same name but a different topic ID are not
         // sent out in the "forget" set in order to not remove the newly added
         // partition in the "fetch" set.
         if version >= 13 {
-            self.add_to_forgotten_topic_map(data.to_replace.drain(..), &mut forgotten_topics);
+            self.add_to_forgotten_topic_map(data.to_replace.drain(..), &mut forgotten_topics)?;
         }
         request.forgotten_topics_data = map_to_list(forgotten_topics);
 
         let mut topics: HashMap<TopicName, FetchTopic> = HashMap::new();
         for (tp, data) in data.to_send.drain() {
-            let partition = FetchPartition {
-                partition: tp.partition,
-                current_leader_epoch: data
-                    .current_leader_epoch
-                    .unwrap_or(NO_PARTITION_LEADER_EPOCH),
-                last_fetched_epoch: data.last_fetched_epoch.unwrap_or(NO_PARTITION_LEADER_EPOCH),
-                fetch_offset: data.fetch_offset + 1,
-                log_start_offset: data.log_start_offset,
-                partition_max_bytes: data.max_bytes,
-                ..Default::default()
-            };
+            let mut partition = FetchPartition::default();
+            partition.partition = tp.partition;
+            partition.current_leader_epoch = data
+                .current_leader_epoch
+                .unwrap_or(NO_PARTITION_LEADER_EPOCH);
+            partition.last_fetched_epoch =
+                data.last_fetched_epoch.unwrap_or(NO_PARTITION_LEADER_EPOCH);
+            partition.fetch_offset = data.fetch_offset + 1;
+            partition.log_start_offset = data.log_start_offset;
+            partition.partition_max_bytes = data.max_bytes;
+
             match topics.get_mut(&tp.topic) {
                 Some(fetch_topic) => fetch_topic.partitions.push(partition),
                 None => {
-                    let topic = FetchTopic {
-                        topic: tp.topic.clone(),
-                        topic_id: data.topic_id,
-                        partitions: vec![partition],
-                        ..Default::default()
-                    };
+                    let mut topic = FetchTopic::default();
+                    topic.topic = tp.topic.clone();
+                    topic.topic_id = data.topic_id;
+                    topic.partitions = vec![partition];
                     topics.insert(tp.topic, topic);
                 }
             }
@@ -624,16 +615,13 @@ impl<Exe: Executor> Fetcher<Exe> {
     pub fn list_offsets_builder(
         &self,
         assignments: HashMap<&TopicPartition, i64>,
-        version: i16,
     ) -> Result<ListOffsetsRequest> {
         let mut topics: HashMap<TopicName, Vec<ListOffsetsPartition>> = HashMap::new();
         for (partition, timestamp) in assignments {
-            let list_offsets_partition = ListOffsetsPartition {
-                partition_index: partition.partition,
-                current_leader_epoch: NO_PARTITION_LEADER_EPOCH,
-                timestamp,
-                ..Default::default()
-            };
+            let mut list_offsets_partition = ListOffsetsPartition::default();
+            list_offsets_partition.partition_index = partition.partition;
+            list_offsets_partition.current_leader_epoch = NO_PARTITION_LEADER_EPOCH;
+            list_offsets_partition.timestamp = timestamp;
 
             match topics.get_mut(&partition.topic) {
                 Some(partitions) => partitions.push(list_offsets_partition),
@@ -646,21 +634,17 @@ impl<Exe: Executor> Fetcher<Exe> {
 
         let mut list_offsets_topics = Vec::with_capacity(topics.len());
         for (name, partitions) in topics {
-            list_offsets_topics.push(ListOffsetsTopic {
-                name,
-                partitions,
-                ..Default::default()
-            });
+            let mut topic = ListOffsetsTopic::default();
+            topic.name = name;
+            topic.partitions = partitions;
+            list_offsets_topics.push(topic);
         }
-        let mut request = ListOffsetsRequest {
-            replica_id: BrokerId(-1),
-            topics: list_offsets_topics,
-            ..Default::default()
-        };
 
-        if version >= 2 {
-            request.isolation_level = IsolationLevel::ReadUncommitted.into();
-        }
+        let mut request = ListOffsetsRequest::default();
+        request.replica_id = BrokerId(-1);
+        request.topics = list_offsets_topics;
+        request.isolation_level = IsolationLevel::ReadUncommitted.into();
+
         Ok(request)
     }
 }
