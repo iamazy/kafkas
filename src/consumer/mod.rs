@@ -27,7 +27,7 @@ use crate::{
     client::Kafka,
     consumer::{
         fetcher::{CompletedFetch, Fetcher},
-        subscription_state::{FetchPosition, SubscriptionState},
+        subscription_state::FetchPosition,
     },
     coordinator::{ConsumerCoordinator, CoordinatorEvent},
     executor::Executor,
@@ -218,7 +218,7 @@ impl<Exe: Executor> Consumer<Exe> {
         let options = Arc::new(options);
 
         let (notify_shutdown, _) = broadcast::channel(1);
-        let mut coordinator =
+        let coordinator =
             ConsumerCoordinator::new(client.clone(), options.clone(), notify_shutdown.clone())
                 .await?;
 
@@ -227,7 +227,7 @@ impl<Exe: Executor> Consumer<Exe> {
         let fetcher = Fetcher::new(
             client.clone(),
             Local::now().timestamp(),
-            coordinator.subscriptions().await?,
+            coordinator.event_sender(),
             options.clone(),
             tx,
         );
@@ -418,7 +418,7 @@ async fn handle_partition_response<Exe: Executor>(
             let error_msg = format!("{} is out of range.", completed_fetch.partition);
             let strategy = options.auto_offset_reset;
             if !matches!(strategy, OffsetResetStrategy::None) {
-                info!("{error_msg}, resetting offset");
+                info!("{error_msg} resetting offset.");
                 event_tx
                     .send(CoordinatorEvent::ResetOffset {
                         partition: completed_fetch.partition.clone(),
@@ -429,7 +429,7 @@ async fn handle_partition_response<Exe: Executor>(
                 completed_partitions.remove(&completed_fetch.partition);
             } else {
                 info!(
-                    "{error_msg}, raising error to the application since no reset policy is \
+                    "{error_msg} raising error to the application since no reset policy is \
                      configured."
                 );
                 return Err(error.into());

@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures::channel::{
-    mpsc::{SendError, TryRecvError},
+    mpsc::{SendError, TryRecvError, TrySendError},
     oneshot::Canceled,
 };
 use kafka_protocol::{
@@ -113,6 +113,11 @@ impl From<DecodeError> for Error {
     }
 }
 
+impl<T> From<TrySendError<T>> for Error {
+    fn from(value: TrySendError<T>) -> Self {
+        Error::Custom(format!("{value}"))
+    }
+}
 impl From<TryRecvError> for Error {
     fn from(value: TryRecvError) -> Self {
         Error::Custom(value.to_string())
