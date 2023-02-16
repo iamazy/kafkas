@@ -49,8 +49,6 @@ async fn main() -> Result<(), Box<Error>> {
         let ret = producer.send(&topic, record).await?;
         let _ = tx.send(ret).await;
     }
-    // hold your main thread to prevent exit immediately.
-    tokio::time::sleep(Duration::from_secs(1)).await;
 }
 ```
 
@@ -61,16 +59,19 @@ async fn main() -> Result<(), Box<Error>> {
 async fn main() -> Result<(), Box<Error>> {
     let client = Kafka::new("127.0.0.1:9092", KafkaOptions::default(), TokioExecutor).await?;
 
-    let consumer_options = ConsumerOptions::new("app");
+    let mut consumer_options = ConsumerOptions::new("default");
+    consumer_options.auto_commit_enabled = false;
+    
     let mut consumer = Consumer::new(kafka_client, consumer_options).await?;
-
     let consume_stream = consumer.subscribe(vec!["kafka"]).await?;
     pin_mut!(consume_stream);
 
-    while let Some(Ok(record)) = consume_stream.next().await {
-        if let Some(record) = record.value {
-            println!("{:?}", String::from_utf8(record.to_vec())?);
+    while let Some(records) = consume_stream.next().await {
+        for record in records {
+            // do something
         }
+        // needed only when `auto_commit_enabled` is false
+        consumer.commit_async().await?;
     }
 }
 ```
