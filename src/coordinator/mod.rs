@@ -150,7 +150,7 @@ fn find_coordinator_builder(
         request.coordinator_keys = vec![key];
     }
 
-    if (1..=4).contains(&version) {
+    if version >= 1 {
         request.key_type = key_type.into();
     }
     Ok(request)

@@ -35,12 +35,6 @@ impl FetchSession {
         }
     }
 
-    pub fn add_topic(&mut self, topic_id: Uuid, topic: TopicName) {
-        if topic_id != Uuid::nil() && !topic.is_empty() {
-            self.session_topic_names.insert(topic_id, topic);
-        }
-    }
-
     fn fetch_response_partitions(
         &self,
         response: &FetchResponse,

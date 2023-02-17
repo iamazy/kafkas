@@ -100,8 +100,8 @@ pub struct TopicIdPartition {
 
 #[derive(Clone, Default, Eq, PartialEq, Hash)]
 pub struct TopicPartition {
-    pub topic: TopicName,
-    pub partition: PartitionId,
+    pub(crate) topic: TopicName,
+    pub(crate) partition: PartitionId,
 }
 
 impl TopicPartition {
@@ -172,11 +172,7 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    pub fn new() -> Cluster {
-        Default::default()
-    }
-
-    pub fn merge_meta(&self, other: MetadataResponse) -> Result<()> {
+    pub fn update_metadata(&self, other: MetadataResponse) -> Result<()> {
         let cluster_id = other.cluster_id;
         {
             let mut lock = self.id.lock()?;
@@ -300,10 +296,11 @@ impl Cluster {
             let mut topic_partitions = Vec::new();
             for topic_entry in self.topics.iter() {
                 for partition in topic_entry.partitions.iter() {
-                    topic_partitions.push(TopicPartition::new0(
-                        topic_entry.key().clone(),
-                        partition.partition,
-                    ));
+                    let tp = TopicPartition {
+                        topic: topic_entry.key().clone(),
+                        partition: partition.partition,
+                    };
+                    topic_partitions.push(tp);
                 }
             }
             self.partitions_by_nodes.insert(node, topic_partitions);

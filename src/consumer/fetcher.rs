@@ -121,10 +121,10 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 };
 
                                 for partition in fetchable_topic.partitions {
-                                    let tp = TopicPartition::new0(
-                                        topic.clone(),
-                                        partition.partition_index,
-                                    );
+                                    let tp = TopicPartition {
+                                        topic: topic.clone(),
+                                        partition: partition.partition_index,
+                                    };
 
                                     match fetch_request_data.session_partitions.get(&tp) {
                                         Some(data) => {
@@ -293,7 +293,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                 None => {
                     return Err(Error::Custom(format!(
                         "Missing position for fetchable {tp}"
-                    )))
+                    )));
                 }
             }
         }
@@ -422,8 +422,12 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 &topic.name, partition
                             );
                             if offset != UNKNOWN_OFFSET {
+                                let tp = TopicPartition {
+                                    topic: topic.name,
+                                    partition,
+                                };
                                 fetched_offsets.insert(
-                                    TopicPartition::new0(topic.name, partition),
+                                    tp,
                                     ListOffsetData {
                                         offset,
                                         timestamp: None,
@@ -448,8 +452,12 @@ impl<Exe: Executor> Fetcher<Exe> {
                                     } else {
                                         Some(partition_response.leader_epoch)
                                     };
+                                let tp = TopicPartition {
+                                    topic: topic.name,
+                                    partition,
+                                };
                                 fetched_offsets.insert(
-                                    TopicPartition::new0(topic.name, partition),
+                                    tp,
                                     ListOffsetData {
                                         offset: partition_response.offset,
                                         timestamp: Some(partition_response.timestamp),
@@ -486,8 +494,11 @@ impl<Exe: Executor> Fetcher<Exe> {
                             "Attempt to fetch offsets for [{} - {}] failed due to {}, retrying.",
                             topic.name.0, partition, error
                         );
-                        partitions_to_retry
-                            .push(TopicPartition::new0(topic.name.clone(), partition));
+                        let tp = TopicPartition {
+                            topic: topic.name.clone(),
+                            partition,
+                        };
+                        partitions_to_retry.push(tp);
                     }
                     Some(ResponseError::UnknownTopicOrPartition) => {
                         warn!(
@@ -495,8 +506,11 @@ impl<Exe: Executor> Fetcher<Exe> {
                              partition [{} - {}]",
                             topic.name.0, partition
                         );
-                        partitions_to_retry
-                            .push(TopicPartition::new0(topic.name.clone(), partition));
+                        let tp = TopicPartition {
+                            topic: topic.name.clone(),
+                            partition,
+                        };
+                        partitions_to_retry.push(tp);
                     }
                     Some(ResponseError::TopicAuthorizationFailed) => {
                         unauthorized_topics.push(topic.name.clone());
@@ -507,8 +521,11 @@ impl<Exe: Executor> Fetcher<Exe> {
                              exception: {}, retrying.",
                             topic.name.0, partition, error
                         );
-                        partitions_to_retry
-                            .push(TopicPartition::new0(topic.name.clone(), partition));
+                        let tp = TopicPartition {
+                            topic: topic.name.clone(),
+                            partition,
+                        };
+                        partitions_to_retry.push(tp);
                     }
                 }
             }
@@ -619,30 +636,28 @@ impl<Exe: Executor> Fetcher<Exe> {
             }
         }
 
-        if version <= 13 {
-            request.replica_id = BrokerId(-1);
-            request.max_wait_ms = self.options.fetch_max_wait_ms;
-            request.min_bytes = self.options.fetch_min_bytes;
-            request.topics = map_to_list(topics);
+        request.replica_id = BrokerId(-1);
+        request.max_wait_ms = self.options.fetch_max_wait_ms;
+        request.min_bytes = self.options.fetch_min_bytes;
+        request.topics = map_to_list(topics);
 
-            if version >= 3 {
-                request.max_bytes = self.options.max_partition_fetch_bytes;
-            } else {
-                request.max_bytes = i32::MAX;
-            }
-            if version >= 4 {
-                request.isolation_level = IsolationLevel::ReadUncommitted.into();
-            }
-            if version >= 7 {
-                request.session_id = data.metadata.session_id;
-                request.session_epoch = data.metadata.epoch;
-            }
-            if version >= 11 {
-                request.rack_id = Default::default();
-            }
-            if version >= 12 {
-                request.cluster_id = None;
-            }
+        if version >= 3 {
+            request.max_bytes = self.options.max_partition_fetch_bytes;
+        } else {
+            request.max_bytes = i32::MAX;
+        }
+        if version >= 4 {
+            request.isolation_level = IsolationLevel::ReadUncommitted.into();
+        }
+        if version >= 7 {
+            request.session_id = data.metadata.session_id;
+            request.session_epoch = data.metadata.epoch;
+        }
+        if version >= 11 {
+            request.rack_id = Default::default();
+        }
+        if version >= 12 {
+            request.cluster_id = None;
         }
         Ok(request)
     }

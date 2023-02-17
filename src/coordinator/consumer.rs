@@ -362,7 +362,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
     }
 
     pub async fn describe_groups(&mut self) -> Result<()> {
-        if let Some(version_range) = self.client.version_range(ApiKey::JoinGroupKey) {
+        if let Some(version_range) = self.client.version_range(ApiKey::DescribeGroupsKey) {
             let describe_groups_response = self
                 .client
                 .describe_groups(&self.node, self.describe_groups_builder(version_range.max)?)
@@ -374,7 +374,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
             }
             Ok(())
         } else {
-            Err(Error::InvalidApiRequest(ApiKey::JoinGroupKey))
+            Err(Error::InvalidApiRequest(ApiKey::DescribeGroupsKey))
         }
     }
 
@@ -510,7 +510,10 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                     self.subscriptions.assignments.clear();
                     for (topic, partitions) in assignment.partitions {
                         for partition in partitions.iter() {
-                            let tp = TopicPartition::new0(topic.clone(), *partition);
+                            let tp = TopicPartition {
+                                topic: topic.clone(),
+                                partition: *partition,
+                            };
                             let mut tp_state = TopicPartitionState::new(*partition);
                             tp_state.position.current_leader =
                                 self.client.cluster_meta.current_leader(&tp);
@@ -721,32 +724,29 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
 
     fn describe_groups_builder(&self, version: i16) -> Result<DescribeGroupsRequest> {
         let mut request = DescribeGroupsRequest::default();
-        if version <= 5 {
-            request.groups = vec![self.group_meta.group_id.clone()];
+        request.groups = vec![self.group_meta.group_id.clone()];
 
-            if version >= 3 {
-                request.include_authorized_operations = true;
-            }
+        if version >= 3 {
+            request.include_authorized_operations = true;
         }
         Ok(request)
     }
 
     fn join_group_builder(&self, version: i16) -> Result<JoinGroupRequest> {
         let mut request = JoinGroupRequest::default();
-        if version <= 9 {
-            request.group_id = self.group_meta.group_id.clone();
-            request.member_id = self.group_meta.member_id.clone();
-            request.protocol_type = StrBytes::from_str(CONSUMER_PROTOCOL_TYPE);
-            request.protocols = self.join_group_protocol()?;
-            request.session_timeout_ms = self.consumer_options.rebalance_options.session_timeout_ms;
-            if version >= 1 {
-                request.rebalance_timeout_ms =
-                    self.consumer_options.rebalance_options.rebalance_timeout_ms;
-            }
-            if version >= 5 {
-                request.group_instance_id = self.group_meta.group_instance_id.clone();
-            }
+        request.group_id = self.group_meta.group_id.clone();
+        request.member_id = self.group_meta.member_id.clone();
+        request.protocol_type = StrBytes::from_str(CONSUMER_PROTOCOL_TYPE);
+        request.protocols = self.join_group_protocol()?;
+        request.session_timeout_ms = self.consumer_options.rebalance_options.session_timeout_ms;
+        if version >= 1 {
+            request.rebalance_timeout_ms =
+                self.consumer_options.rebalance_options.rebalance_timeout_ms;
         }
+        if version >= 5 {
+            request.group_instance_id = self.group_meta.group_instance_id.clone();
+        }
+
         Ok(request)
     }
 
@@ -771,37 +771,34 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
 
     fn sync_group_builder(&self, version: i16) -> Result<SyncGroupRequest> {
         let mut request = SyncGroupRequest::default();
-        if version <= 5 {
-            request.group_id = self.group_meta.group_id.clone();
-            request.member_id = self.group_meta.member_id.clone();
-            request.generation_id = self.group_meta.generation_id;
+        request.group_id = self.group_meta.group_id.clone();
+        request.member_id = self.group_meta.member_id.clone();
+        request.generation_id = self.group_meta.generation_id;
 
-            if self.group_meta.member_id == self.group_meta.leader {
-                match self.group_meta.protocol_name {
-                    Some(ref protocol) => {
-                        let assignor = self.look_up_assignor(&protocol.to_string())?;
-                        let cluster = self.client.cluster_meta.clone();
-                        request.assignments = serialize_assignments(
-                            assignor.assign(cluster, &self.group_subscription)?,
-                        )?;
-                    }
-                    None => {
-                        return Err(Error::Custom(format!(
-                            "Group leader {} has no partition assignor protocol",
-                            self.group_meta.leader
-                        )));
-                    }
+        if self.group_meta.member_id == self.group_meta.leader {
+            match self.group_meta.protocol_name {
+                Some(ref protocol) => {
+                    let assignor = self.look_up_assignor(&protocol.to_string())?;
+                    let cluster = self.client.cluster_meta.clone();
+                    request.assignments =
+                        serialize_assignments(assignor.assign(cluster, &self.group_subscription)?)?;
+                }
+                None => {
+                    return Err(Error::Custom(format!(
+                        "Group leader {} has no partition assignor protocol",
+                        self.group_meta.leader
+                    )));
                 }
             }
+        }
 
-            if version >= 3 {
-                request.group_instance_id = self.group_meta.group_instance_id.clone();
-            }
+        if version >= 3 {
+            request.group_instance_id = self.group_meta.group_instance_id.clone();
+        }
 
-            if version == 5 {
-                request.protocol_name = self.group_meta.protocol_name.clone();
-                request.protocol_type = self.group_meta.protocol_type.clone();
-            }
+        if version == 5 {
+            request.protocol_name = self.group_meta.protocol_name.clone();
+            request.protocol_type = self.group_meta.protocol_type.clone();
         }
         Ok(request)
     }
@@ -917,14 +914,12 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
 
     pub fn heartbeat_builder(&self, version: i16) -> Result<HeartbeatRequest> {
         let mut request = HeartbeatRequest::default();
-        if version <= 4 {
-            request.group_id = self.group_meta.group_id.clone();
-            request.member_id = self.group_meta.member_id.clone();
-            request.generation_id = self.group_meta.generation_id;
+        request.group_id = self.group_meta.group_id.clone();
+        request.member_id = self.group_meta.member_id.clone();
+        request.generation_id = self.group_meta.generation_id;
 
-            if version >= 3 {
-                request.group_instance_id = self.group_meta.group_instance_id.clone();
-            }
+        if version >= 3 {
+            request.group_instance_id = self.group_meta.group_instance_id.clone();
         }
         Ok(request)
     }

@@ -1,7 +1,7 @@
-pub mod fetch_session;
-pub mod fetcher;
-pub mod partition_assignor;
-pub mod subscription_state;
+mod fetch_session;
+mod fetcher;
+pub(crate) mod partition_assignor;
+pub(crate) mod subscription_state;
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -60,7 +60,7 @@ pub enum OffsetResetStrategy {
 }
 
 impl OffsetResetStrategy {
-    pub fn from_timestamp(timestamp: i64) -> Self {
+    fn from_timestamp(timestamp: i64) -> Self {
         match timestamp {
             -2 => Self::Earliest,
             -1 => Self::Latest,
@@ -68,7 +68,7 @@ impl OffsetResetStrategy {
         }
     }
 
-    pub fn strategy_timestamp(&self) -> i64 {
+    pub(crate) fn strategy_timestamp(&self) -> i64 {
         match self {
             Self::Earliest => -2,
             Self::Latest => -1,
