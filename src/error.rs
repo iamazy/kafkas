@@ -102,14 +102,14 @@ impl From<ConsumeError> for Error {
 }
 
 impl From<EncodeError> for Error {
-    fn from(_: EncodeError) -> Self {
-        Error::Connection(ConnectionError::Encoding("encode error".into()))
+    fn from(value: EncodeError) -> Self {
+        Error::Connection(ConnectionError::Encoding(value.to_string()))
     }
 }
 
 impl From<DecodeError> for Error {
-    fn from(_: DecodeError) -> Self {
-        Error::Connection(ConnectionError::Decoding("decode error".into()))
+    fn from(value: DecodeError) -> Self {
+        Error::Connection(ConnectionError::Decoding(value.to_string()))
     }
 }
 
@@ -177,14 +177,14 @@ impl From<NotEnoughBytesError> for ConnectionError {
 }
 
 impl From<EncodeError> for ConnectionError {
-    fn from(_: EncodeError) -> Self {
-        ConnectionError::Encoding("encode error".into())
+    fn from(value: EncodeError) -> Self {
+        ConnectionError::Encoding(value.to_string())
     }
 }
 
 impl From<DecodeError> for ConnectionError {
-    fn from(_: DecodeError) -> Self {
-        ConnectionError::Decoding("decode error".into())
+    fn from(value: DecodeError) -> Self {
+        ConnectionError::Decoding(value.to_string())
     }
 }
 
@@ -258,7 +258,7 @@ impl std::fmt::Display for ProduceError {
                         .as_ref()
                         .map(drop)
                         .unwrap_err();
-                    write!(f, "first error: {first_error}")?;
+                    write!(f, "First error: {first_error}")?;
                 }
                 Ok(())
             }

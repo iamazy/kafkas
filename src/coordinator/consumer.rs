@@ -57,7 +57,10 @@ macro_rules! offset_fetch_block {
     ($self:ident, $source:ident) => {
         for topic in $source.topics {
             for partition in topic.partitions {
-                let tp = TopicPartition::new0(topic.name.clone(), partition.partition_index);
+                let tp = TopicPartition {
+                    topic: topic.name.clone(),
+                    partition: partition.partition_index,
+                };
                 if partition.error_code.is_ok() {
                     if let Some(partition_state) = $self.subscriptions.assignments.get_mut(&tp) {
                         partition_state.position.offset = partition.committed_offset;

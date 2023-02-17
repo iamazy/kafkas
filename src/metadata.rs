@@ -105,10 +105,6 @@ pub struct TopicPartition {
 }
 
 impl TopicPartition {
-    pub(crate) fn new0(topic: TopicName, partition: PartitionId) -> Self {
-        Self { topic, partition }
-    }
-
     pub fn new<S: AsRef<str>>(topic: S, partition: PartitionId) -> Self {
         Self {
             topic: topic.as_ref().to_string().to_str_bytes().into(),
@@ -180,7 +176,7 @@ impl Cluster {
                 *lock = cluster_id;
             } else if *lock != cluster_id {
                 return Err(Error::Custom(format!(
-                    "cluster id: {cluster_id:?} is not equal to {:?}",
+                    "Cluster id: {cluster_id:?} is not equal to {:?}",
                     *lock
                 )));
             }
