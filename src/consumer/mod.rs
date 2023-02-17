@@ -418,12 +418,13 @@ async fn handle_partition_response<Exe: Executor>(
             let strategy = options.auto_offset_reset;
             if !matches!(strategy, OffsetResetStrategy::None) {
                 info!("{error_msg} resetting offset.");
-                event_tx
-                    .send(CoordinatorEvent::ResetOffset {
-                        partition: completed_fetch.partition.clone(),
-                        strategy,
-                    })
-                    .await?;
+                let (tx, rx) = oneshot::channel();
+                event_tx.unbounded_send(CoordinatorEvent::ResetOffset {
+                    partition: completed_fetch.partition.clone(),
+                    strategy,
+                    notify: tx,
+                })?;
+                rx.await?;
                 reset_offset_tx.send(()).await?;
                 completed_partitions.remove(&completed_fetch.partition);
             } else {
@@ -533,6 +534,7 @@ async fn reset_offset<Exe: Executor>(
 
         match select(next_reset_offset, shutdown).await {
             Either::Left((Some(_), _)) => {
+                println!("111");
                 if let Err(err) = fetcher.reset_offset().await {
                     error!("Reset offset failed, {}", err);
                 }

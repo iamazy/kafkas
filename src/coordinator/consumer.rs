@@ -101,7 +101,7 @@ macro_rules! coordinator_task {
             .interval(Duration::from_millis($interval_ms as u64));
 
         let mut shutdown = $self.notify_shutdown.subscribe();
-        let mut event_tx = $self.event_tx.clone();
+        let event_tx = $self.event_tx.clone();
 
         $self.client.executor.spawn(Box::pin(async move {
             let task_name = stringify!($event);
@@ -115,7 +115,7 @@ macro_rules! coordinator_task {
 
                 match select(interval_fut, shutdown).await {
                     Either::Left((Some(_), _)) => {
-                        if let Err(err) = event_tx.send(CoordinatorEvent::$event).await {
+                        if let Err(err) = event_tx.unbounded_send(CoordinatorEvent::$event) {
                             error!("{task_name} error: {err}");
                         }
                     }
@@ -179,35 +179,35 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 
     pub async fn subscribe(&mut self, topics: Vec<TopicName>) -> Result<()> {
         self.event_tx
-            .send(CoordinatorEvent::Subscribe(topics))
-            .await?;
+            .unbounded_send(CoordinatorEvent::Subscribe(topics))?;
         Ok(())
     }
 
     pub async fn unsubscribe(&mut self) -> Result<()> {
-        self.event_tx.send(CoordinatorEvent::Unsubscribe).await?;
+        self.event_tx
+            .unbounded_send(CoordinatorEvent::Unsubscribe)?;
         Ok(())
     }
 
     pub async fn join_group(&mut self) -> Result<()> {
-        self.event_tx.send(CoordinatorEvent::JoinGroup).await?;
+        self.event_tx.unbounded_send(CoordinatorEvent::JoinGroup)?;
         Ok(())
     }
 
     pub async fn sync_group(&mut self) -> Result<()> {
-        self.event_tx.send(CoordinatorEvent::SyncGroup).await?;
+        self.event_tx.unbounded_send(CoordinatorEvent::SyncGroup)?;
         Ok(())
     }
 
     pub async fn maybe_leave_group(&mut self, reason: StrBytes) -> Result<()> {
         self.event_tx
-            .send(CoordinatorEvent::LeaveGroup(reason))
-            .await?;
+            .unbounded_send(CoordinatorEvent::LeaveGroup(reason))?;
         Ok(())
     }
 
     pub async fn offset_fetch(&mut self) -> Result<()> {
-        self.event_tx.send(CoordinatorEvent::OffsetFetch).await?;
+        self.event_tx
+            .unbounded_send(CoordinatorEvent::OffsetFetch)?;
         Ok(())
     }
 
@@ -263,7 +263,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.commit_offset_tx = Some(commit_offset_tx);
 
         let mut shutdown = self.notify_shutdown.subscribe();
-        let mut event_tx = self.event_tx.clone();
+        let event_tx = self.event_tx.clone();
 
         self.client.executor.spawn(Box::pin(async move {
             loop {
@@ -275,7 +275,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 
                 match select(offset_commit, shutdown).await {
                     Either::Left((Some(_), _)) => {
-                        if let Err(err) = event_tx.send(CoordinatorEvent::OffsetCommit).await {
+                        if let Err(err) = event_tx.unbounded_send(CoordinatorEvent::OffsetCommit) {
                             error!("Offset commit error: {err}");
                         }
                     }
@@ -948,10 +948,14 @@ async fn coordinator_loop<Exe: Executor>(
             CoordinatorEvent::ResetOffset {
                 partition,
                 strategy,
-            } => match coordinator.subscriptions.assignments.get_mut(&partition) {
-                Some(tp_state) => tp_state.reset(strategy),
-                None => Ok(()),
-            },
+                notify,
+            } => {
+                if let Some(tp_state) = coordinator.subscriptions.assignments.get_mut(&partition) {
+                    let _ = tp_state.reset(strategy);
+                }
+                let _ = notify.send(());
+                Ok(())
+            }
             CoordinatorEvent::Heartbeat => coordinator.heartbeat().await,
             CoordinatorEvent::Subscribe(topics) => coordinator.subscribe(topics).await,
             CoordinatorEvent::Unsubscribe => {
@@ -1010,10 +1014,12 @@ async fn coordinator_loop<Exe: Executor>(
             CoordinatorEvent::MaybeValidatePositionForCurrentLeader {
                 partition,
                 current_leader,
+                partitions_tx,
             } => {
-                let _ = coordinator
+                let ret = coordinator
                     .subscriptions
                     .maybe_validate_position_for_current_leader(&partition, current_leader);
+                let _ = partitions_tx.send(ret);
                 Ok(())
             }
             CoordinatorEvent::FetchPosition {
@@ -1047,30 +1053,39 @@ async fn coordinator_loop<Exe: Executor>(
             CoordinatorEvent::RequestFailed {
                 partitions,
                 next_retry_time_ms,
+                notify,
             } => {
                 coordinator
                     .subscriptions
                     .request_failed(partitions, next_retry_time_ms);
+                let _ = notify.send(());
                 Ok(())
             }
             CoordinatorEvent::SetNextAllowedRetry {
                 assignments,
                 next_allowed_reset_ms,
+                notify,
             } => {
                 coordinator
                     .subscriptions
                     .set_next_allowed_retry(assignments, next_allowed_reset_ms);
+                let _ = notify.send(());
                 Ok(())
             }
             CoordinatorEvent::MaybeSeekUnvalidated {
                 partition,
                 position,
                 offset_strategy,
-            } => coordinator.subscriptions.maybe_seek_unvalidated(
-                partition,
-                position,
-                offset_strategy,
-            ),
+                notify,
+            } => {
+                let ret = coordinator.subscriptions.maybe_seek_unvalidated(
+                    partition,
+                    position,
+                    offset_strategy,
+                );
+                let _ = notify.send(ret);
+                Ok(())
+            }
             CoordinatorEvent::Shutdown => break,
         };
         if let Err(err) = ret {

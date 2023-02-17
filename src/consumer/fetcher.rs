@@ -165,7 +165,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 }
                             }
 
-                            if (7..=13).contains(&version) {
+                            if version >= 7 {
                                 match fetch_response.error_code.err() {
                                     None => {
                                         session.next_metadata.session_id = fetch_response.session_id
@@ -215,12 +215,15 @@ impl<Exe: Executor> Fetcher<Exe> {
             .unbounded_send(CoordinatorEvent::Assignments { partitions_tx: tx })?;
         for tp in rx.await? {
             let current_leader = self.client.cluster_meta.current_leader(&tp);
+            let (tx, rx) = oneshot::channel();
             self.event_tx.unbounded_send(
                 CoordinatorEvent::MaybeValidatePositionForCurrentLeader {
                     partition: tp,
                     current_leader,
+                    partitions_tx: tx,
                 },
             )?;
+            let _ = rx.await;
         }
 
         Ok(())
@@ -345,15 +348,19 @@ impl<Exe: Executor> Fetcher<Exe> {
         let requests = self
             .group_list_offsets_request(&mut offset_reset_timestamps)
             .await?;
+        println!("request: {requests:?}");
         for (node, request) in requests {
             let response = self.client.list_offsets(&node, request).await?;
             let list_offset_result = self.handle_list_offsets_response(response)?;
             if !list_offset_result.partitions_to_retry.is_empty() {
+                let (tx, rx) = oneshot::channel();
                 self.event_tx
                     .unbounded_send(CoordinatorEvent::RequestFailed {
                         partitions: list_offset_result.partitions_to_retry,
                         next_retry_time_ms: self.timestamp + self.options.retry_backoff_ms,
+                        notify: tx,
                     })?;
+                rx.await?;
                 self.client.update_full_metadata().await?;
             }
 
@@ -383,12 +390,15 @@ impl<Exe: Executor> Fetcher<Exe> {
             current_leader: self.client.cluster_meta.current_leader(&partition),
         };
         // TODO: metadata update last seen epoch if newer
+        let (tx, rx) = oneshot::channel();
         self.event_tx
             .unbounded_send(CoordinatorEvent::MaybeSeekUnvalidated {
                 partition,
                 position,
                 offset_strategy,
+                notify: tx,
             })?;
+        rx.await??;
         Ok(())
     }
 
@@ -559,12 +569,15 @@ impl<Exe: Executor> Fetcher<Exe> {
                     }
                 }
 
+                let (tx, rx) = oneshot::channel();
                 self.event_tx
                     .unbounded_send(CoordinatorEvent::SetNextAllowedRetry {
                         assignments: topics.keys().cloned().collect(),
                         next_allowed_reset_ms: self.timestamp
                             + self.options.request_timeout_ms as i64,
+                        notify: tx,
                     })?;
+                rx.await?;
                 let request = self.list_offsets_builder(topics)?;
                 node_request.insert(node_entry.value().clone(), request);
             }

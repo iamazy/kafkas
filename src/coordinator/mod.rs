@@ -46,6 +46,7 @@ pub enum CoordinatorEvent {
     ResetOffset {
         partition: TopicPartition,
         strategy: OffsetResetStrategy,
+        notify: oneshot::Sender<()>,
     },
     Heartbeat,
     Subscribe(Vec<TopicName>),
@@ -72,6 +73,7 @@ pub enum CoordinatorEvent {
     MaybeValidatePositionForCurrentLeader {
         partition: TopicPartition,
         current_leader: LeaderAndEpoch,
+        partitions_tx: oneshot::Sender<Result<bool>>,
     },
     FetchPosition {
         partition: TopicPartition,
@@ -88,15 +90,18 @@ pub enum CoordinatorEvent {
     RequestFailed {
         partitions: Vec<TopicPartition>,
         next_retry_time_ms: i64,
+        notify: oneshot::Sender<()>,
     },
     SetNextAllowedRetry {
         assignments: Vec<TopicPartition>,
         next_allowed_reset_ms: i64,
+        notify: oneshot::Sender<()>,
     },
     MaybeSeekUnvalidated {
         partition: TopicPartition,
         position: FetchPosition,
         offset_strategy: OffsetResetStrategy,
+        notify: oneshot::Sender<Result<()>>,
     },
     Shutdown,
 }

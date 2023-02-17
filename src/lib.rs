@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 #![allow(clippy::mutable_key_type)]
-#![feature(async_closure)]
 
 use std::collections::HashMap;
 
