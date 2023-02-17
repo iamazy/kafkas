@@ -283,12 +283,10 @@ impl<Exe: Executor> Consumer<Exe> {
             self.notify_shutdown.subscribe(),
         )));
 
-        let event_tx = self.coordinator.event_sender();
-
         Ok(fetch_stream(
             self.client.clone(),
             self.options.clone(),
-            event_tx,
+            self.coordinator.event_sender(),
             self.fetches_rx.take().unwrap(),
             self.fetcher.completed_partitions.clone(),
             reset_offset_tx,
@@ -303,6 +301,7 @@ impl<Exe: Executor> Consumer<Exe> {
             ))
             .await?;
         self.coordinator.unsubscribe().await?;
+        // Stop heartbeat and offset commit task, not really shutdown the consumer.
         self.notify_shutdown.send(())?;
         info!("Unsubscribed all topics or patterns and assigned partitions");
         Ok(())
@@ -327,7 +326,7 @@ async fn do_fetch<Exe: Executor>(mut fetcher: Fetcher<Exe>, mut rx: broadcast::R
             Either::Left((Err(err), _)) => {
                 error!("Fetch error: {err}");
             }
-            Either::Left((_, _)) => {}
+            Either::Left(_) => {}
             Either::Right(_) => break,
         }
     }
@@ -344,8 +343,8 @@ fn fetch_stream<Exe: Executor>(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> impl Stream<Item = Vec<Record>> {
     stream! {
-    while let Some(completed_fetch) = completed_fetches_rx.next().await {
-        let records_fut = handle_partition_response(
+        while let Some(completed_fetch) = completed_fetches_rx.next().await {
+            let records_fut = handle_partition_response(
                 &client,
                 &mut reset_offset_tx,
                 completed_fetch,

@@ -384,10 +384,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         if let Some(version_range) = self.client.version_range(ApiKey::JoinGroupKey) {
             let join_group_response = self
                 .client
-                .join_group(
-                    &self.node,
-                    self.join_group_builder(version_range.max).await?,
-                )
+                .join_group(&self.node, self.join_group_builder(version_range.max)?)
                 .await?;
 
             match join_group_response.error_code.err() {
@@ -691,7 +688,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         Ok(())
     }
 
-    async fn join_group_protocol(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
+    fn join_group_protocol(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
         let topics = self
             .subscriptions
             .topics
@@ -734,13 +731,13 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         Ok(request)
     }
 
-    async fn join_group_builder(&self, version: i16) -> Result<JoinGroupRequest> {
+    fn join_group_builder(&self, version: i16) -> Result<JoinGroupRequest> {
         let mut request = JoinGroupRequest::default();
         if version <= 9 {
             request.group_id = self.group_meta.group_id.clone();
             request.member_id = self.group_meta.member_id.clone();
             request.protocol_type = StrBytes::from_str(CONSUMER_PROTOCOL_TYPE);
-            request.protocols = self.join_group_protocol().await?;
+            request.protocols = self.join_group_protocol()?;
             request.session_timeout_ms = self.consumer_options.rebalance_options.session_timeout_ms;
             if version >= 1 {
                 request.rebalance_timeout_ms =
