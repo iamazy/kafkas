@@ -17,7 +17,7 @@ use kafka_protocol::{
     ResponseError,
 };
 
-use crate::{producer::SendFuture, NodeId, PartitionId};
+use crate::{array_display, producer::SendFuture, NodeId, PartitionId};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -139,16 +139,20 @@ impl std::fmt::Display for Error {
             Error::Produce(e) => write!(f, "Produce error: {e}"),
             Error::Consume(e) => write!(f, "Consume error: {e}"),
             Error::PartitionNotAvailable { topic, partition } => {
-                write!(f, "Partition {partition} not available, topic: {topic:?}")
+                write!(f, "Partition {partition} not available, topic: {}", topic.0)
             }
             Error::TopicNotAvailable { topic } => {
-                write!(f, "Topic not available, topic: {topic:?}")
+                write!(f, "Topic not available, topic: {}", topic.0)
             }
             Error::TopicAuthorizationError { topics } => {
-                write!(f, "Topic Authorization Error, topics: {topics:?}")
+                write!(
+                    f,
+                    "Topic Authorization Error, topics: <{}>",
+                    array_display(topics.iter().map(|topic| &**topic))
+                )
             }
             Error::NodeNotAvailable { node } => {
-                write!(f, "Node not available, node: {node:?}")
+                write!(f, "Node not available, node: {node}")
             }
         }
     }

@@ -13,6 +13,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{
+    array_display,
     metadata::{TopicIdPartition, TopicPartition},
     NodeId,
 };
@@ -115,16 +116,17 @@ impl FetchSession {
         }
 
         if !omitted.is_empty() {
-            problem.extend(format!("omitted partitions=({omitted:?}),").chars());
+            problem
+                .extend(format!("omitted partitions=({}),", array_display(omitted.iter())).chars());
         }
         if !extra.is_empty() {
-            problem.extend(format!("extra partitions=({extra:?}),").chars());
+            problem.extend(format!("extra partitions=({}),", array_display(extra.iter())).chars());
         }
         if !extra_ids.is_empty() {
-            problem.extend(format!("extra ids=({extra_ids:?}),").chars());
+            problem.extend(format!("extra ids=({}),", array_display(extra_ids.iter())).chars());
         }
         if !omitted.is_empty() || !extra.is_empty() || !extra_ids.is_empty() {
-            problem.extend(format!("response=({partitions:?})").chars());
+            problem.extend(format!("response=({})", array_display(partitions.iter())).chars());
             return Some(problem);
         }
         None
@@ -148,13 +150,13 @@ impl FetchSession {
 
         let mut problem = String::new();
         if !extra.is_empty() {
-            problem.extend(format!("extra partitions=({extra:?}),").chars());
+            problem.extend(format!("extra partitions=({}),", array_display(extra.iter())).chars());
         }
         if !extra_ids.is_empty() {
-            problem.extend(format!("extra ids=({extra_ids:?}),").chars());
+            problem.extend(format!("extra ids=({}),", array_display(extra_ids.iter())).chars());
         }
         if !extra.is_empty() || !extra_ids.is_empty() {
-            problem.extend(format!("response=({partitions:?})").chars());
+            problem.extend(format!("response=({})", array_display(partitions.iter())).chars());
             return Some(problem);
         }
         None

@@ -311,7 +311,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
 
         let node = find_coordinator(&client, group_id.clone(), CoordinatorType::Group).await?;
         info!(
-            "Find coordinator success, group {:?}, node: {}",
+            "Find coordinator success, group {}, node: {}",
             group_id,
             node.address()
         );
@@ -372,7 +372,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                     .await?;
                 for group in describe_groups_response.groups {
                     if group.error_code.is_err() {
-                        error!("Describe group {:?} failed", group.group_id);
+                        error!("Describe group [{}] failed", group.group_id.0);
                     }
                 }
                 Ok(())
@@ -499,9 +499,10 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                     None => {
                         if self.is_protocol_type_inconsistent(&sync_group_response.protocol_type) {
                             error!(
-                                "JoinGroup failed: Inconsistent Protocol Type, received {:?} but \
-                                 expected {:?}",
-                                sync_group_response.protocol_type, self.group_meta.protocol_type
+                                "JoinGroup failed: Inconsistent Protocol Type, received {} but \
+                                 expected {}",
+                                sync_group_response.protocol_type.unwrap(),
+                                self.group_meta.protocol_type.as_ref().unwrap()
                             );
                             return Err(ResponseError::InconsistentGroupProtocol.into());
                         }
@@ -531,7 +532,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                         self.state = MemberState::Stable;
                         info!(
                             "Sync group [{}] success, leader = {}, member_id = {}, generation_id \
-                             = {}, protocol_type = {:?}, protocol_name = {:?}, assignments = <{}>",
+                             = {}, protocol_type = {}, protocol_name = {}, assignments = <{}>",
                             self.group_meta.group_id.0,
                             self.group_meta.leader,
                             self.group_meta.member_id,

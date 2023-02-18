@@ -155,7 +155,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                                                 } else {
                                                     warn!(
                                                         "Response for missing session request \
-                                                         partition: {tp}; metadata={metadata}."
+                                                         {tp}; metadata={metadata}."
                                                     );
                                                 }
                                                 continue;
@@ -417,9 +417,9 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 partition_response.old_style_offsets[0]
                             };
                             debug!(
-                                "Handing v0 ListOffsetResponse response for [{:?} - {}]. Fetched \
+                                "Handing v0 ListOffsetResponse response for [{} - {}]. Fetched \
                                  offset {offset}",
-                                &topic.name, partition
+                                &topic.name.0, partition
                             );
                             if offset != UNKNOWN_OFFSET {
                                 let tp = TopicPartition {

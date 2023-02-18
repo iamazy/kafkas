@@ -60,8 +60,8 @@ pub trait PartitionAssigner {
                 partitions_per_topic.insert(topic, num_partitions);
             } else {
                 debug!(
-                    "skipping assignment for topic {:?} since no metadata is available",
-                    topic
+                    "skipping assignment for topic {} since no metadata is available",
+                    topic.0
                 );
             }
         }
