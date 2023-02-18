@@ -101,7 +101,7 @@ macro_rules! coordinator_task {
             .interval(Duration::from_millis($interval_ms as u64));
 
         let mut shutdown = $self.notify_shutdown.subscribe();
-        let mut event_tx = $self.event_tx.clone();
+        let event_tx = $self.event_tx.clone();
 
         $self.client.executor.spawn(Box::pin(async move {
             let task_name = stringify!($event);
@@ -115,7 +115,7 @@ macro_rules! coordinator_task {
 
                 match select(interval_fut, shutdown).await {
                     Either::Left((Some(_), _)) => {
-                        if let Err(err) = event_tx.send(CoordinatorEvent::$event).await {
+                        if let Err(err) = event_tx.unbounded_send(CoordinatorEvent::$event) {
                             error!("{task_name} error: {err}");
                         }
                     }
@@ -177,37 +177,37 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.event_tx.clone()
     }
 
-    pub async fn subscribe(&mut self, topics: Vec<TopicName>) -> Result<()> {
+    pub async fn subscribe(&self, topics: Vec<TopicName>) -> Result<()> {
         self.event_tx
-            .send(CoordinatorEvent::Subscribe(topics))
-            .await?;
+            .unbounded_send(CoordinatorEvent::Subscribe(topics))?;
         Ok(())
     }
 
-    pub async fn unsubscribe(&mut self) -> Result<()> {
-        self.event_tx.send(CoordinatorEvent::Unsubscribe).await?;
-        Ok(())
-    }
-
-    pub async fn join_group(&mut self) -> Result<()> {
-        self.event_tx.send(CoordinatorEvent::JoinGroup).await?;
-        Ok(())
-    }
-
-    pub async fn sync_group(&mut self) -> Result<()> {
-        self.event_tx.send(CoordinatorEvent::SyncGroup).await?;
-        Ok(())
-    }
-
-    pub async fn maybe_leave_group(&mut self, reason: StrBytes) -> Result<()> {
+    pub async fn unsubscribe(&self) -> Result<()> {
         self.event_tx
-            .send(CoordinatorEvent::LeaveGroup(reason))
-            .await?;
+            .unbounded_send(CoordinatorEvent::Unsubscribe)?;
         Ok(())
     }
 
-    pub async fn offset_fetch(&mut self) -> Result<()> {
-        self.event_tx.send(CoordinatorEvent::OffsetFetch).await?;
+    pub async fn join_group(&self) -> Result<()> {
+        self.event_tx.unbounded_send(CoordinatorEvent::JoinGroup)?;
+        Ok(())
+    }
+
+    pub async fn sync_group(&self) -> Result<()> {
+        self.event_tx.unbounded_send(CoordinatorEvent::SyncGroup)?;
+        Ok(())
+    }
+
+    pub async fn maybe_leave_group(&self, reason: StrBytes) -> Result<()> {
+        self.event_tx
+            .unbounded_send(CoordinatorEvent::LeaveGroup(reason))?;
+        Ok(())
+    }
+
+    pub async fn offset_fetch(&self) -> Result<()> {
+        self.event_tx
+            .unbounded_send(CoordinatorEvent::OffsetFetch)?;
         Ok(())
     }
 
@@ -244,15 +244,14 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         Ok(())
     }
 
-    pub async fn seek(&mut self, partition: TopicPartition, offset: i64) -> Result<()> {
+    pub async fn seek(&self, partition: TopicPartition, offset: i64) -> Result<()> {
         if offset < 0 {
             return Err(Error::Custom(format!(
                 "offset {offset} is less than 0, which is invalid"
             )));
         }
         self.event_tx
-            .send(CoordinatorEvent::SeekOffset { partition, offset })
-            .await?;
+            .unbounded_send(CoordinatorEvent::SeekOffset { partition, offset })?;
         Ok(())
     }
 }
@@ -263,7 +262,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.commit_offset_tx = Some(commit_offset_tx);
 
         let mut shutdown = self.notify_shutdown.subscribe();
-        let mut event_tx = self.event_tx.clone();
+        let event_tx = self.event_tx.clone();
 
         self.client.executor.spawn(Box::pin(async move {
             loop {
@@ -275,7 +274,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 
                 match select(offset_commit, shutdown).await {
                     Either::Left((Some(_), _)) => {
-                        if let Err(err) = event_tx.send(CoordinatorEvent::OffsetCommit).await {
+                        if let Err(err) = event_tx.unbounded_send(CoordinatorEvent::OffsetCommit) {
                             error!("Offset commit error: {err}");
                         }
                     }
@@ -526,13 +525,14 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                     self.state = MemberState::Stable;
                     info!(
                         "Sync group [{}] success, leader = {}, member_id = {}, generation_id = \
-                         {}, protocol_type = {:?}, protocol_name = {:?}",
+                         {}, protocol_type = {:?}, protocol_name = {:?}, assignments = <{}>",
                         self.group_meta.group_id.0,
                         self.group_meta.leader,
                         self.group_meta.member_id,
                         self.group_meta.generation_id,
                         self.group_meta.protocol_type.as_ref().unwrap(),
                         self.group_meta.protocol_name.as_ref().unwrap(),
+                        crate::array_display(self.subscriptions.assignments.keys()),
                     );
                     Ok(())
                 }
@@ -841,7 +841,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
     }
 
     pub async fn offset_commit_builder(
-        &self,
+        &mut self,
         all_consumed: HashMap<TopicPartition, OffsetMetadata>,
     ) -> Result<OffsetCommitRequest> {
         let mut topics: HashMap<TopicName, Vec<OffsetCommitRequestPartition>> =
@@ -886,6 +886,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                      group"
                 );
                 return if self.rebalance_in_progress() {
+                    self.rejoin_group().await?;
                     Err(Error::Custom(
                         "Offset commit cannot be completed since the consumer is undergoing a \
                          rebalance for auto partition assignment. You can try completing the \

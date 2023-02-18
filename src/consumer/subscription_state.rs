@@ -82,17 +82,17 @@ impl SubscriptionState {
         partitions
     }
 
-    pub(crate) fn partitions_need_reset(&self, now: i64) -> Vec<TopicPartition> {
+    pub(crate) fn partitions_need_reset(&self, _now: i64) -> Vec<TopicPartition> {
         self.collection_partitions(|state| {
             matches!(state.fetch_state, FetchState::AwaitReset)
-                && !state.awaiting_retry_backoff(now)
+            // && !state.awaiting_retry_backoff(now)
         })
     }
 
-    fn partitions_need_validation(&self, now: i64) -> Vec<TopicPartition> {
+    fn partitions_need_validation(&self, _now: i64) -> Vec<TopicPartition> {
         self.collection_partitions(|state| {
             matches!(state.fetch_state, FetchState::AwaitValidation)
-                && !state.awaiting_retry_backoff(now)
+            // && !state.awaiting_retry_backoff(now)
         })
     }
 

@@ -1,7 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt::{Display, Formatter},
-    hash::Hash,
     sync::Arc,
     vec::Drain,
 };
@@ -28,8 +26,7 @@ use crate::{
             FetchRequestData, FetchRequestDataBuilder, FetchRequestPartitionData, FetchSession,
         },
         subscription_state::FetchPosition,
-        ConsumerOptions, IsolationLevel, OffsetResetStrategy, FINAL_EPOCH, INITIAL_EPOCH,
-        INVALID_SESSION_ID,
+        ConsumerOptions, IsolationLevel, OffsetResetStrategy,
     },
     coordinator::CoordinatorEvent,
     error::Result,
@@ -165,7 +162,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 }
                             }
 
-                            if (7..=13).contains(&version) {
+                            if version >= 7 {
                                 match fetch_response.error_code.err() {
                                     None => {
                                         session.next_metadata.session_id = fetch_response.session_id
@@ -696,66 +693,6 @@ impl<Exe: Executor> Fetcher<Exe> {
         request.isolation_level = IsolationLevel::ReadUncommitted.into();
 
         Ok(request)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Hash)]
-pub struct FetchMetadata {
-    pub session_id: i32,
-    pub epoch: i32,
-}
-
-impl Display for FetchMetadata {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        if self.session_id == INVALID_SESSION_ID {
-            write!(f, "(session_id=INVALID, ")?;
-        } else {
-            write!(f, "(session_id={}, ", self.session_id)?;
-        }
-
-        if self.epoch == INITIAL_EPOCH {
-            write!(f, "epoch=INITIAL)")
-        } else if self.epoch == FINAL_EPOCH {
-            write!(f, "epoch=FINAL)")
-        } else {
-            write!(f, "epoch={})", self.epoch)
-        }
-    }
-}
-
-impl FetchMetadata {
-    pub fn new(session_id: i32, epoch: i32) -> Self {
-        Self { session_id, epoch }
-    }
-
-    pub fn initial() -> Self {
-        Self::new(INVALID_SESSION_ID, INITIAL_EPOCH)
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.epoch == INITIAL_EPOCH || self.epoch == FINAL_EPOCH
-    }
-
-    pub fn new_incremental(session_id: i32) -> Self {
-        Self::new(session_id, next_epoch(INITIAL_EPOCH))
-    }
-
-    pub fn next_incremental(&mut self) {
-        self.epoch = next_epoch(self.epoch);
-    }
-
-    pub fn next_close_existing(&mut self) {
-        self.epoch = INITIAL_EPOCH;
-    }
-}
-
-fn next_epoch(prev_epoch: i32) -> i32 {
-    if prev_epoch < 0 {
-        FINAL_EPOCH
-    } else if prev_epoch == i32::MAX {
-        1
-    } else {
-        prev_epoch + 1
     }
 }
 

@@ -35,10 +35,6 @@ use crate::{
     NodeId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
 };
 
-const INITIAL_EPOCH: i32 = 0;
-const FINAL_EPOCH: i32 = -1;
-const INVALID_SESSION_ID: i32 = 0;
-
 /// High-level consumer record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerRecord {
@@ -418,12 +414,10 @@ async fn handle_partition_response<Exe: Executor>(
             let strategy = options.auto_offset_reset;
             if !matches!(strategy, OffsetResetStrategy::None) {
                 info!("{error_msg} resetting offset.");
-                event_tx
-                    .send(CoordinatorEvent::ResetOffset {
-                        partition: completed_fetch.partition.clone(),
-                        strategy,
-                    })
-                    .await?;
+                event_tx.unbounded_send(CoordinatorEvent::ResetOffset {
+                    partition: completed_fetch.partition.clone(),
+                    strategy,
+                })?;
                 reset_offset_tx.send(()).await?;
                 completed_partitions.remove(&completed_fetch.partition);
             } else {
@@ -483,27 +477,23 @@ async fn handle_partition_response<Exe: Executor>(
                         completed_fetch.partition,
                         records.len()
                     );
-                    event_tx
-                        .send(CoordinatorEvent::PartitionData {
-                            partition: completed_fetch.partition.clone(),
-                            position,
-                            data: partition,
-                            notify: tx,
-                        })
-                        .await?;
+                    event_tx.unbounded_send(CoordinatorEvent::PartitionData {
+                        partition: completed_fetch.partition.clone(),
+                        position,
+                        data: partition,
+                        notify: tx,
+                    })?;
                     rx.await?;
                     completed_partitions.remove(&completed_fetch.partition);
                     return Ok(Some(records));
                 }
                 None => {
-                    event_tx
-                        .send(CoordinatorEvent::PartitionData {
-                            partition: completed_fetch.partition,
-                            position,
-                            data: partition,
-                            notify: tx,
-                        })
-                        .await?;
+                    event_tx.unbounded_send(CoordinatorEvent::PartitionData {
+                        partition: completed_fetch.partition,
+                        position,
+                        data: partition,
+                        notify: tx,
+                    })?;
                     rx.await?;
                 }
             }
