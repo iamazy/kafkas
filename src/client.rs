@@ -1,6 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::StreamExt;
 use kafka_protocol::{
     messages::{
@@ -23,7 +24,7 @@ use crate::{
     connection_manager::{ConnectionManager, OperationRetryOptions},
     error::{ConnectionError, Error, Result},
     executor::Executor,
-    metadata::{Cluster, Node},
+    metadata::{Cluster, Node, TopicPartition},
     PartitionRef, ToStrBytes,
 };
 
@@ -32,7 +33,7 @@ pub trait DeserializeMessage {
     /// type produced from the message
     type Output: Sized;
     /// deserialize method that will be called by the consumer
-    fn deserialize_message(record: Record) -> Self::Output;
+    fn deserialize_message(partition: &TopicPartition, record: Record) -> Self::Output;
 }
 
 /// Helper trait for message serialization
@@ -50,7 +51,7 @@ pub struct Kafka<Exe: Executor> {
     pub operation_retry_options: OperationRetryOptions,
     pub executor: Arc<Exe>,
     pub cluster_meta: Arc<Cluster>,
-    supported_versions: HashMap<i16, VersionRange>,
+    supported_versions: Arc<DashMap<i16, VersionRange>>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +95,7 @@ impl<Exe: Executor> Kafka<Exe> {
         .await?;
 
         let api_versions_response = Self::api_version(&manager).await?;
-        let mut supported_versions = HashMap::with_capacity(api_versions_response.api_keys.len());
+        let supported_versions = DashMap::with_capacity(api_versions_response.api_keys.len());
         for (k, v) in api_versions_response.api_keys.iter() {
             supported_versions.insert(
                 *k,
@@ -123,7 +124,7 @@ impl<Exe: Executor> Kafka<Exe> {
             operation_retry_options,
             executor,
             cluster_meta: Arc::new(Cluster::default()),
-            supported_versions,
+            supported_versions: Arc::new(supported_versions),
         })
     }
 
@@ -138,8 +139,10 @@ impl<Exe: Executor> Kafka<Exe> {
         self.cluster_meta.partitions(topic)
     }
 
-    pub fn version_range(&self, key: ApiKey) -> Option<&VersionRange> {
-        self.supported_versions.get(&(key as i16))
+    pub fn version_range(&self, key: ApiKey) -> Option<VersionRange> {
+        self.supported_versions
+            .get(&(key as i16))
+            .map(|v| *v.value())
     }
 }
 

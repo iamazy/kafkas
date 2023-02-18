@@ -35,11 +35,7 @@ async fn main() -> Result<(), Box<Error>> {
     while let Some(records) = consume_stream.next().await {
         for record in records {
             if let Some(value) = record.value {
-                println!(
-                    "{:?} - {}",
-                    String::from_utf8(value.to_vec())?,
-                    record.offset
-                );
+                println!("{:?} - {}", String::from_utf8(value)?, record.offset);
             }
         }
         // needed only when `auto_commit_enabled` is false

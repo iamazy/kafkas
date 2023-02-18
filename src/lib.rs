@@ -25,8 +25,8 @@ pub mod protocol;
 
 // kafka protocol
 pub use kafka_protocol::records::{
-    Compression, Record, TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH,
-    NO_PRODUCER_ID, NO_SEQUENCE,
+    Compression, TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
+    NO_SEQUENCE,
 };
 pub use producer::ProducerRecord;
 

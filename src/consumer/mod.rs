@@ -24,7 +24,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    client::Kafka,
+    client::{DeserializeMessage, Kafka},
     consumer::{
         fetcher::{CompletedFetch, Fetcher},
         subscription_state::FetchPosition,
@@ -43,8 +43,29 @@ pub struct ConsumerRecord {
     pub offset: i64,
     pub key: Option<Vec<u8>>,
     pub value: Option<Vec<u8>>,
-    pub headers: BTreeMap<String, Vec<u8>>,
+    pub headers: BTreeMap<String, Option<Vec<u8>>>,
     pub timestamp: i64,
+}
+
+impl DeserializeMessage for ConsumerRecord {
+    type Output = Self;
+
+    fn deserialize_message(partition: &TopicPartition, mut record: Record) -> Self::Output {
+        let mut headers = BTreeMap::new();
+        for (key, value) in record.headers.drain(..) {
+            headers.insert(key.to_string(), value.map(|v| v.to_vec()));
+        }
+
+        ConsumerRecord {
+            topic: partition.topic.to_string(),
+            partition: partition.partition,
+            offset: record.offset,
+            key: record.key.map(|key| key.to_vec()),
+            value: record.value.map(|value| value.to_vec()),
+            headers,
+            timestamp: record.timestamp,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -254,7 +275,7 @@ impl<Exe: Executor> Consumer<Exe> {
     pub async fn subscribe<S: AsRef<str>>(
         &mut self,
         topics: Vec<S>,
-    ) -> Result<impl Stream<Item = Vec<Record>>> {
+    ) -> Result<impl Stream<Item = Vec<ConsumerRecord>>> {
         self.coordinator
             .subscribe(
                 topics
@@ -337,7 +358,7 @@ fn fetch_stream<Exe: Executor>(
     completed_partitions: Arc<DashSet<TopicPartition>>,
     mut reset_offset_tx: mpsc::UnboundedSender<()>,
     mut shutdown_rx: broadcast::Receiver<()>,
-) -> impl Stream<Item = Vec<Record>> {
+) -> impl Stream<Item = Vec<ConsumerRecord>> {
     stream! {
         while let Some(completed_fetch) = completed_fetches_rx.next().await {
             let records_fut = handle_partition_response(
@@ -354,7 +375,11 @@ fn fetch_stream<Exe: Executor>(
             pin_mut!(shutdown);
 
             match select(records_fut, shutdown).await {
-                Either::Left((Ok(Some(records)), _)) => {
+                Either::Left((Ok(Some((tp, raw_records))), _)) => {
+                    let mut records = Vec::with_capacity(raw_records.len());
+                    for record in raw_records {
+                        records.push(ConsumerRecord::deserialize_message(&tp, record));
+                    }
                     yield records;
                 }
                 Either::Left((Ok(None), _)) => {},
@@ -375,7 +400,7 @@ async fn handle_partition_response<Exe: Executor>(
     options: &Arc<ConsumerOptions>,
     event_tx: &mut mpsc::UnboundedSender<CoordinatorEvent>,
     completed_partitions: &Arc<DashSet<TopicPartition>>,
-) -> Result<Option<Vec<Record>>> {
+) -> Result<Option<(TopicPartition, Vec<Record>)>> {
     let mut partition = completed_fetch.partition_data;
     match partition.error_code.err() {
         Some(
@@ -485,7 +510,7 @@ async fn handle_partition_response<Exe: Executor>(
                     })?;
                     rx.await?;
                     completed_partitions.remove(&completed_fetch.partition);
-                    return Ok(Some(records));
+                    return Ok(Some((completed_fetch.partition, records)));
                 }
                 None => {
                     event_tx.unbounded_send(CoordinatorEvent::PartitionData {
