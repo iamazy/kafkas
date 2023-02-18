@@ -1,8 +1,7 @@
 #![allow(dead_code)]
 #![allow(clippy::mutable_key_type)]
-#![feature(async_closure)]
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Display};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::mapref::one::Ref;
@@ -76,4 +75,14 @@ fn map_to_list<K, V>(map: HashMap<K, V>) -> Vec<V> {
         list.push(v);
     }
     list
+}
+
+fn array_display<T: Display, I: Iterator<Item = T>>(array: I) -> String {
+    let mut display = String::new();
+    for item in array {
+        display.extend(format!("{item}, ").chars());
+    }
+    display.remove(display.len() - 1);
+    display.remove(display.len() - 1);
+    display
 }

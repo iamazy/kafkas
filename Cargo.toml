@@ -14,7 +14,6 @@ description = "async kafka client for rust"
 [dependencies]
 asynchronous-codec = { version = "0.6", optional = true }
 async-io = { version  = "1", optional = true}
-async-lock = "2"
 async-native-tls = { version = "0.4", optional = true }
 async-recursion = "1.0.0"
 async-std = { version = "1", features = ["attributes", "unstable"], optional = true }
@@ -26,9 +25,8 @@ dashmap = "5"
 fnv = "1"
 futures = "0.3"
 fxhash = "0.2"
-heck = "0.4"
 indexmap = "1"
-kafka-protocol = "0.5"
+kafka-protocol = { git = "https://github.com/iamazy/kafka-protocol-rs", branch = "trunk"}
 native-tls = "0.2"
 pin-project-lite = "0.2"
 rand = "0.8"

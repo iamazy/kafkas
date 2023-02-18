@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt::{Display, Formatter},
     hash::Hash,
 };
 
@@ -12,10 +13,20 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{
-    consumer::{fetcher::FetchMetadata, INITIAL_EPOCH, INVALID_SESSION_ID},
     metadata::{TopicIdPartition, TopicPartition},
     NodeId,
 };
+
+/// The first epoch.  When used in a fetch request, indicates that the client
+///   wants to create or recreate a session.
+const INITIAL_EPOCH: i32 = 0;
+
+/// An invalid epoch.  When used in a fetch request, indicates that the client
+/// wants to close any existing session, and not create a new one.
+const FINAL_EPOCH: i32 = -1;
+
+/// The session ID used by clients with no session.
+const INVALID_SESSION_ID: i32 = 0;
 
 #[derive(Debug, Clone)]
 pub struct FetchSession {
@@ -32,12 +43,6 @@ impl FetchSession {
             next_metadata: FetchMetadata::new(INVALID_SESSION_ID, INITIAL_EPOCH),
             session_topic_names: HashMap::new(),
             session_partitions: HashMap::new(),
-        }
-    }
-
-    pub fn add_topic(&mut self, topic_id: Uuid, topic: TopicName) {
-        if topic_id != Uuid::nil() && !topic.is_empty() {
-            self.session_topic_names.insert(topic_id, topic);
         }
     }
 
@@ -159,8 +164,8 @@ impl FetchSession {
         if response.error_code.is_err() {
             let error = response.error_code.err().unwrap();
             info!(
-                "Node {} was unable to process the fetch request with {}:{}.",
-                self.node, self.next_metadata, error
+                "Node {} was unable to process the fetch request with {}: {error}.",
+                self.node, self.next_metadata
             );
             if error == ResponseError::FetchSessionIdNotFound {
                 self.next_metadata = FetchMetadata::initial();
@@ -256,6 +261,70 @@ fn find_missing<'a, T: Eq + Hash>(
         }
     }
     ret
+}
+
+#[derive(Debug, Clone, Copy, Hash)]
+pub struct FetchMetadata {
+    pub session_id: i32,
+    pub epoch: i32,
+}
+
+impl Display for FetchMetadata {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.session_id == INVALID_SESSION_ID {
+            write!(f, "(session_id=INVALID, ")?;
+        } else {
+            write!(f, "(session_id={}, ", self.session_id)?;
+        }
+
+        if self.epoch == INITIAL_EPOCH {
+            write!(f, "epoch=INITIAL)")
+        } else if self.epoch == FINAL_EPOCH {
+            write!(f, "epoch=FINAL)")
+        } else {
+            write!(f, "epoch={})", self.epoch)
+        }
+    }
+}
+
+impl FetchMetadata {
+    pub fn new(session_id: i32, epoch: i32) -> Self {
+        Self { session_id, epoch }
+    }
+
+    pub fn initial() -> Self {
+        Self::new(INVALID_SESSION_ID, INITIAL_EPOCH)
+    }
+
+    /// Returns true if this is a full fetch request.
+    pub fn is_full(&self) -> bool {
+        self.epoch == INITIAL_EPOCH || self.epoch == FINAL_EPOCH
+    }
+
+    /// Return the metadata for the next full fetch request.
+    pub fn new_incremental(session_id: i32) -> Self {
+        Self::new(session_id, next_epoch(INITIAL_EPOCH))
+    }
+
+    /// Return the metadata for the next incremental response.
+    pub fn next_incremental(&mut self) {
+        self.epoch = next_epoch(self.epoch);
+    }
+
+    /// Return the metadata for the next error response.
+    pub fn next_close_existing(&mut self) {
+        self.epoch = INITIAL_EPOCH;
+    }
+}
+
+fn next_epoch(prev_epoch: i32) -> i32 {
+    if prev_epoch < 0 {
+        FINAL_EPOCH
+    } else if prev_epoch == i32::MAX {
+        1
+    } else {
+        prev_epoch + 1
+    }
 }
 
 #[derive(Debug)]

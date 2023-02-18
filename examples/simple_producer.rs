@@ -41,11 +41,11 @@ async fn main() -> Result<(), Box<Error>> {
     let now = Instant::now();
     let topic = topic_name("kafka");
     let producer = Producer::new(kafka_client, ProducerOptions::default()).await?;
-    for i in 0..10000_0000 {
+    for i in 0..100_000_000 {
         let record = TestData::new(&format!("hello - kafka {i}"));
         let ret = producer.send(&topic, record).await?;
         let _ = tx.send(ret).await;
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     info!("elapsed: {:?}", now.elapsed());
     // wait till all cached records send to kafka
@@ -91,7 +91,7 @@ impl SerializeMessage for TestData {
             sequence: NO_SEQUENCE,
             timestamp: 0,
             key: None,
-            value: input.value.map(|value| Bytes::from(value)),
+            value: input.value,
             headers: indexmap::IndexMap::new(),
         })
     }

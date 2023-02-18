@@ -1,9 +1,8 @@
 mod consumer;
 mod transaction;
 
-use std::sync::Arc;
+use std::collections::HashSet;
 
-use async_lock::RwLock;
 pub use consumer::ConsumerCoordinator;
 use futures::channel::oneshot;
 use kafka_protocol::{
@@ -15,10 +14,7 @@ use tracing::error;
 
 use crate::{
     client::Kafka,
-    consumer::{
-        subscription_state::{FetchPosition, SubscriptionState},
-        OffsetResetStrategy,
-    },
+    consumer::{subscription_state::FetchPosition, LeaderAndEpoch, OffsetResetStrategy},
     error::{ConsumeError, Result},
     executor::Executor,
     metadata::{Node, TopicPartition},
@@ -41,6 +37,7 @@ impl From<CoordinatorType> for i8 {
 }
 
 pub enum CoordinatorEvent {
+    // For Coordinator
     JoinGroup,
     SyncGroup,
     LeaveGroup(StrBytes),
@@ -63,7 +60,44 @@ pub enum CoordinatorEvent {
         partition: TopicPartition,
         offset: i64,
     },
-    GetSubscriptionsRef(oneshot::Sender<Arc<RwLock<SubscriptionState>>>),
+
+    // For SubscriptionState
+    FetchablePartitions {
+        exclude: HashSet<TopicPartition>,
+        partitions_tx: oneshot::Sender<Vec<TopicPartition>>,
+    },
+    Assignments {
+        partitions_tx: oneshot::Sender<Vec<TopicPartition>>,
+    },
+    MaybeValidatePositionForCurrentLeader {
+        partition: TopicPartition,
+        current_leader: LeaderAndEpoch,
+    },
+    FetchPosition {
+        partition: TopicPartition,
+        position_tx: oneshot::Sender<Option<FetchPosition>>,
+    },
+    StrategyTimestamp {
+        partition: TopicPartition,
+        timestamp_tx: oneshot::Sender<Option<i64>>,
+    },
+    PartitionsNeedReset {
+        timestamp: i64,
+        partition_tx: oneshot::Sender<Vec<TopicPartition>>,
+    },
+    RequestFailed {
+        partitions: Vec<TopicPartition>,
+        next_retry_time_ms: i64,
+    },
+    SetNextAllowedRetry {
+        assignments: Vec<TopicPartition>,
+        next_allowed_reset_ms: i64,
+    },
+    MaybeSeekUnvalidated {
+        partition: TopicPartition,
+        position: FetchPosition,
+        offset_strategy: OffsetResetStrategy,
+    },
     Shutdown,
 }
 
@@ -116,7 +150,7 @@ fn find_coordinator_builder(
         request.coordinator_keys = vec![key];
     }
 
-    if (1..=4).contains(&version) {
+    if version >= 1 {
         request.key_type = key_type.into();
     }
     Ok(request)

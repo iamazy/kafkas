@@ -1,14 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt::{Display, Formatter},
-    hash::Hash,
     sync::Arc,
     vec::Drain,
 };
 
-use async_lock::RwLock;
 use dashmap::{DashMap, DashSet};
-use futures::channel::mpsc;
+use futures::channel::{mpsc, mpsc::UnboundedSender, oneshot};
 use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
@@ -29,9 +26,9 @@ use crate::{
             FetchRequestData, FetchRequestDataBuilder, FetchRequestPartitionData, FetchSession,
         },
         subscription_state::FetchPosition,
-        ConsumerOptions, IsolationLevel, OffsetResetStrategy, SubscriptionState, FINAL_EPOCH,
-        INITIAL_EPOCH, INVALID_SESSION_ID,
+        ConsumerOptions, IsolationLevel, OffsetResetStrategy,
     },
+    coordinator::CoordinatorEvent,
     error::Result,
     executor::Executor,
     map_to_list,
@@ -44,7 +41,7 @@ pub struct Fetcher<Exe: Executor> {
     pub client: Kafka<Exe>,
     timestamp: i64,
     options: Arc<ConsumerOptions>,
-    subscription: Arc<RwLock<SubscriptionState>>,
+    event_tx: UnboundedSender<CoordinatorEvent>,
     sessions: Arc<DashMap<NodeId, FetchSession>>,
     completed_fetches_tx: mpsc::UnboundedSender<CompletedFetch>,
     pub completed_partitions: Arc<DashSet<TopicPartition>>,
@@ -55,7 +52,7 @@ impl<Exe: Executor> Fetcher<Exe> {
     pub fn new(
         client: Kafka<Exe>,
         timestamp: i64,
-        subscription: Arc<RwLock<SubscriptionState>>,
+        event_tx: UnboundedSender<CoordinatorEvent>,
         options: Arc<ConsumerOptions>,
         completed_fetches_tx: mpsc::UnboundedSender<CompletedFetch>,
     ) -> Self {
@@ -67,7 +64,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         Self {
             client,
             timestamp,
-            subscription,
+            event_tx,
             sessions: Arc::new(sessions),
             completed_fetches_tx,
             completed_partitions: Arc::new(DashSet::with_capacity(100)),
@@ -121,10 +118,10 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 };
 
                                 for partition in fetchable_topic.partitions {
-                                    let tp = TopicPartition::new0(
-                                        topic.clone(),
-                                        partition.partition_index,
-                                    );
+                                    let tp = TopicPartition {
+                                        topic: topic.clone(),
+                                        partition: partition.partition_index,
+                                    };
 
                                     match fetch_request_data.session_partitions.get(&tp) {
                                         Some(data) => {
@@ -165,7 +162,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 }
                             }
 
-                            if (7..=13).contains(&version) {
+                            if version >= 7 {
                                 match fetch_response.error_code.err() {
                                     None => {
                                         session.next_metadata.session_id = fetch_response.session_id
@@ -195,31 +192,45 @@ impl<Exe: Executor> Fetcher<Exe> {
 }
 
 impl<Exe: Executor> Fetcher<Exe> {
-    async fn fetchable_partitions(&self) -> Vec<TopicPartition> {
+    async fn fetchable_partitions(&self) -> Result<Vec<TopicPartition>> {
         let mut exclude: HashSet<TopicPartition> = HashSet::new();
         for fetch in self.completed_partitions.iter() {
             exclude.insert(fetch.key().clone());
         }
-        self.subscription
-            .read()
-            .await
-            .fetchable_partitions(|tp| !exclude.contains(tp))
+        let (tx, rx) = oneshot::channel();
+        self.event_tx
+            .unbounded_send(CoordinatorEvent::FetchablePartitions {
+                exclude,
+                partitions_tx: tx,
+            })?;
+        Ok(rx.await?)
     }
 
     async fn validate_position_on_metadata_change(&self) -> Result<()> {
-        let mut tp_list = Vec::with_capacity(self.subscription.read().await.assignments.len());
-        for (tp, _) in self.subscription.read().await.assignments.iter() {
-            tp_list.push(tp.clone());
-        }
-        for tp in tp_list {
+        let (tx, rx) = oneshot::channel();
+        self.event_tx
+            .unbounded_send(CoordinatorEvent::Assignments { partitions_tx: tx })?;
+        for tp in rx.await? {
             let current_leader = self.client.cluster_meta.current_leader(&tp);
-            self.subscription
-                .write()
-                .await
-                .maybe_validate_position_for_current_leader(&tp, current_leader)?;
+            self.event_tx.unbounded_send(
+                CoordinatorEvent::MaybeValidatePositionForCurrentLeader {
+                    partition: tp,
+                    current_leader,
+                },
+            )?;
         }
 
         Ok(())
+    }
+
+    async fn fetch_position(&self, partition: TopicPartition) -> Result<Option<FetchPosition>> {
+        let (tx, rx) = oneshot::channel();
+        self.event_tx
+            .unbounded_send(CoordinatorEvent::FetchPosition {
+                partition,
+                position_tx: tx,
+            })?;
+        Ok(rx.await?)
     }
 
     async fn prepare_fetch_requests(&self) -> Result<HashMap<NodeId, FetchRequestData>> {
@@ -227,9 +238,9 @@ impl<Exe: Executor> Fetcher<Exe> {
 
         self.validate_position_on_metadata_change().await?;
 
-        let fetchable_partitions = self.fetchable_partitions().await;
-        for tp in fetchable_partitions.iter() {
-            match self.subscription.read().await.position(tp) {
+        let fetchable_partitions = self.fetchable_partitions().await?;
+        for tp in fetchable_partitions {
+            match self.fetch_position(tp.clone()).await? {
                 Some(position) => match position.current_leader.leader {
                     Some(node) => {
                         if self.nodes_with_pending_fetch_requests.contains(&node) {
@@ -279,7 +290,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                 None => {
                     return Err(Error::Custom(format!(
                         "Missing position for fetchable {tp}"
-                    )))
+                    )));
                 }
             }
         }
@@ -293,20 +304,35 @@ impl<Exe: Executor> Fetcher<Exe> {
         Ok(requests)
     }
 
+    async fn strategy_timestamp(&self, partition: TopicPartition) -> Result<Option<i64>> {
+        let (tx, rx) = oneshot::channel();
+        self.event_tx
+            .unbounded_send(CoordinatorEvent::StrategyTimestamp {
+                partition,
+                timestamp_tx: tx,
+            })?;
+        Ok(rx.await?)
+    }
+
+    async fn partitions_need_reset(&self, timestamp: i64) -> Result<Vec<TopicPartition>> {
+        let (tx, rx) = oneshot::channel();
+        self.event_tx
+            .unbounded_send(CoordinatorEvent::PartitionsNeedReset {
+                timestamp,
+                partition_tx: tx,
+            })?;
+        Ok(rx.await?)
+    }
+
     pub(crate) async fn reset_offset(&mut self) -> Result<()> {
-        let partitions = self
-            .subscription
-            .read()
-            .await
-            .partitions_need_reset(self.timestamp);
+        let partitions = self.partitions_need_reset(self.timestamp).await?;
         if partitions.is_empty() {
             return Ok(());
         }
 
         let mut offset_reset_timestamps = HashMap::new();
         for partition in partitions {
-            if let Some(tp_state) = self.subscription.read().await.assignments.get(&partition) {
-                let timestamp = tp_state.offset_strategy.strategy_timestamp();
+            if let Some(timestamp) = self.strategy_timestamp(partition.clone()).await? {
                 if timestamp != 0 {
                     offset_reset_timestamps.insert(partition, timestamp);
                 }
@@ -320,10 +346,11 @@ impl<Exe: Executor> Fetcher<Exe> {
             let response = self.client.list_offsets(&node, request).await?;
             let list_offset_result = self.handle_list_offsets_response(response)?;
             if !list_offset_result.partitions_to_retry.is_empty() {
-                self.subscription.write().await.request_failed(
-                    list_offset_result.partitions_to_retry,
-                    self.timestamp + self.options.retry_backoff_ms,
-                );
+                self.event_tx
+                    .unbounded_send(CoordinatorEvent::RequestFailed {
+                        partitions: list_offset_result.partitions_to_retry,
+                        next_retry_time_ms: self.timestamp + self.options.retry_backoff_ms,
+                    })?;
                 self.client.update_full_metadata().await?;
             }
 
@@ -353,10 +380,13 @@ impl<Exe: Executor> Fetcher<Exe> {
             current_leader: self.client.cluster_meta.current_leader(&partition),
         };
         // TODO: metadata update last seen epoch if newer
-        self.subscription
-            .write()
-            .await
-            .maybe_seek_unvalidated(partition, position, offset_strategy)
+        self.event_tx
+            .unbounded_send(CoordinatorEvent::MaybeSeekUnvalidated {
+                partition,
+                position,
+                offset_strategy,
+            })?;
+        Ok(())
     }
 
     fn handle_list_offsets_response(
@@ -389,8 +419,12 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 &topic.name, partition
                             );
                             if offset != UNKNOWN_OFFSET {
+                                let tp = TopicPartition {
+                                    topic: topic.name,
+                                    partition,
+                                };
                                 fetched_offsets.insert(
-                                    TopicPartition::new0(topic.name, partition),
+                                    tp,
                                     ListOffsetData {
                                         offset,
                                         timestamp: None,
@@ -415,8 +449,12 @@ impl<Exe: Executor> Fetcher<Exe> {
                                     } else {
                                         Some(partition_response.leader_epoch)
                                     };
+                                let tp = TopicPartition {
+                                    topic: topic.name,
+                                    partition,
+                                };
                                 fetched_offsets.insert(
-                                    TopicPartition::new0(topic.name, partition),
+                                    tp,
                                     ListOffsetData {
                                         offset: partition_response.offset,
                                         timestamp: Some(partition_response.timestamp),
@@ -453,8 +491,11 @@ impl<Exe: Executor> Fetcher<Exe> {
                             "Attempt to fetch offsets for [{} - {}] failed due to {}, retrying.",
                             topic.name.0, partition, error
                         );
-                        partitions_to_retry
-                            .push(TopicPartition::new0(topic.name.clone(), partition));
+                        let tp = TopicPartition {
+                            topic: topic.name.clone(),
+                            partition,
+                        };
+                        partitions_to_retry.push(tp);
                     }
                     Some(ResponseError::UnknownTopicOrPartition) => {
                         warn!(
@@ -462,8 +503,11 @@ impl<Exe: Executor> Fetcher<Exe> {
                              partition [{} - {}]",
                             topic.name.0, partition
                         );
-                        partitions_to_retry
-                            .push(TopicPartition::new0(topic.name.clone(), partition));
+                        let tp = TopicPartition {
+                            topic: topic.name.clone(),
+                            partition,
+                        };
+                        partitions_to_retry.push(tp);
                     }
                     Some(ResponseError::TopicAuthorizationFailed) => {
                         unauthorized_topics.push(topic.name.clone());
@@ -474,8 +518,11 @@ impl<Exe: Executor> Fetcher<Exe> {
                              exception: {}, retrying.",
                             topic.name.0, partition, error
                         );
-                        partitions_to_retry
-                            .push(TopicPartition::new0(topic.name.clone(), partition));
+                        let tp = TopicPartition {
+                            topic: topic.name.clone(),
+                            partition,
+                        };
+                        partitions_to_retry.push(tp);
                     }
                 }
             }
@@ -505,14 +552,16 @@ impl<Exe: Executor> Fetcher<Exe> {
                 let mut topics = HashMap::new();
                 for partition in partitions {
                     if let Some(timestamp) = offset_reset_timestamps.get_mut(partition) {
-                        topics.insert(partition, *timestamp);
+                        topics.insert(partition.clone(), *timestamp);
                     }
                 }
 
-                self.subscription.write().await.set_next_allowed_retry(
-                    topics.keys(),
-                    self.timestamp + self.options.request_timeout_ms as i64,
-                );
+                self.event_tx
+                    .unbounded_send(CoordinatorEvent::SetNextAllowedRetry {
+                        assignments: topics.keys().cloned().collect(),
+                        next_allowed_reset_ms: self.timestamp
+                            + self.options.request_timeout_ms as i64,
+                    })?;
                 let request = self.list_offsets_builder(topics)?;
                 node_request.insert(node_entry.value().clone(), request);
             }
@@ -584,37 +633,35 @@ impl<Exe: Executor> Fetcher<Exe> {
             }
         }
 
-        if version <= 13 {
-            request.replica_id = BrokerId(-1);
-            request.max_wait_ms = self.options.fetch_max_wait_ms;
-            request.min_bytes = self.options.fetch_min_bytes;
-            request.topics = map_to_list(topics);
+        request.replica_id = BrokerId(-1);
+        request.max_wait_ms = self.options.fetch_max_wait_ms;
+        request.min_bytes = self.options.fetch_min_bytes;
+        request.topics = map_to_list(topics);
 
-            if version >= 3 {
-                request.max_bytes = self.options.max_partition_fetch_bytes;
-            } else {
-                request.max_bytes = i32::MAX;
-            }
-            if version >= 4 {
-                request.isolation_level = IsolationLevel::ReadUncommitted.into();
-            }
-            if version >= 7 {
-                request.session_id = data.metadata.session_id;
-                request.session_epoch = data.metadata.epoch;
-            }
-            if version >= 11 {
-                request.rack_id = Default::default();
-            }
-            if version >= 12 {
-                request.cluster_id = None;
-            }
+        if version >= 3 {
+            request.max_bytes = self.options.max_partition_fetch_bytes;
+        } else {
+            request.max_bytes = i32::MAX;
+        }
+        if version >= 4 {
+            request.isolation_level = IsolationLevel::ReadUncommitted.into();
+        }
+        if version >= 7 {
+            request.session_id = data.metadata.session_id;
+            request.session_epoch = data.metadata.epoch;
+        }
+        if version >= 11 {
+            request.rack_id = Default::default();
+        }
+        if version >= 12 {
+            request.cluster_id = None;
         }
         Ok(request)
     }
 
     pub fn list_offsets_builder(
         &self,
-        assignments: HashMap<&TopicPartition, i64>,
+        assignments: HashMap<TopicPartition, i64>,
     ) -> Result<ListOffsetsRequest> {
         let mut topics: HashMap<TopicName, Vec<ListOffsetsPartition>> = HashMap::new();
         for (partition, timestamp) in assignments {
@@ -646,66 +693,6 @@ impl<Exe: Executor> Fetcher<Exe> {
         request.isolation_level = IsolationLevel::ReadUncommitted.into();
 
         Ok(request)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Hash)]
-pub struct FetchMetadata {
-    pub session_id: i32,
-    pub epoch: i32,
-}
-
-impl Display for FetchMetadata {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        if self.session_id == INVALID_SESSION_ID {
-            write!(f, "(session_id=INVALID, ")?;
-        } else {
-            write!(f, "(session_id={}, ", self.session_id)?;
-        }
-
-        if self.epoch == INITIAL_EPOCH {
-            write!(f, "epoch=INITIAL)")
-        } else if self.epoch == FINAL_EPOCH {
-            write!(f, "epoch=FINAL)")
-        } else {
-            write!(f, "epoch={})", self.epoch)
-        }
-    }
-}
-
-impl FetchMetadata {
-    pub fn new(session_id: i32, epoch: i32) -> Self {
-        Self { session_id, epoch }
-    }
-
-    pub fn initial() -> Self {
-        Self::new(INVALID_SESSION_ID, INITIAL_EPOCH)
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.epoch == INITIAL_EPOCH || self.epoch == FINAL_EPOCH
-    }
-
-    pub fn new_incremental(session_id: i32) -> Self {
-        Self::new(session_id, next_epoch(INITIAL_EPOCH))
-    }
-
-    pub fn next_incremental(&mut self) {
-        self.epoch = next_epoch(self.epoch);
-    }
-
-    pub fn next_close_existing(&mut self) {
-        self.epoch = INITIAL_EPOCH;
-    }
-}
-
-fn next_epoch(prev_epoch: i32) -> i32 {
-    if prev_epoch < 0 {
-        FINAL_EPOCH
-    } else if prev_epoch == i32::MAX {
-        1
-    } else {
-        prev_epoch + 1
     }
 }
 

@@ -1,7 +1,7 @@
-pub mod fetch_session;
-pub mod fetcher;
-pub mod partition_assignor;
-pub mod subscription_state;
+mod fetch_session;
+mod fetcher;
+pub(crate) mod partition_assignor;
+pub(crate) mod subscription_state;
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -27,17 +27,13 @@ use crate::{
     client::Kafka,
     consumer::{
         fetcher::{CompletedFetch, Fetcher},
-        subscription_state::{FetchPosition, SubscriptionState},
+        subscription_state::FetchPosition,
     },
     coordinator::{ConsumerCoordinator, CoordinatorEvent},
     executor::Executor,
     metadata::TopicPartition,
-    Error, NodeId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
+    NodeId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
 };
-
-const INITIAL_EPOCH: i32 = 0;
-const FINAL_EPOCH: i32 = -1;
-const INVALID_SESSION_ID: i32 = 0;
 
 /// High-level consumer record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +56,7 @@ pub enum OffsetResetStrategy {
 }
 
 impl OffsetResetStrategy {
-    pub fn from_timestamp(timestamp: i64) -> Self {
+    fn from_timestamp(timestamp: i64) -> Self {
         match timestamp {
             -2 => Self::Earliest,
             -1 => Self::Latest,
@@ -68,7 +64,7 @@ impl OffsetResetStrategy {
         }
     }
 
-    pub fn strategy_timestamp(&self) -> i64 {
+    pub(crate) fn strategy_timestamp(&self) -> i64 {
         match self {
             Self::Earliest => -2,
             Self::Latest => -1,
@@ -218,7 +214,7 @@ impl<Exe: Executor> Consumer<Exe> {
         let options = Arc::new(options);
 
         let (notify_shutdown, _) = broadcast::channel(1);
-        let mut coordinator =
+        let coordinator =
             ConsumerCoordinator::new(client.clone(), options.clone(), notify_shutdown.clone())
                 .await?;
 
@@ -227,7 +223,7 @@ impl<Exe: Executor> Consumer<Exe> {
         let fetcher = Fetcher::new(
             client.clone(),
             Local::now().timestamp(),
-            coordinator.subscriptions().await?,
+            coordinator.event_sender(),
             options.clone(),
             tx,
         );
@@ -243,15 +239,7 @@ impl<Exe: Executor> Consumer<Exe> {
     }
 
     pub async fn seek(&mut self, partition: TopicPartition, offset: i64) -> Result<()> {
-        if offset < 0 {
-            return Err(Error::Custom(format!(
-                "offset {offset} is less than 0, which is invalid"
-            )));
-        }
-        self.coordinator
-            .event_tx
-            .send(CoordinatorEvent::SeekOffset { partition, offset })
-            .await?;
+        self.coordinator.seek(partition, offset).await?;
         Ok(())
     }
 
@@ -291,12 +279,10 @@ impl<Exe: Executor> Consumer<Exe> {
             self.notify_shutdown.subscribe(),
         )));
 
-        let event_tx = self.coordinator.event_tx.clone();
-
         Ok(fetch_stream(
             self.client.clone(),
             self.options.clone(),
-            event_tx,
+            self.coordinator.event_sender(),
             self.fetches_rx.take().unwrap(),
             self.fetcher.completed_partitions.clone(),
             reset_offset_tx,
@@ -310,10 +296,8 @@ impl<Exe: Executor> Consumer<Exe> {
                 "the consumer unsubscribed from all topics",
             ))
             .await?;
-        self.coordinator
-            .event_tx
-            .send(CoordinatorEvent::Unsubscribe)
-            .await?;
+        self.coordinator.unsubscribe().await?;
+        // Stop heartbeat and offset commit task, not really shutdown the consumer.
         self.notify_shutdown.send(())?;
         info!("Unsubscribed all topics or patterns and assigned partitions");
         Ok(())
@@ -338,7 +322,7 @@ async fn do_fetch<Exe: Executor>(mut fetcher: Fetcher<Exe>, mut rx: broadcast::R
             Either::Left((Err(err), _)) => {
                 error!("Fetch error: {err}");
             }
-            Either::Left((_, _)) => {}
+            Either::Left(_) => {}
             Either::Right(_) => break,
         }
     }
@@ -355,8 +339,8 @@ fn fetch_stream<Exe: Executor>(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> impl Stream<Item = Vec<Record>> {
     stream! {
-    while let Some(completed_fetch) = completed_fetches_rx.next().await {
-        let records_fut = handle_partition_response(
+        while let Some(completed_fetch) = completed_fetches_rx.next().await {
+            let records_fut = handle_partition_response(
                 &client,
                 &mut reset_offset_tx,
                 completed_fetch,
@@ -429,18 +413,16 @@ async fn handle_partition_response<Exe: Executor>(
             let error_msg = format!("{} is out of range.", completed_fetch.partition);
             let strategy = options.auto_offset_reset;
             if !matches!(strategy, OffsetResetStrategy::None) {
-                info!("{error_msg}, resetting offset");
-                event_tx
-                    .send(CoordinatorEvent::ResetOffset {
-                        partition: completed_fetch.partition.clone(),
-                        strategy,
-                    })
-                    .await?;
+                info!("{error_msg} resetting offset.");
+                event_tx.unbounded_send(CoordinatorEvent::ResetOffset {
+                    partition: completed_fetch.partition.clone(),
+                    strategy,
+                })?;
                 reset_offset_tx.send(()).await?;
                 completed_partitions.remove(&completed_fetch.partition);
             } else {
                 info!(
-                    "{error_msg}, raising error to the application since no reset policy is \
+                    "{error_msg} raising error to the application since no reset policy is \
                      configured."
                 );
                 return Err(error.into());
@@ -495,27 +477,23 @@ async fn handle_partition_response<Exe: Executor>(
                         completed_fetch.partition,
                         records.len()
                     );
-                    event_tx
-                        .send(CoordinatorEvent::PartitionData {
-                            partition: completed_fetch.partition.clone(),
-                            position,
-                            data: partition,
-                            notify: tx,
-                        })
-                        .await?;
+                    event_tx.unbounded_send(CoordinatorEvent::PartitionData {
+                        partition: completed_fetch.partition.clone(),
+                        position,
+                        data: partition,
+                        notify: tx,
+                    })?;
                     rx.await?;
                     completed_partitions.remove(&completed_fetch.partition);
                     return Ok(Some(records));
                 }
                 None => {
-                    event_tx
-                        .send(CoordinatorEvent::PartitionData {
-                            partition: completed_fetch.partition,
-                            position,
-                            data: partition,
-                            notify: tx,
-                        })
-                        .await?;
+                    event_tx.unbounded_send(CoordinatorEvent::PartitionData {
+                        partition: completed_fetch.partition,
+                        position,
+                        data: partition,
+                        notify: tx,
+                    })?;
                     rx.await?;
                 }
             }

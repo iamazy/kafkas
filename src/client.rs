@@ -122,7 +122,7 @@ impl<Exe: Executor> Kafka<Exe> {
             manager,
             operation_retry_options,
             executor,
-            cluster_meta: Arc::new(Cluster::new()),
+            cluster_meta: Arc::new(Cluster::default()),
             supported_versions,
         })
     }
@@ -282,7 +282,7 @@ impl<Exe: Executor> Kafka<Exe> {
         let request = RequestKind::MetadataRequest(request);
         let response = self.manager.invoke(&self.manager.url, request).await?;
         if let ResponseKind::MetadataResponse(metadata) = response {
-            self.cluster_meta.merge_meta(metadata)
+            self.cluster_meta.update_metadata(metadata)
         } else {
             Err(Error::Connection(ConnectionError::UnexpectedResponse(
                 format!("{response:?}"),

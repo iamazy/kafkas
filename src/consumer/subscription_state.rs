@@ -1,4 +1,4 @@
-use std::collections::{hash_map::Keys, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use kafka_protocol::{messages::TopicName, protocol::StrBytes};
 use tracing::{debug, info};
@@ -82,17 +82,17 @@ impl SubscriptionState {
         partitions
     }
 
-    pub(crate) fn partitions_need_reset(&self, now: i64) -> Vec<TopicPartition> {
+    pub(crate) fn partitions_need_reset(&self, _now: i64) -> Vec<TopicPartition> {
         self.collection_partitions(|state| {
             matches!(state.fetch_state, FetchState::AwaitReset)
-                && !state.awaiting_retry_backoff(now)
+            // && !state.awaiting_retry_backoff(now)
         })
     }
 
-    fn partitions_need_validation(&self, now: i64) -> Vec<TopicPartition> {
+    fn partitions_need_validation(&self, _now: i64) -> Vec<TopicPartition> {
         self.collection_partitions(|state| {
             matches!(state.fetch_state, FetchState::AwaitValidation)
-                && !state.awaiting_retry_backoff(now)
+            // && !state.awaiting_retry_backoff(now)
         })
     }
 
@@ -111,11 +111,11 @@ impl SubscriptionState {
 
     pub fn set_next_allowed_retry(
         &mut self,
-        assignments: Keys<&TopicPartition, i64>,
+        assignments: Vec<TopicPartition>,
         next_allowed_reset_ms: i64,
     ) {
-        for topic in assignments {
-            if let Some(tp_state) = self.assignments.get_mut(*topic) {
+        for topic in assignments.iter() {
+            if let Some(tp_state) = self.assignments.get_mut(topic) {
                 tp_state.next_retry_time_ms = Some(next_allowed_reset_ms);
             }
         }

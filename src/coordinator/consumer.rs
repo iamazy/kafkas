@@ -4,12 +4,8 @@ use std::{
     time::Duration,
 };
 
-use async_lock::RwLock;
 use futures::{
-    channel::{
-        mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
-        oneshot,
-    },
+    channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
     future::{select, Either},
     pin_mut, SinkExt, StreamExt,
 };
@@ -61,11 +57,12 @@ macro_rules! offset_fetch_block {
     ($self:ident, $source:ident) => {
         for topic in $source.topics {
             for partition in topic.partitions {
-                let tp = TopicPartition::new0(topic.name.clone(), partition.partition_index);
+                let tp = TopicPartition {
+                    topic: topic.name.clone(),
+                    partition: partition.partition_index,
+                };
                 if partition.error_code.is_ok() {
-                    if let Some(partition_state) =
-                        $self.subscriptions.write().await.assignments.get_mut(&tp)
-                    {
+                    if let Some(partition_state) = $self.subscriptions.assignments.get_mut(&tp) {
                         partition_state.position.offset = partition.committed_offset;
                         partition_state.position.offset_epoch =
                             Some(partition.committed_leader_epoch);
@@ -84,9 +81,9 @@ macro_rules! offset_fetch_block {
         }
 
         let seek_offsets: HashMap<TopicPartition, i64> =
-            HashMap::from_iter($self.subscriptions.write().await.seek_offsets.drain());
+            HashMap::from_iter($self.subscriptions.seek_offsets.drain());
         for (tp, offset) in seek_offsets {
-            if let Some(tp_state) = $self.subscriptions.write().await.assignments.get_mut(&tp) {
+            if let Some(tp_state) = $self.subscriptions.assignments.get_mut(&tp) {
                 tp_state.position.offset = offset;
                 tp_state.position.offset_epoch = None;
                 tp_state.position.current_leader = $self.client.cluster_meta.current_leader(&tp);
@@ -104,7 +101,7 @@ macro_rules! coordinator_task {
             .interval(Duration::from_millis($interval_ms as u64));
 
         let mut shutdown = $self.notify_shutdown.subscribe();
-        let mut event_tx = $self.event_tx.clone();
+        let event_tx = $self.event_tx.clone();
 
         $self.client.executor.spawn(Box::pin(async move {
             let task_name = stringify!($event);
@@ -118,7 +115,7 @@ macro_rules! coordinator_task {
 
                 match select(interval_fut, shutdown).await {
                     Either::Left((Some(_), _)) => {
-                        if let Err(err) = event_tx.send(CoordinatorEvent::$event).await {
+                        if let Err(err) = event_tx.unbounded_send(CoordinatorEvent::$event) {
                             error!("{task_name} error: {err}");
                         }
                     }
@@ -148,7 +145,7 @@ pub struct ConsumerCoordinator<Exe: Executor> {
     client: Kafka<Exe>,
     inner: Option<CoordinatorInner<Exe>>,
     inner_handle: Option<JoinHandle<CoordinatorInner<Exe>>>,
-    pub(crate) event_tx: UnboundedSender<CoordinatorEvent>,
+    event_tx: UnboundedSender<CoordinatorEvent>,
     options: Arc<ConsumerOptions>,
     commit_offset_tx: Option<UnboundedSender<()>>,
     notify_shutdown: broadcast::Sender<()>,
@@ -176,40 +173,41 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         })
     }
 
-    pub async fn subscribe(&mut self, topics: Vec<TopicName>) -> Result<()> {
+    pub fn event_sender(&self) -> UnboundedSender<CoordinatorEvent> {
+        self.event_tx.clone()
+    }
+
+    pub async fn subscribe(&self, topics: Vec<TopicName>) -> Result<()> {
         self.event_tx
-            .send(CoordinatorEvent::Subscribe(topics))
-            .await?;
+            .unbounded_send(CoordinatorEvent::Subscribe(topics))?;
         Ok(())
     }
 
-    pub async fn subscriptions(&mut self) -> Result<Arc<RwLock<SubscriptionState>>> {
-        let (tx, rx) = oneshot::channel();
+    pub async fn unsubscribe(&self) -> Result<()> {
         self.event_tx
-            .send(CoordinatorEvent::GetSubscriptionsRef(tx))
-            .await?;
-        Ok(rx.await?)
-    }
-
-    pub async fn join_group(&mut self) -> Result<()> {
-        self.event_tx.send(CoordinatorEvent::JoinGroup).await?;
+            .unbounded_send(CoordinatorEvent::Unsubscribe)?;
         Ok(())
     }
 
-    pub async fn sync_group(&mut self) -> Result<()> {
-        self.event_tx.send(CoordinatorEvent::SyncGroup).await?;
+    pub async fn join_group(&self) -> Result<()> {
+        self.event_tx.unbounded_send(CoordinatorEvent::JoinGroup)?;
         Ok(())
     }
 
-    pub async fn maybe_leave_group(&mut self, reason: StrBytes) -> Result<()> {
+    pub async fn sync_group(&self) -> Result<()> {
+        self.event_tx.unbounded_send(CoordinatorEvent::SyncGroup)?;
+        Ok(())
+    }
+
+    pub async fn maybe_leave_group(&self, reason: StrBytes) -> Result<()> {
         self.event_tx
-            .send(CoordinatorEvent::LeaveGroup(reason))
-            .await?;
+            .unbounded_send(CoordinatorEvent::LeaveGroup(reason))?;
         Ok(())
     }
 
-    pub async fn offset_fetch(&mut self) -> Result<()> {
-        self.event_tx.send(CoordinatorEvent::OffsetFetch).await?;
+    pub async fn offset_fetch(&self) -> Result<()> {
+        self.event_tx
+            .unbounded_send(CoordinatorEvent::OffsetFetch)?;
         Ok(())
     }
 
@@ -240,9 +238,20 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         let interval_ms = self.options.rebalance_options.heartbeat_interval_ms;
         coordinator_task!(self, interval_ms, Heartbeat);
         info!(
-            "Heartbeat task is started, which group is {}.",
+            "Heartbeat task is started, which group is [{}].",
             self.options.group_id
         );
+        Ok(())
+    }
+
+    pub async fn seek(&self, partition: TopicPartition, offset: i64) -> Result<()> {
+        if offset < 0 {
+            return Err(Error::Custom(format!(
+                "offset {offset} is less than 0, which is invalid"
+            )));
+        }
+        self.event_tx
+            .unbounded_send(CoordinatorEvent::SeekOffset { partition, offset })?;
         Ok(())
     }
 }
@@ -253,7 +262,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         self.commit_offset_tx = Some(commit_offset_tx);
 
         let mut shutdown = self.notify_shutdown.subscribe();
-        let mut event_tx = self.event_tx.clone();
+        let event_tx = self.event_tx.clone();
 
         self.client.executor.spawn(Box::pin(async move {
             loop {
@@ -265,7 +274,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 
                 match select(offset_commit, shutdown).await {
                     Either::Left((Some(_), _)) => {
-                        if let Err(err) = event_tx.send(CoordinatorEvent::OffsetCommit).await {
+                        if let Err(err) = event_tx.unbounded_send(CoordinatorEvent::OffsetCommit) {
                             error!("Offset commit error: {err}");
                         }
                     }
@@ -287,7 +296,7 @@ struct CoordinatorInner<Exe: Executor> {
     pub group_meta: ConsumerGroupMetadata,
     group_subscription: GroupSubscription,
     consumer_options: Arc<ConsumerOptions>,
-    pub subscriptions: Arc<RwLock<SubscriptionState>>,
+    subscriptions: SubscriptionState,
     assignors: Vec<PartitionAssignor>,
     state: MemberState,
 }
@@ -319,7 +328,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
             client,
             node,
             event_rx,
-            subscriptions: Arc::new(RwLock::new(SubscriptionState::default())),
+            subscriptions: SubscriptionState::default(),
             group_meta: ConsumerGroupMetadata::new(group_id.into()),
             group_subscription: GroupSubscription::default(),
             consumer_options: options,
@@ -328,13 +337,9 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         })
     }
 
-    pub async fn subscribe(&self, topics: Vec<TopicName>) -> Result<()> {
-        self.subscriptions
-            .write()
-            .await
-            .topics
-            .extend(topics.clone());
-        self.subscriptions.write().await.subscription_type = SubscriptionType::AutoTopics;
+    pub async fn subscribe(&mut self, topics: Vec<TopicName>) -> Result<()> {
+        self.subscriptions.topics.extend(topics.clone());
+        self.subscriptions.subscription_type = SubscriptionType::AutoTopics;
         // TODO: remove it
         self.client.update_metadata(topics).await?;
         Ok(())
@@ -359,7 +364,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
     }
 
     pub async fn describe_groups(&mut self) -> Result<()> {
-        if let Some(version_range) = self.client.version_range(ApiKey::JoinGroupKey) {
+        if let Some(version_range) = self.client.version_range(ApiKey::DescribeGroupsKey) {
             let describe_groups_response = self
                 .client
                 .describe_groups(&self.node, self.describe_groups_builder(version_range.max)?)
@@ -371,7 +376,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
             }
             Ok(())
         } else {
-            Err(Error::InvalidApiRequest(ApiKey::JoinGroupKey))
+            Err(Error::InvalidApiRequest(ApiKey::DescribeGroupsKey))
         }
     }
 
@@ -381,10 +386,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         if let Some(version_range) = self.client.version_range(ApiKey::JoinGroupKey) {
             let join_group_response = self
                 .client
-                .join_group(
-                    &self.node,
-                    self.join_group_builder(version_range.max).await?,
-                )
+                .join_group(&self.node, self.join_group_builder(version_range.max)?)
                 .await?;
 
             match join_group_response.error_code.err() {
@@ -507,30 +509,30 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                     }
                     let assignment =
                         Assignment::deserialize_from_bytes(&mut sync_group_response.assignment)?;
-                    self.subscriptions.write().await.assignments.clear();
+                    self.subscriptions.assignments.clear();
                     for (topic, partitions) in assignment.partitions {
                         for partition in partitions.iter() {
-                            let tp = TopicPartition::new0(topic.clone(), *partition);
+                            let tp = TopicPartition {
+                                topic: topic.clone(),
+                                partition: *partition,
+                            };
                             let mut tp_state = TopicPartitionState::new(*partition);
                             tp_state.position.current_leader =
                                 self.client.cluster_meta.current_leader(&tp);
-                            self.subscriptions
-                                .write()
-                                .await
-                                .assignments
-                                .insert(tp, tp_state);
+                            self.subscriptions.assignments.insert(tp, tp_state);
                         }
                     }
                     self.state = MemberState::Stable;
                     info!(
                         "Sync group [{}] success, leader = {}, member_id = {}, generation_id = \
-                         {}, protocol_type = {:?}, protocol_name = {:?}",
+                         {}, protocol_type = {:?}, protocol_name = {:?}, assignments = <{}>",
                         self.group_meta.group_id.0,
                         self.group_meta.leader,
                         self.group_meta.member_id,
                         self.group_meta.generation_id,
                         self.group_meta.protocol_type.as_ref().unwrap(),
                         self.group_meta.protocol_name.as_ref().unwrap(),
+                        crate::array_display(self.subscriptions.assignments.keys()),
                     );
                     Ok(())
                 }
@@ -567,7 +569,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
     }
 
     pub async fn offset_commit(&mut self) -> Result<()> {
-        let all_consumed = self.subscriptions.read().await.all_consumed();
+        let all_consumed = self.subscriptions.all_consumed();
         if all_consumed.is_empty() {
             return Ok(());
         }
@@ -692,11 +694,9 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         Ok(())
     }
 
-    async fn join_group_protocol(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
+    fn join_group_protocol(&self) -> Result<IndexMap<StrBytes, JoinGroupRequestProtocol>> {
         let topics = self
             .subscriptions
-            .read()
-            .await
             .topics
             .iter()
             .cloned()
@@ -706,7 +706,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
             let subscription = Subscription::new(
                 topics.clone(),
                 assignor.subscription_user_data(&topics)?,
-                self.subscriptions.read().await.partitions(),
+                self.subscriptions.partitions(),
             );
             let metadata = subscription.serialize_to_bytes()?;
             let mut protocol = JoinGroupRequestProtocol::default();
@@ -727,32 +727,29 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
 
     fn describe_groups_builder(&self, version: i16) -> Result<DescribeGroupsRequest> {
         let mut request = DescribeGroupsRequest::default();
-        if version <= 5 {
-            request.groups = vec![self.group_meta.group_id.clone()];
+        request.groups = vec![self.group_meta.group_id.clone()];
 
-            if version >= 3 {
-                request.include_authorized_operations = true;
-            }
+        if version >= 3 {
+            request.include_authorized_operations = true;
         }
         Ok(request)
     }
 
-    async fn join_group_builder(&self, version: i16) -> Result<JoinGroupRequest> {
+    fn join_group_builder(&self, version: i16) -> Result<JoinGroupRequest> {
         let mut request = JoinGroupRequest::default();
-        if version <= 9 {
-            request.group_id = self.group_meta.group_id.clone();
-            request.member_id = self.group_meta.member_id.clone();
-            request.protocol_type = StrBytes::from_str(CONSUMER_PROTOCOL_TYPE);
-            request.protocols = self.join_group_protocol().await?;
-            request.session_timeout_ms = self.consumer_options.rebalance_options.session_timeout_ms;
-            if version >= 1 {
-                request.rebalance_timeout_ms =
-                    self.consumer_options.rebalance_options.rebalance_timeout_ms;
-            }
-            if version >= 5 {
-                request.group_instance_id = self.group_meta.group_instance_id.clone();
-            }
+        request.group_id = self.group_meta.group_id.clone();
+        request.member_id = self.group_meta.member_id.clone();
+        request.protocol_type = StrBytes::from_str(CONSUMER_PROTOCOL_TYPE);
+        request.protocols = self.join_group_protocol()?;
+        request.session_timeout_ms = self.consumer_options.rebalance_options.session_timeout_ms;
+        if version >= 1 {
+            request.rebalance_timeout_ms =
+                self.consumer_options.rebalance_options.rebalance_timeout_ms;
         }
+        if version >= 5 {
+            request.group_instance_id = self.group_meta.group_instance_id.clone();
+        }
+
         Ok(request)
     }
 
@@ -777,37 +774,34 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
 
     fn sync_group_builder(&self, version: i16) -> Result<SyncGroupRequest> {
         let mut request = SyncGroupRequest::default();
-        if version <= 5 {
-            request.group_id = self.group_meta.group_id.clone();
-            request.member_id = self.group_meta.member_id.clone();
-            request.generation_id = self.group_meta.generation_id;
+        request.group_id = self.group_meta.group_id.clone();
+        request.member_id = self.group_meta.member_id.clone();
+        request.generation_id = self.group_meta.generation_id;
 
-            if self.group_meta.member_id == self.group_meta.leader {
-                match self.group_meta.protocol_name {
-                    Some(ref protocol) => {
-                        let assignor = self.look_up_assignor(&protocol.to_string())?;
-                        let cluster = self.client.cluster_meta.clone();
-                        request.assignments = serialize_assignments(
-                            assignor.assign(cluster, &self.group_subscription)?,
-                        )?;
-                    }
-                    None => {
-                        return Err(Error::Custom(format!(
-                            "Group leader {} has no partition assignor protocol",
-                            self.group_meta.leader
-                        )));
-                    }
+        if self.group_meta.member_id == self.group_meta.leader {
+            match self.group_meta.protocol_name {
+                Some(ref protocol) => {
+                    let assignor = self.look_up_assignor(&protocol.to_string())?;
+                    let cluster = self.client.cluster_meta.clone();
+                    request.assignments =
+                        serialize_assignments(assignor.assign(cluster, &self.group_subscription)?)?;
+                }
+                None => {
+                    return Err(Error::Custom(format!(
+                        "Group leader {} has no partition assignor protocol",
+                        self.group_meta.leader
+                    )));
                 }
             }
+        }
 
-            if version >= 3 {
-                request.group_instance_id = self.group_meta.group_instance_id.clone();
-            }
+        if version >= 3 {
+            request.group_instance_id = self.group_meta.group_instance_id.clone();
+        }
 
-            if version == 5 {
-                request.protocol_name = self.group_meta.protocol_name.clone();
-                request.protocol_type = self.group_meta.protocol_type.clone();
-            }
+        if version == 5 {
+            request.protocol_name = self.group_meta.protocol_name.clone();
+            request.protocol_type = self.group_meta.protocol_type.clone();
         }
         Ok(request)
     }
@@ -815,8 +809,8 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
     pub async fn offset_fetch_builder(&self, version: i16) -> Result<OffsetFetchRequest> {
         let mut request = OffsetFetchRequest::default();
         if version <= 7 {
-            let mut topics = Vec::with_capacity(self.subscriptions.read().await.topics.len());
-            for assign in self.subscriptions.read().await.topics.iter() {
+            let mut topics = Vec::with_capacity(self.subscriptions.topics.len());
+            for assign in self.subscriptions.topics.iter() {
                 let partitions = self.client.cluster_meta.partitions(assign)?;
 
                 let mut topic = OffsetFetchRequestTopic::default();
@@ -827,8 +821,8 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
             request.group_id = self.group_meta.group_id.clone();
             request.topics = Some(topics);
         } else {
-            let mut topics = Vec::with_capacity(self.subscriptions.read().await.topics.len());
-            for assign in self.subscriptions.read().await.topics.iter() {
+            let mut topics = Vec::with_capacity(self.subscriptions.topics.len());
+            for assign in self.subscriptions.topics.iter() {
                 let partitions = self.client.cluster_meta.partitions(assign)?;
 
                 let mut topic = OffsetFetchRequestTopics::default();
@@ -847,11 +841,11 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
     }
 
     pub async fn offset_commit_builder(
-        &self,
+        &mut self,
         all_consumed: HashMap<TopicPartition, OffsetMetadata>,
     ) -> Result<OffsetCommitRequest> {
         let mut topics: HashMap<TopicName, Vec<OffsetCommitRequestPartition>> =
-            HashMap::with_capacity(self.subscriptions.read().await.topics.len());
+            HashMap::with_capacity(self.subscriptions.topics.len());
         for (tp, meta) in all_consumed.iter() {
             let mut partition = OffsetCommitRequestPartition::default();
             partition.partition_index = tp.partition;
@@ -882,12 +876,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
 
         let mut generation = self.group_meta.generation_id;
         let mut member = self.group_meta.member_id.clone();
-        if self
-            .subscriptions
-            .read()
-            .await
-            .has_auto_assigned_partitions()
-        {
+        if self.subscriptions.has_auto_assigned_partitions() {
             // if the generation is null, we are not part of an active group (and we expect to be).
             // the only thing we can do is fail the commit and let the user rejoin the group in
             // poll().
@@ -897,6 +886,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                      group"
                 );
                 return if self.rebalance_in_progress() {
+                    self.rejoin_group().await?;
                     Err(Error::Custom(
                         "Offset commit cannot be completed since the consumer is undergoing a \
                          rebalance for auto partition assignment. You can try completing the \
@@ -928,14 +918,12 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
 
     pub fn heartbeat_builder(&self, version: i16) -> Result<HeartbeatRequest> {
         let mut request = HeartbeatRequest::default();
-        if version <= 4 {
-            request.group_id = self.group_meta.group_id.clone();
-            request.member_id = self.group_meta.member_id.clone();
-            request.generation_id = self.group_meta.generation_id;
+        request.group_id = self.group_meta.group_id.clone();
+        request.member_id = self.group_meta.member_id.clone();
+        request.generation_id = self.group_meta.generation_id;
 
-            if version >= 3 {
-                request.group_instance_id = self.group_meta.group_instance_id.clone();
-            }
+        if version >= 3 {
+            request.group_instance_id = self.group_meta.group_instance_id.clone();
         }
         Ok(request)
     }
@@ -954,8 +942,6 @@ async fn coordinator_loop<Exe: Executor>(
             CoordinatorEvent::SeekOffset { partition, offset } => {
                 let _ = coordinator
                     .subscriptions
-                    .write()
-                    .await
                     .seek_offsets
                     .insert(partition, offset);
                 Ok(())
@@ -963,22 +949,14 @@ async fn coordinator_loop<Exe: Executor>(
             CoordinatorEvent::ResetOffset {
                 partition,
                 strategy,
-            } => {
-                match coordinator
-                    .subscriptions
-                    .write()
-                    .await
-                    .assignments
-                    .get_mut(&partition)
-                {
-                    Some(tp_state) => tp_state.reset(strategy),
-                    None => Ok(()),
-                }
-            }
+            } => match coordinator.subscriptions.assignments.get_mut(&partition) {
+                Some(tp_state) => tp_state.reset(strategy),
+                None => Ok(()),
+            },
             CoordinatorEvent::Heartbeat => coordinator.heartbeat().await,
             CoordinatorEvent::Subscribe(topics) => coordinator.subscribe(topics).await,
             CoordinatorEvent::Unsubscribe => {
-                coordinator.subscriptions.write().await.unsubscribe();
+                coordinator.subscriptions.unsubscribe();
                 Ok(())
             }
             CoordinatorEvent::PartitionData {
@@ -987,13 +965,7 @@ async fn coordinator_loop<Exe: Executor>(
                 data,
                 notify,
             } => {
-                if let Some(tp_state) = coordinator
-                    .subscriptions
-                    .write()
-                    .await
-                    .assignments
-                    .get_mut(&partition)
-                {
+                if let Some(tp_state) = coordinator.subscriptions.assignments.get_mut(&partition) {
                     if let Some(position) = position {
                         tp_state.position.offset = position.offset;
                         tp_state.position.offset_epoch = position.offset_epoch;
@@ -1016,11 +988,90 @@ async fn coordinator_loop<Exe: Executor>(
                 }
                 Ok(())
             }
-            CoordinatorEvent::GetSubscriptionsRef(tx) => {
-                let subscriptions = coordinator.subscriptions.clone();
-                let _ = tx.send(subscriptions);
+            CoordinatorEvent::FetchablePartitions {
+                exclude,
+                partitions_tx,
+            } => {
+                let partitions = coordinator
+                    .subscriptions
+                    .fetchable_partitions(|tp| !exclude.contains(tp));
+                let _ = partitions_tx.send(partitions);
                 Ok(())
             }
+            CoordinatorEvent::Assignments { partitions_tx } => {
+                let partitions = coordinator
+                    .subscriptions
+                    .assignments
+                    .keys()
+                    .cloned()
+                    .collect();
+                let _ = partitions_tx.send(partitions);
+                Ok(())
+            }
+            CoordinatorEvent::MaybeValidatePositionForCurrentLeader {
+                partition,
+                current_leader,
+            } => {
+                let _ = coordinator
+                    .subscriptions
+                    .maybe_validate_position_for_current_leader(&partition, current_leader);
+                Ok(())
+            }
+            CoordinatorEvent::FetchPosition {
+                partition,
+                position_tx,
+            } => {
+                let position = coordinator.subscriptions.position(&partition).cloned();
+                let _ = position_tx.send(position);
+                Ok(())
+            }
+            CoordinatorEvent::StrategyTimestamp {
+                partition,
+                timestamp_tx,
+            } => {
+                let timestamp = coordinator
+                    .subscriptions
+                    .assignments
+                    .get(&partition)
+                    .map(|tp_state| tp_state.offset_strategy.strategy_timestamp());
+                let _ = timestamp_tx.send(timestamp);
+                Ok(())
+            }
+            CoordinatorEvent::PartitionsNeedReset {
+                timestamp,
+                partition_tx,
+            } => {
+                let partitions = coordinator.subscriptions.partitions_need_reset(timestamp);
+                let _ = partition_tx.send(partitions);
+                Ok(())
+            }
+            CoordinatorEvent::RequestFailed {
+                partitions,
+                next_retry_time_ms,
+            } => {
+                coordinator
+                    .subscriptions
+                    .request_failed(partitions, next_retry_time_ms);
+                Ok(())
+            }
+            CoordinatorEvent::SetNextAllowedRetry {
+                assignments,
+                next_allowed_reset_ms,
+            } => {
+                coordinator
+                    .subscriptions
+                    .set_next_allowed_retry(assignments, next_allowed_reset_ms);
+                Ok(())
+            }
+            CoordinatorEvent::MaybeSeekUnvalidated {
+                partition,
+                position,
+                offset_strategy,
+            } => coordinator.subscriptions.maybe_seek_unvalidated(
+                partition,
+                position,
+                offset_strategy,
+            ),
             CoordinatorEvent::Shutdown => break,
         };
         if let Err(err) = ret {
