@@ -85,7 +85,7 @@ Examples can be found in [`examples`](https://github.com/iamazy/kafkas/blob/main
 
 ## Flame graph
 
-<img style="width:800px" src="./benchmark/flamegraph.svg"  alt="flamegraph"/>
+<img style="width:800px" src="benches/flamegraph.svg"  alt="flamegraph"/>
 
 ## Rust version requirements
 
