@@ -278,8 +278,7 @@ impl<Exe: Executor> Consumer<Exe> {
     }
 
     pub async fn seek(&mut self, partition: TopicPartition, offset: i64) -> Result<()> {
-        self.coordinator.seek(partition, offset).await?;
-        Ok(())
+        self.coordinator.seek(partition, offset).await
     }
 
     pub fn notify_shutdown(&self) -> broadcast::Receiver<()> {
@@ -290,12 +289,13 @@ impl<Exe: Executor> Consumer<Exe> {
         self.coordinator.commit_async().await
     }
 
-    pub async fn subscribe<S: AsRef<str>, T: DeserializeMessage<Output = T> + Sized>(
+    pub async fn subscribe<S, T>(
         &mut self,
         topics: Vec<S>,
     ) -> Result<impl Stream<Item = ConsumerRecords<T>>>
     where
-        <T as DeserializeMessage>::Output: DeserializeMessage,
+        S: AsRef<str>,
+        T: DeserializeMessage<Output = T> + Sized,
     {
         self.coordinator
             .subscribe(
@@ -371,7 +371,7 @@ async fn do_fetch<Exe: Executor>(mut fetcher: Fetcher<Exe>, mut rx: broadcast::R
     info!("Fetch task finished.");
 }
 
-fn fetch_stream<Exe: Executor, T: DeserializeMessage<Output = T> + Sized>(
+fn fetch_stream<Exe, T>(
     client: Kafka<Exe>,
     options: Arc<ConsumerOptions>,
     mut event_tx: mpsc::UnboundedSender<CoordinatorEvent>,
@@ -381,7 +381,8 @@ fn fetch_stream<Exe: Executor, T: DeserializeMessage<Output = T> + Sized>(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> impl Stream<Item = ConsumerRecords<T>>
 where
-    <T as DeserializeMessage>::Output: DeserializeMessage,
+    Exe: Executor,
+    T: DeserializeMessage<Output = T> + Sized,
 {
     stream! {
         while let Some(completed_fetch) = completed_fetches_rx.next().await {
