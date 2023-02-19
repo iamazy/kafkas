@@ -31,8 +31,10 @@ async fn main() -> Result<(), Box<Error>> {
         .await?;
     pin_mut!(consume_stream);
 
+    let mut i = 0;
     while let Some(records) = consume_stream.next().await {
         for record in records {
+            i += 1;
             if let Some(value) = record.value {
                 println!(
                     "{:?} - {}",
@@ -43,6 +45,7 @@ async fn main() -> Result<(), Box<Error>> {
         }
         // needed only when `auto_commit_enabled` is false
         consumer.commit_async().await?;
+        println!("consume records size: {}", i);
     }
 
     Ok(())

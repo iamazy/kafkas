@@ -612,7 +612,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         request.forgotten_topics_data = map_to_list(forgotten_topics);
 
         let mut topics: HashMap<TopicName, FetchTopic> = HashMap::new();
-        for (tp, data) in data.to_send.drain() {
+        for (tp, data) in data.to_send.drain(..) {
             let mut partition = FetchPartition::default();
             partition.partition = tp.partition;
             partition.current_leader_epoch = data
