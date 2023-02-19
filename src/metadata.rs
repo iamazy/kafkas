@@ -111,6 +111,14 @@ impl TopicPartition {
             partition,
         }
     }
+
+    pub fn topic(&self) -> &StrBytes {
+        &self.topic
+    }
+
+    pub fn partition(&self) -> PartitionId {
+        self.partition
+    }
 }
 
 impl Debug for TopicPartition {

@@ -10,31 +10,43 @@ use kafka_protocol::{
     protocol::{Encodable, StrBytes},
 };
 
-pub mod client;
-pub mod connection;
-pub mod connection_manager;
-pub mod consumer;
-pub mod coordinator;
+mod client;
+pub use client::{DeserializeMessage, Kafka, KafkaOptions, SerializeMessage};
+
+mod connection;
+mod connection_manager;
+
+mod consumer;
+pub use consumer::{
+    Consumer, ConsumerOptions, ConsumerRecord, ConsumerRecords, OffsetResetStrategy,
+    RebalanceOptions,
+};
+
+mod coordinator;
 
 mod error;
 pub use error::{Error, Result};
-pub mod executor;
-pub mod metadata;
-pub mod producer;
-pub mod protocol;
+
+mod executor;
+pub use executor::{AsyncStdExecutor, TokioExecutor};
+
+mod metadata;
+pub use metadata::TopicPartition;
+
+mod producer;
+pub use producer::{Producer, ProducerOptions, ProducerRecord};
+
+mod protocol;
 
 // kafka protocol
 pub use kafka_protocol::records::{
     Compression, Record, TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH,
     NO_PRODUCER_ID, NO_SEQUENCE,
 };
-pub use producer::ProducerRecord;
 
-use crate::metadata::TopicPartition;
-
-pub type NodeId = i32;
-pub type PartitionId = i32;
-pub type MemberId = StrBytes;
+type NodeId = i32;
+type PartitionId = i32;
+type MemberId = StrBytes;
 
 const UNKNOWN_OFFSET: i64 = -1;
 const UNKNOWN_TIMESTAMP: i64 = -1;
@@ -42,8 +54,8 @@ const UNKNOWN_EPOCH: i32 = NO_PARTITION_LEADER_EPOCH;
 const DEFAULT_GENERATION_ID: i32 = -1;
 const INVALID_LOG_START_OFFSET: i64 = -1;
 
-pub type PartitionRef<'a> = Ref<'a, TopicName, Vec<PartitionId>>;
-pub type NodeRef<'a> = Ref<'a, NodeId, Vec<TopicPartition>>;
+type PartitionRef<'a> = Ref<'a, TopicName, Vec<PartitionId>>;
+type NodeRef<'a> = Ref<'a, NodeId, Vec<TopicPartition>>;
 
 pub trait ToStrBytes {
     fn to_str_bytes(self) -> StrBytes;

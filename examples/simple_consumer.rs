@@ -1,9 +1,6 @@
 use futures::{pin_mut, StreamExt};
 use kafkas::{
-    client::{Kafka, KafkaOptions},
-    consumer::{Consumer, ConsumerOptions},
-    executor::TokioExecutor,
-    Error,
+    Consumer, ConsumerOptions, ConsumerRecord, Error, Kafka, KafkaOptions, TokioExecutor,
 };
 
 #[tokio::main]
@@ -29,7 +26,9 @@ async fn main() -> Result<(), Box<Error>> {
     // seek offset
     // consumer.seek(TopicPartition::new("kafka", 0), 100000).await;
 
-    let consume_stream = consumer.subscribe(vec!["kafka"]).await?;
+    let consume_stream = consumer
+        .subscribe::<&str, ConsumerRecord>(vec!["kafka"])
+        .await?;
     pin_mut!(consume_stream);
 
     while let Some(records) = consume_stream.next().await {

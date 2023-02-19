@@ -74,119 +74,122 @@ impl<Exe: Executor> Fetcher<Exe> {
     }
 
     pub async fn fetch(&mut self) -> Result<()> {
-        if let Some(version_range) = self.client.version_range(ApiKey::FetchKey) {
-            let mut version = version_range.max;
-            let fetch_requests = self.prepare_fetch_requests().await?;
-            for (node, mut fetch_request_data) in fetch_requests {
-                if !fetch_request_data.can_use_topic_ids {
-                    version = 12;
-                }
-                let metadata = fetch_request_data.metadata;
-                if let Some(node) = self.client.cluster_meta.nodes.get(&node) {
-                    let fetch_request =
-                        self.fetch_builder(&mut fetch_request_data, version).await?;
-                    trace!("Send fetch request: {:?}", fetch_request);
-                    // We add the node to the set of nodes with pending fetch requests before adding
-                    // the listener because the future may have been fulfilled
-                    // on another thread (e.g. during a disconnection being
-                    // handled by the heartbeat thread) which will mean the listener
-                    // will be invoked synchronously.
-                    self.nodes_with_pending_fetch_requests.insert(node.id);
-                    let fetch_response = self.client.fetch(node.value(), fetch_request).await?;
-                    trace!("Receive fetch response: {:?}", fetch_response);
-                    match self.sessions.get_mut(node.key()) {
-                        Some(mut session) => {
-                            if !session
-                                .value_mut()
-                                .handle_fetch_response(&fetch_response, version)
-                            {
-                                if let Some(error) = fetch_response.error_code.err() {
-                                    if error == ResponseError::FetchSessionTopicIdError {
-                                        self.client.update_full_metadata().await?;
-                                    }
-                                    continue;
-                                }
-                            }
-
-                            for fetchable_topic in fetch_response.responses {
-                                let topic = if let Some(topic_name) =
-                                    session.session_topic_names.get(&fetchable_topic.topic_id)
+        match self.client.version_range(ApiKey::FetchKey) {
+            Some(version_range) => {
+                let mut version = version_range.max;
+                let fetch_requests = self.prepare_fetch_requests().await?;
+                for (node, mut fetch_request_data) in fetch_requests {
+                    if !fetch_request_data.can_use_topic_ids {
+                        version = 12;
+                    }
+                    let metadata = fetch_request_data.metadata;
+                    if let Some(node) = self.client.cluster_meta.nodes.get(&node) {
+                        let fetch_request =
+                            self.fetch_builder(&mut fetch_request_data, version).await?;
+                        trace!("Send fetch request: {:?}", fetch_request);
+                        // We add the node to the set of nodes with pending fetch requests before
+                        // adding the listener because the future may have
+                        // been fulfilled on another thread (e.g. during a
+                        // disconnection being handled by the heartbeat
+                        // thread) which will mean the listener
+                        // will be invoked synchronously.
+                        self.nodes_with_pending_fetch_requests.insert(node.id);
+                        let fetch_response = self.client.fetch(node.value(), fetch_request).await?;
+                        trace!("Receive fetch response: {:?}", fetch_response);
+                        match self.sessions.get_mut(node.key()) {
+                            Some(mut session) => {
+                                if !session
+                                    .value_mut()
+                                    .handle_fetch_response(&fetch_response, version)
                                 {
-                                    topic_name
-                                } else {
-                                    &fetchable_topic.topic
-                                };
+                                    if let Some(error) = fetch_response.error_code.err() {
+                                        if error == ResponseError::FetchSessionTopicIdError {
+                                            self.client.update_full_metadata().await?;
+                                        }
+                                        continue;
+                                    }
+                                }
 
-                                for partition in fetchable_topic.partitions {
-                                    let tp = TopicPartition {
-                                        topic: topic.clone(),
-                                        partition: partition.partition_index,
+                                for fetchable_topic in fetch_response.responses {
+                                    let topic = if let Some(topic_name) =
+                                        session.session_topic_names.get(&fetchable_topic.topic_id)
+                                    {
+                                        topic_name
+                                    } else {
+                                        &fetchable_topic.topic
                                     };
 
-                                    match fetch_request_data.session_partitions.get(&tp) {
-                                        Some(data) => {
-                                            debug!(
-                                                "Fetch {:?} at offset {} for {tp}",
-                                                self.options.isolation_level, data.fetch_offset
-                                            );
-                                            self.completed_partitions.insert(tp.clone());
-                                            if let Err(err) = self
-                                                .completed_fetches_tx
-                                                .unbounded_send(CompletedFetch {
-                                                    partition: tp,
-                                                    partition_data: partition,
-                                                    next_fetch_offset: data.fetch_offset,
-                                                    last_epoch: None,
-                                                    is_consumed: false,
-                                                    initialized: false,
-                                                })
-                                            {
-                                                error!("send error: {}", err);
-                                            }
-                                        }
-                                        None => {
-                                            if metadata.is_full() {
-                                                warn!(
-                                                    "Response for missing full request {tp}; \
-                                                     metadata={metadata}."
-                                                );
-                                            } else {
-                                                warn!(
-                                                    "Response for missing session request \
-                                                     partition: {tp}; metadata={metadata}."
-                                                );
-                                            }
-                                            continue;
-                                        }
-                                    }
-                                }
-                            }
+                                    for partition in fetchable_topic.partitions {
+                                        let tp = TopicPartition {
+                                            topic: topic.clone(),
+                                            partition: partition.partition_index,
+                                        };
 
-                            if version >= 7 {
-                                match fetch_response.error_code.err() {
-                                    None => {
-                                        session.next_metadata.session_id = fetch_response.session_id
+                                        match fetch_request_data.session_partitions.get(&tp) {
+                                            Some(data) => {
+                                                debug!(
+                                                    "Fetch {:?} at offset {} for {tp}",
+                                                    self.options.isolation_level, data.fetch_offset
+                                                );
+                                                self.completed_partitions.insert(tp.clone());
+                                                if let Err(err) = self
+                                                    .completed_fetches_tx
+                                                    .unbounded_send(CompletedFetch {
+                                                        partition: tp,
+                                                        partition_data: partition,
+                                                        next_fetch_offset: data.fetch_offset,
+                                                        last_epoch: None,
+                                                        is_consumed: false,
+                                                        initialized: false,
+                                                    })
+                                                {
+                                                    error!("send error: {}", err);
+                                                }
+                                            }
+                                            None => {
+                                                if metadata.is_full() {
+                                                    warn!(
+                                                        "Response for missing full request {tp}; \
+                                                         metadata={metadata}."
+                                                    );
+                                                } else {
+                                                    warn!(
+                                                        "Response for missing session request \
+                                                         {tp}; metadata={metadata}."
+                                                    );
+                                                }
+                                                continue;
+                                            }
+                                        }
                                     }
-                                    Some(error) => return Err(error.into()),
+                                }
+
+                                if version >= 7 {
+                                    match fetch_response.error_code.err() {
+                                        None => {
+                                            session.next_metadata.session_id =
+                                                fetch_response.session_id
+                                        }
+                                        Some(error) => return Err(error.into()),
+                                    }
                                 }
                             }
+                            None => {
+                                error!(
+                                    "Unable to find FetchSessionHandler for node {}. Ignoring \
+                                     fetch response.",
+                                    node.key()
+                                );
+                                continue;
+                            }
                         }
-                        None => {
-                            error!(
-                                "Unable to find FetchSessionHandler for node {}. Ignoring fetch \
-                                 response.",
-                                node.key()
-                            );
-                            continue;
-                        }
+                        // TODO: How to ensure that `node.id` will be removed
+                        self.nodes_with_pending_fetch_requests.remove(&node.id);
                     }
-                    // TODO: How to ensure that `node.id` will be removed
-                    self.nodes_with_pending_fetch_requests.remove(&node.id);
                 }
+                Ok(())
             }
-            Ok(())
-        } else {
-            Err(Error::InvalidApiRequest(ApiKey::FetchKey))
+            None => Err(Error::InvalidApiRequest(ApiKey::FetchKey)),
         }
     }
 }
@@ -414,9 +417,9 @@ impl<Exe: Executor> Fetcher<Exe> {
                                 partition_response.old_style_offsets[0]
                             };
                             debug!(
-                                "Handing v0 ListOffsetResponse response for [{:?} - {}]. Fetched \
+                                "Handing v0 ListOffsetResponse response for [{} - {}]. Fetched \
                                  offset {offset}",
-                                &topic.name, partition
+                                &topic.name.0, partition
                             );
                             if offset != UNKNOWN_OFFSET {
                                 let tp = TopicPartition {

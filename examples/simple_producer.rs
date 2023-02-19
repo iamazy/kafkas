@@ -2,15 +2,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use kafka_protocol::records::{
-    Record, TimestampType, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
-    NO_SEQUENCE,
-};
 use kafkas::{
-    client::{Kafka, KafkaOptions, SerializeMessage},
-    executor::TokioExecutor,
-    producer::{Producer, ProducerOptions},
-    topic_name, Error,
+    topic_name, Error, Kafka, KafkaOptions, Producer, ProducerOptions, Record, SerializeMessage,
+    TimestampType, TokioExecutor, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID,
+    NO_SEQUENCE,
 };
 use tracing::{error, info};
 

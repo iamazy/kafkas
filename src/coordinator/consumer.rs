@@ -311,7 +311,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
 
         let node = find_coordinator(&client, group_id.clone(), CoordinatorType::Group).await?;
         info!(
-            "Find coordinator success, group {:?}, node: {}",
+            "Find coordinator success, group {}, node: {}",
             group_id,
             node.address()
         );
@@ -364,114 +364,118 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
     }
 
     pub async fn describe_groups(&mut self) -> Result<()> {
-        if let Some(version_range) = self.client.version_range(ApiKey::DescribeGroupsKey) {
-            let describe_groups_response = self
-                .client
-                .describe_groups(&self.node, self.describe_groups_builder(version_range.max)?)
-                .await?;
-            for group in describe_groups_response.groups {
-                if group.error_code.is_err() {
-                    error!("Describe group {:?} failed", group.group_id);
+        match self.client.version_range(ApiKey::DescribeGroupsKey) {
+            Some(version_range) => {
+                let describe_groups_response = self
+                    .client
+                    .describe_groups(&self.node, self.describe_groups_builder(version_range.max)?)
+                    .await?;
+                for group in describe_groups_response.groups {
+                    if group.error_code.is_err() {
+                        error!("Describe group [{}] failed", group.group_id.0);
+                    }
                 }
+                Ok(())
             }
-            Ok(())
-        } else {
-            Err(Error::InvalidApiRequest(ApiKey::DescribeGroupsKey))
+            None => Err(Error::InvalidApiRequest(ApiKey::DescribeGroupsKey)),
         }
     }
 
     #[async_recursion::async_recursion]
     pub async fn join_group(&mut self) -> Result<()> {
         self.state = MemberState::PreparingRebalance;
-        if let Some(version_range) = self.client.version_range(ApiKey::JoinGroupKey) {
-            let join_group_response = self
-                .client
-                .join_group(&self.node, self.join_group_builder(version_range.max)?)
-                .await?;
+        match self.client.version_range(ApiKey::JoinGroupKey) {
+            Some(version_range) => {
+                let join_group_response = self
+                    .client
+                    .join_group(&self.node, self.join_group_builder(version_range.max)?)
+                    .await?;
 
-            match join_group_response.error_code.err() {
-                Some(ResponseError::MemberIdRequired) => {
-                    self.group_meta.member_id = join_group_response.member_id;
-                    warn!(
-                        "Join group with unknown member id, will rejoin group [{}] with member \
-                         id: {}",
-                        self.group_meta.group_id.0, self.group_meta.member_id
-                    );
-                    self.join_group().await
-                }
-                Some(error) => Err(error.into()),
-                None => {
-                    self.group_meta.member_id = join_group_response.member_id;
-                    self.group_meta.generation_id = join_group_response.generation_id;
-                    self.group_meta.leader = join_group_response.leader;
-                    self.group_meta.protocol_name = join_group_response.protocol_name;
-                    self.group_meta.protocol_type = join_group_response.protocol_type;
+                match join_group_response.error_code.err() {
+                    Some(ResponseError::MemberIdRequired) => {
+                        self.group_meta.member_id = join_group_response.member_id;
+                        warn!(
+                            "Join group with unknown member id, will rejoin group [{}] with \
+                             member id: {}",
+                            self.group_meta.group_id.0, self.group_meta.member_id
+                        );
+                        self.join_group().await
+                    }
+                    Some(error) => Err(error.into()),
+                    None => {
+                        self.group_meta.member_id = join_group_response.member_id;
+                        self.group_meta.generation_id = join_group_response.generation_id;
+                        self.group_meta.leader = join_group_response.leader;
+                        self.group_meta.protocol_name = join_group_response.protocol_name;
+                        self.group_meta.protocol_type = join_group_response.protocol_type;
 
-                    let group_subscription = deserialize_member(join_group_response.members)?;
-                    self.group_subscription = group_subscription;
-                    self.state = MemberState::CompletingRebalance;
+                        let group_subscription = deserialize_member(join_group_response.members)?;
+                        self.group_subscription = group_subscription;
+                        self.state = MemberState::CompletingRebalance;
 
-                    info!(
-                        "Join group [{}] success, leader = {}, member_id = {}, generation_id = {}",
-                        self.group_meta.group_id.0,
-                        self.group_meta.leader,
-                        self.group_meta.member_id,
-                        self.group_meta.generation_id
-                    );
-                    Ok(())
+                        info!(
+                            "Join group [{}] success, leader = {}, member_id = {}, generation_id \
+                             = {}",
+                            self.group_meta.group_id.0,
+                            self.group_meta.leader,
+                            self.group_meta.member_id,
+                            self.group_meta.generation_id
+                        );
+                        Ok(())
+                    }
                 }
             }
-        } else {
-            Err(Error::InvalidApiRequest(ApiKey::JoinGroupKey))
+            None => Err(Error::InvalidApiRequest(ApiKey::JoinGroupKey)),
         }
     }
 
     pub async fn leave_group(&mut self, reason: StrBytes) -> Result<()> {
-        if let Some(version_range) = self.client.version_range(ApiKey::LeaveGroupKey) {
-            debug!(
-                "Member {} send LeaveGroup request to coordinator {} due to {reason}",
-                self.group_meta.member_id,
-                self.node.address(),
-            );
+        match self.client.version_range(ApiKey::LeaveGroupKey) {
+            Some(version_range) => {
+                debug!(
+                    "Member {} send LeaveGroup request to coordinator {} due to {reason}",
+                    self.group_meta.member_id,
+                    self.node.address(),
+                );
 
-            let leave_group_request = self.leave_group_builder(version_range.max, reason)?;
+                let leave_group_request = self.leave_group_builder(version_range.max, reason)?;
 
-            let leave_group_response = self
-                .client
-                .leave_group(&self.node, leave_group_request)
-                .await?;
+                let leave_group_response = self
+                    .client
+                    .leave_group(&self.node, leave_group_request)
+                    .await?;
 
-            match leave_group_response.error_code.err() {
-                None => {
-                    for member in leave_group_response.members {
-                        if member.error_code.is_ok() {
-                            debug!(
-                                "Member {} leave group {} success.",
-                                member.member_id, self.group_meta.group_id.0
-                            );
-                        } else {
-                            error!(
-                                "Member {} leave group {} failed.",
-                                member.member_id, self.group_meta.group_id.0
-                            );
+                match leave_group_response.error_code.err() {
+                    None => {
+                        for member in leave_group_response.members {
+                            if member.error_code.is_ok() {
+                                debug!(
+                                    "Member {} leave group {} success.",
+                                    member.member_id, self.group_meta.group_id.0
+                                );
+                            } else {
+                                error!(
+                                    "Member {} leave group {} failed.",
+                                    member.member_id, self.group_meta.group_id.0
+                                );
+                            }
                         }
+                        info!(
+                            "Leave group [{}] success, member: {}",
+                            self.group_meta.group_id.0, self.group_meta.member_id
+                        );
+                        Ok(())
                     }
-                    info!(
-                        "Leave group [{}] success, member: {}",
-                        self.group_meta.group_id.0, self.group_meta.member_id
-                    );
-                    Ok(())
-                }
-                Some(error) => {
-                    error!(
-                        "Leave group [{}] failed, error: {error}",
-                        self.group_meta.group_id.0
-                    );
-                    Err(error.into())
+                    Some(error) => {
+                        error!(
+                            "Leave group [{}] failed, error: {error}",
+                            self.group_meta.group_id.0
+                        );
+                        Err(error.into())
+                    }
                 }
             }
-        } else {
-            Err(Error::InvalidApiRequest(ApiKey::LeaveGroupKey))
+            None => Err(Error::InvalidApiRequest(ApiKey::LeaveGroupKey)),
         }
     }
 
@@ -485,86 +489,90 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
     }
 
     pub async fn sync_group(&mut self) -> Result<()> {
-        if let Some(version_range) = self.client.version_range(ApiKey::SyncGroupKey) {
-            let mut sync_group_response = self
-                .client
-                .sync_group(&self.node, self.sync_group_builder(version_range.max)?)
-                .await?;
-            match sync_group_response.error_code.err() {
-                None => {
-                    if self.is_protocol_type_inconsistent(&sync_group_response.protocol_type) {
-                        error!(
-                            "JoinGroup failed: Inconsistent Protocol Type, received {:?} but \
-                             expected {:?}",
-                            sync_group_response.protocol_type, self.group_meta.protocol_type
-                        );
-                        return Err(ResponseError::InconsistentGroupProtocol.into());
-                    }
-
-                    if self.group_meta.protocol_name.is_none() {
-                        self.group_meta.protocol_name = sync_group_response.protocol_name;
-                    }
-                    if self.group_meta.protocol_type.is_none() {
-                        self.group_meta.protocol_type = sync_group_response.protocol_type;
-                    }
-                    let assignment =
-                        Assignment::deserialize_from_bytes(&mut sync_group_response.assignment)?;
-                    self.subscriptions.assignments.clear();
-                    for (topic, partitions) in assignment.partitions {
-                        for partition in partitions.iter() {
-                            let tp = TopicPartition {
-                                topic: topic.clone(),
-                                partition: *partition,
-                            };
-                            let mut tp_state = TopicPartitionState::new(*partition);
-                            tp_state.position.current_leader =
-                                self.client.cluster_meta.current_leader(&tp);
-                            self.subscriptions.assignments.insert(tp, tp_state);
+        match self.client.version_range(ApiKey::SyncGroupKey) {
+            Some(version_range) => {
+                let mut sync_group_response = self
+                    .client
+                    .sync_group(&self.node, self.sync_group_builder(version_range.max)?)
+                    .await?;
+                match sync_group_response.error_code.err() {
+                    None => {
+                        if self.is_protocol_type_inconsistent(&sync_group_response.protocol_type) {
+                            error!(
+                                "JoinGroup failed: Inconsistent Protocol Type, received {} but \
+                                 expected {}",
+                                sync_group_response.protocol_type.unwrap(),
+                                self.group_meta.protocol_type.as_ref().unwrap()
+                            );
+                            return Err(ResponseError::InconsistentGroupProtocol.into());
                         }
+
+                        if self.group_meta.protocol_name.is_none() {
+                            self.group_meta.protocol_name = sync_group_response.protocol_name;
+                        }
+                        if self.group_meta.protocol_type.is_none() {
+                            self.group_meta.protocol_type = sync_group_response.protocol_type;
+                        }
+                        let assignment = Assignment::deserialize_from_bytes(
+                            &mut sync_group_response.assignment,
+                        )?;
+                        self.subscriptions.assignments.clear();
+                        for (topic, partitions) in assignment.partitions {
+                            for partition in partitions.iter() {
+                                let tp = TopicPartition {
+                                    topic: topic.clone(),
+                                    partition: *partition,
+                                };
+                                let mut tp_state = TopicPartitionState::new(*partition);
+                                tp_state.position.current_leader =
+                                    self.client.cluster_meta.current_leader(&tp);
+                                self.subscriptions.assignments.insert(tp, tp_state);
+                            }
+                        }
+                        self.state = MemberState::Stable;
+                        info!(
+                            "Sync group [{}] success, leader = {}, member_id = {}, generation_id \
+                             = {}, protocol_type = {}, protocol_name = {}, assignments = <{}>",
+                            self.group_meta.group_id.0,
+                            self.group_meta.leader,
+                            self.group_meta.member_id,
+                            self.group_meta.generation_id,
+                            self.group_meta.protocol_type.as_ref().unwrap(),
+                            self.group_meta.protocol_name.as_ref().unwrap(),
+                            crate::array_display(self.subscriptions.assignments.keys()),
+                        );
+                        Ok(())
                     }
-                    self.state = MemberState::Stable;
-                    info!(
-                        "Sync group [{}] success, leader = {}, member_id = {}, generation_id = \
-                         {}, protocol_type = {:?}, protocol_name = {:?}, assignments = <{}>",
-                        self.group_meta.group_id.0,
-                        self.group_meta.leader,
-                        self.group_meta.member_id,
-                        self.group_meta.generation_id,
-                        self.group_meta.protocol_type.as_ref().unwrap(),
-                        self.group_meta.protocol_name.as_ref().unwrap(),
-                        crate::array_display(self.subscriptions.assignments.keys()),
-                    );
-                    Ok(())
+                    Some(error) => Err(error.into()),
                 }
-                Some(error) => Err(error.into()),
             }
-        } else {
-            Err(Error::InvalidApiRequest(ApiKey::SyncGroupKey))
+            None => Err(Error::InvalidApiRequest(ApiKey::SyncGroupKey)),
         }
     }
 
     pub async fn offset_fetch(&mut self) -> Result<()> {
-        if let Some(version_range) = self.client.version_range(ApiKey::OffsetFetchKey) {
-            let mut offset_fetch_response = self
-                .client
-                .offset_fetch(
-                    &self.node,
-                    self.offset_fetch_builder(version_range.max).await?,
-                )
-                .await?;
-            match offset_fetch_response.error_code.err() {
-                None => {
-                    if let Some(group) = offset_fetch_response.groups.pop() {
-                        offset_fetch_block!(self, group);
-                    } else {
-                        offset_fetch_block!(self, offset_fetch_response);
+        match self.client.version_range(ApiKey::OffsetFetchKey) {
+            Some(version_range) => {
+                let mut offset_fetch_response = self
+                    .client
+                    .offset_fetch(
+                        &self.node,
+                        self.offset_fetch_builder(version_range.max).await?,
+                    )
+                    .await?;
+                match offset_fetch_response.error_code.err() {
+                    None => {
+                        if let Some(group) = offset_fetch_response.groups.pop() {
+                            offset_fetch_block!(self, group);
+                        } else {
+                            offset_fetch_block!(self, offset_fetch_response);
+                        }
+                        Ok(())
                     }
-                    Ok(())
+                    Some(error) => Err(error.into()),
                 }
-                Some(error) => Err(error.into()),
             }
-        } else {
-            Err(Error::InvalidApiRequest(ApiKey::OffsetFetchKey))
+            None => Err(Error::InvalidApiRequest(ApiKey::OffsetFetchKey)),
         }
     }
 
@@ -597,72 +605,73 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
 
     pub async fn heartbeat(&mut self) -> Result<()> {
         let sent_generation = self.group_meta.generation_id;
-        if let Some(version_range) = self.client.version_range(ApiKey::HeartbeatKey) {
-            let heartbeat_response = self
-                .client
-                .heartbeat(&self.node, self.heartbeat_builder(version_range.max)?)
-                .await?;
+        match self.client.version_range(ApiKey::HeartbeatKey) {
+            Some(version_range) => {
+                let heartbeat_response = self
+                    .client
+                    .heartbeat(&self.node, self.heartbeat_builder(version_range.max)?)
+                    .await?;
 
-            match heartbeat_response.error_code.err() {
-                None => {
-                    debug!(
-                        "Heartbeat success, group: {}, member: {}",
-                        self.group_meta.group_id.0, self.group_meta.member_id
-                    );
-                    Ok(())
-                }
-                Some(
-                    error @ ResponseError::CoordinatorNotAvailable
-                    | error @ ResponseError::NotCoordinator,
-                ) => {
-                    info!(
-                        "Attempt to heartbeat failed since coordinator {} is either not started \
-                         or not valid",
-                        self.node.id
-                    );
-                    Err(error.into())
-                }
-                Some(error @ ResponseError::RebalanceInProgress) => {
-                    if matches!(self.state, MemberState::Stable) {
-                        warn!("Request joining group due to: group is already rebalancing");
-                        self.rejoin_group().await?;
-                        Err(error.into())
-                    } else {
+                match heartbeat_response.error_code.err() {
+                    None => {
                         debug!(
-                            "Ignoring heartbeat response with error {error} during {:?} state",
-                            self.state
+                            "Heartbeat success, group: {}, member: {}",
+                            self.group_meta.group_id.0, self.group_meta.member_id
                         );
                         Ok(())
                     }
-                }
-                Some(
-                    error @ ResponseError::IllegalGeneration
-                    | error @ ResponseError::UnknownMemberId
-                    | error @ ResponseError::FencedInstanceId,
-                ) => {
-                    if self.group_meta.generation_id == sent_generation {
+                    Some(
+                        error @ ResponseError::CoordinatorNotAvailable
+                        | error @ ResponseError::NotCoordinator,
+                    ) => {
                         info!(
-                            "Attempt to heartbeat with generation {} and group instance id {:?} \
-                             failed due to {error}, resetting generation",
-                            self.group_meta.generation_id, self.group_meta.group_instance_id
+                            "Attempt to heartbeat failed since coordinator {} is either not \
+                             started or not valid",
+                            self.node.id
                         );
-                        self.reset_state(matches!(error, ResponseError::IllegalGeneration));
-                        self.rejoin_group().await?;
                         Err(error.into())
-                    } else {
-                        info!(
-                            "Attempt to heartbeat with stale generation {} and group instance id \
-                             {:?} failed due to {error}, ignoring the error",
-                            sent_generation, self.group_meta.group_instance_id
-                        );
-                        Ok(())
                     }
+                    Some(error @ ResponseError::RebalanceInProgress) => {
+                        if matches!(self.state, MemberState::Stable) {
+                            warn!("Request joining group due to: group is already rebalancing");
+                            self.rejoin_group().await?;
+                            Err(error.into())
+                        } else {
+                            debug!(
+                                "Ignoring heartbeat response with error {error} during {:?} state",
+                                self.state
+                            );
+                            Ok(())
+                        }
+                    }
+                    Some(
+                        error @ ResponseError::IllegalGeneration
+                        | error @ ResponseError::UnknownMemberId
+                        | error @ ResponseError::FencedInstanceId,
+                    ) => {
+                        if self.group_meta.generation_id == sent_generation {
+                            info!(
+                                "Attempt to heartbeat with generation {} and group instance id \
+                                 {:?} failed due to {error}, resetting generation",
+                                self.group_meta.generation_id, self.group_meta.group_instance_id
+                            );
+                            self.reset_state(matches!(error, ResponseError::IllegalGeneration));
+                            self.rejoin_group().await?;
+                            Err(error.into())
+                        } else {
+                            info!(
+                                "Attempt to heartbeat with stale generation {} and group instance \
+                                 id {:?} failed due to {error}, ignoring the error",
+                                sent_generation, self.group_meta.group_instance_id
+                            );
+                            Ok(())
+                        }
+                    }
+                    Some(error @ ResponseError::GroupAuthorizationFailed) => Err(error.into()),
+                    Some(error) => Err(error.into()),
                 }
-                Some(error @ ResponseError::GroupAuthorizationFailed) => Err(error.into()),
-                Some(error) => Err(error.into()),
             }
-        } else {
-            Err(Error::InvalidApiRequest(ApiKey::HeartbeatKey))
+            None => Err(Error::InvalidApiRequest(ApiKey::HeartbeatKey)),
         }
     }
 }

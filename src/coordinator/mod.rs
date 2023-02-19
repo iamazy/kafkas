@@ -106,35 +106,36 @@ async fn find_coordinator<Exe: Executor>(
     key: StrBytes,
     key_type: CoordinatorType,
 ) -> Result<Node> {
-    if let Some(version_range) = client.version_range(ApiKey::FindCoordinatorKey) {
-        let mut find_coordinator_response = client
-            .find_coordinator(find_coordinator_builder(key, key_type, version_range.max)?)
-            .await?;
+    match client.version_range(ApiKey::FindCoordinatorKey) {
+        Some(version_range) => {
+            let mut find_coordinator_response = client
+                .find_coordinator(find_coordinator_builder(key, key_type, version_range.max)?)
+                .await?;
 
-        if find_coordinator_response.error_code.is_ok() {
-            if let Some(coordinator) = find_coordinator_response.coordinators.pop() {
-                Ok(Node::new(
-                    coordinator.node_id,
-                    coordinator.host,
-                    coordinator.port,
-                ))
+            if find_coordinator_response.error_code.is_ok() {
+                if let Some(coordinator) = find_coordinator_response.coordinators.pop() {
+                    Ok(Node::new(
+                        coordinator.node_id,
+                        coordinator.host,
+                        coordinator.port,
+                    ))
+                } else {
+                    Ok(Node::new(
+                        find_coordinator_response.node_id,
+                        find_coordinator_response.host,
+                        find_coordinator_response.port,
+                    ))
+                }
             } else {
-                Ok(Node::new(
-                    find_coordinator_response.node_id,
-                    find_coordinator_response.host,
-                    find_coordinator_response.port,
-                ))
+                error!(
+                    "Find coordinator error: {}, message: {:?}",
+                    find_coordinator_response.error_code.err().unwrap(),
+                    find_coordinator_response.error_message
+                );
+                Err(ConsumeError::CoordinatorNotAvailable.into())
             }
-        } else {
-            error!(
-                "Find coordinator error: {}, message: {:?}",
-                find_coordinator_response.error_code.err().unwrap(),
-                find_coordinator_response.error_message
-            );
-            Err(ConsumeError::CoordinatorNotAvailable.into())
         }
-    } else {
-        Err(Error::InvalidApiRequest(ApiKey::FindCoordinatorKey))
+        None => Err(Error::InvalidApiRequest(ApiKey::FindCoordinatorKey)),
     }
 }
 
