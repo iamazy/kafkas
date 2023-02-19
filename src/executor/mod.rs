@@ -16,7 +16,6 @@ pub enum ExecutorKind {
 /// Wrapper trait abstracting the Tokio and async-std executors
 pub trait Executor: Clone + Send + Sync + 'static {
     /// spawns a new task
-    #[allow(clippy::result_unit_err)]
     fn spawn<Res>(&self, f: Pin<Box<dyn Future<Output = Res> + Send>>) -> JoinHandle<Res>
     where
         Res: Send + 'static;

@@ -4,6 +4,7 @@ use std::{
     hash::Hash,
 };
 
+use indexmap::IndexMap;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{fetch_response::PartitionData, FetchResponse, TopicName},
@@ -339,7 +340,7 @@ pub struct FetchRequestData {
     pub(crate) can_use_topic_ids: bool,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct FetchRequestPartitionData {
     pub(crate) topic_id: Uuid,
     pub(crate) fetch_offset: i64,
@@ -362,7 +363,7 @@ impl FetchRequestPartitionData {
 
 #[derive(Debug, Default)]
 pub struct FetchRequestDataBuilder {
-    next: HashMap<TopicPartition, FetchRequestPartitionData>,
+    next: IndexMap<TopicPartition, FetchRequestPartitionData>,
     topic_names: HashMap<Uuid, TopicName>,
     partitions_without_topic_ids: usize,
     copy_session_partitions: bool,
@@ -394,7 +395,7 @@ impl FetchRequestDataBuilder {
                 session.next_metadata, session.node
             );
             session.session_partitions.clear();
-            session.session_partitions.extend(self.next.drain());
+            session.session_partitions.extend(self.next.drain(..));
 
             session.session_topic_names.clear();
             if can_use_topic_ids {
@@ -403,7 +404,7 @@ impl FetchRequestDataBuilder {
 
             let mut to_send = HashMap::with_capacity(session.session_partitions.len());
             for (tp, data) in session.session_partitions.iter() {
-                to_send.insert(tp.clone(), data.clone());
+                to_send.insert(tp.clone(), *data);
             }
             return FetchRequestData {
                 to_send: to_send.clone(),
@@ -424,12 +425,17 @@ impl FetchRequestDataBuilder {
         for (tp, prev_data) in session.session_partitions.iter_mut() {
             match self.next.remove(tp) {
                 Some(next_data) => {
+                    // We basically check if the new partition had the same topic ID. If not,
+                    // we add it to the "replaced" set. If the request is version 13 or higher, the
+                    // replaced partition will be forgotten. In any case, we will send the new
+                    // partition in the request.
                     if prev_data.topic_id != next_data.topic_id
                         && !prev_data.topic_id.is_nil()
                         && !next_data.topic_id.is_nil()
                     {
                         let topic_id = prev_data.topic_id;
                         prev_data.copied_from(&next_data);
+                        // Re-add the replaced partition to the end of 'next'
                         self.next.insert(tp.clone(), next_data);
                         replaced.push(TopicIdPartition {
                             topic_id,
@@ -438,6 +444,7 @@ impl FetchRequestDataBuilder {
                     } else if prev_data != &next_data {
                         let topic_id = next_data.topic_id;
                         prev_data.copied_from(&next_data);
+                        // Re-add the altered partition to the end of 'next'
                         self.next.insert(tp.clone(), next_data);
                         altered.push(TopicIdPartition {
                             topic_id,
@@ -446,11 +453,15 @@ impl FetchRequestDataBuilder {
                     }
                 }
                 None => {
+                    // Remove this partition from the session.
                     session_remove.push(tp.clone());
+                    // Indicate that we no longer want to listen to this partition.
                     removed.push(TopicIdPartition {
                         topic_id: prev_data.topic_id,
                         partition: tp.clone(),
                     });
+                    // If we do not have this topic ID in the builder or the session, we can not use
+                    // topic IDs.
                     if can_use_topic_ids && prev_data.topic_id.is_nil() {
                         can_use_topic_ids = false;
                     }
@@ -462,14 +473,17 @@ impl FetchRequestDataBuilder {
             session.session_partitions.remove(tp);
         }
 
+        // Add any new partitions to the session.
         for (tp, next_data) in self.next.iter() {
             if session.session_partitions.contains_key(tp) {
+                // In the previous loop, all the partitions which existed in both sessionPartitions
+                // and next were moved to the end of next, or removed from next.  Therefore,
+                // once we hit one of them, we know there are no more unseen entries to look
+                // at in next.
                 break;
             }
             let topic_id = next_data.topic_id;
-            session
-                .session_partitions
-                .insert(tp.clone(), next_data.clone());
+            session.session_partitions.insert(tp.clone(), *next_data);
             added.push(TopicIdPartition {
                 topic_id,
                 partition: tp.clone(),
@@ -477,12 +491,16 @@ impl FetchRequestDataBuilder {
         }
 
         session.session_topic_names.clear();
+
+        // Add topic IDs to session if we can use them. If an ID is inconsistent, we will handle in
+        // the receiving broker. If we switched from using topic IDs to not using them (or
+        // vice versa), that error will also be handled in the receiving broker.
         if can_use_topic_ids {
-            session.session_topic_names.extend(self.topic_names.drain());
+            session.session_topic_names.extend(self.topic_names.clone());
         }
 
         let mut to_send = HashMap::with_capacity(self.next.len());
-        to_send.extend(self.next.drain());
+        to_send.extend(self.next.drain(..));
 
         FetchRequestData {
             to_send,
