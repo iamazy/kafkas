@@ -20,11 +20,10 @@ use kafka_protocol::{
 use uuid::Uuid;
 
 use crate::{
-    connection::Connection,
     connection_manager::{ConnectionManager, OperationRetryOptions},
     error::{ConnectionError, Error, Result},
     executor::Executor,
-    metadata::{Cluster, Node, TopicPartition},
+    metadata::{Cluster, Node},
     PartitionRef, ToStrBytes,
 };
 
@@ -33,7 +32,7 @@ pub trait DeserializeMessage {
     /// type produced from the message
     type Output: Sized;
     /// deserialize method that will be called by the consumer
-    fn deserialize_message(partition: &TopicPartition, record: Record) -> Self::Output;
+    fn deserialize_message(record: Record) -> Self::Output;
 }
 
 /// Helper trait for message serialization
@@ -312,11 +311,4 @@ impl<Exe: Executor> Kafka<Exe> {
         request.client_software_version = Self::PKG_VERSION.to_string().to_str_bytes();
         Ok(request)
     }
-}
-
-#[derive(Clone)]
-pub struct PartitionClient<'a, Exe: Executor> {
-    pub topic: &'a String,
-    pub partition: i32,
-    pub connection: Arc<Connection<Exe>>,
 }

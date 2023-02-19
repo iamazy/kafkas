@@ -3,9 +3,10 @@ mod fetcher;
 pub(crate) mod partition_assignor;
 pub(crate) mod subscription_state;
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use async_stream::stream;
+use bytes::Bytes;
 use chrono::Local;
 use dashmap::DashSet;
 use futures::{
@@ -13,6 +14,7 @@ use futures::{
     future::{select, Either},
     pin_mut, SinkExt, Stream, StreamExt,
 };
+use indexmap::IndexMap;
 use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::GroupId,
@@ -32,39 +34,55 @@ use crate::{
     coordinator::{ConsumerCoordinator, CoordinatorEvent},
     executor::Executor,
     metadata::TopicPartition,
-    NodeId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
+    NodeId, PartitionId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
 };
 
 /// High-level consumer record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerRecord {
-    pub topic: String,
-    pub partition: i32,
     pub offset: i64,
-    pub key: Option<Vec<u8>>,
-    pub value: Option<Vec<u8>>,
-    pub headers: BTreeMap<String, Option<Vec<u8>>>,
+    pub key: Option<Bytes>,
+    pub value: Option<Bytes>,
+    pub headers: IndexMap<StrBytes, Option<Bytes>>,
     pub timestamp: i64,
 }
 
 impl DeserializeMessage for ConsumerRecord {
     type Output = Self;
 
-    fn deserialize_message(partition: &TopicPartition, mut record: Record) -> Self::Output {
-        let mut headers = BTreeMap::new();
-        for (key, value) in record.headers.drain(..) {
-            headers.insert(key.to_string(), value.map(|v| v.to_vec()));
-        }
-
+    fn deserialize_message(record: Record) -> Self::Output {
         ConsumerRecord {
-            topic: partition.topic.to_string(),
-            partition: partition.partition,
             offset: record.offset,
-            key: record.key.map(|key| key.to_vec()),
-            value: record.value.map(|value| value.to_vec()),
-            headers,
+            key: record.key,
+            value: record.value,
+            headers: record.headers,
             timestamp: record.timestamp,
         }
+    }
+}
+
+/// High-level consumer record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerRecords<T: DeserializeMessage + Sized> {
+    partition: TopicPartition,
+    records: Vec<T>,
+}
+
+impl<T: DeserializeMessage + Sized> ConsumerRecords<T> {
+    pub fn topic(&self) -> &StrBytes {
+        self.partition.topic()
+    }
+
+    pub fn partition(&self) -> PartitionId {
+        self.partition.partition()
+    }
+}
+
+impl<T: DeserializeMessage + Sized> Iterator for ConsumerRecords<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.records.pop()
     }
 }
 
@@ -272,10 +290,13 @@ impl<Exe: Executor> Consumer<Exe> {
         self.coordinator.commit_async().await
     }
 
-    pub async fn subscribe<S: AsRef<str>>(
+    pub async fn subscribe<S: AsRef<str>, T: DeserializeMessage<Output = T> + Sized>(
         &mut self,
         topics: Vec<S>,
-    ) -> Result<impl Stream<Item = Vec<ConsumerRecord>>> {
+    ) -> Result<impl Stream<Item = ConsumerRecords<T>>>
+    where
+        <T as DeserializeMessage>::Output: DeserializeMessage,
+    {
         self.coordinator
             .subscribe(
                 topics
@@ -300,7 +321,7 @@ impl<Exe: Executor> Consumer<Exe> {
             self.notify_shutdown.subscribe(),
         )));
 
-        Ok(fetch_stream(
+        Ok(fetch_stream::<Exe, T>(
             self.client.clone(),
             self.options.clone(),
             self.coordinator.event_sender(),
@@ -350,7 +371,7 @@ async fn do_fetch<Exe: Executor>(mut fetcher: Fetcher<Exe>, mut rx: broadcast::R
     info!("Fetch task finished.");
 }
 
-fn fetch_stream<Exe: Executor>(
+fn fetch_stream<Exe: Executor, T: DeserializeMessage<Output = T> + Sized>(
     client: Kafka<Exe>,
     options: Arc<ConsumerOptions>,
     mut event_tx: mpsc::UnboundedSender<CoordinatorEvent>,
@@ -358,7 +379,10 @@ fn fetch_stream<Exe: Executor>(
     completed_partitions: Arc<DashSet<TopicPartition>>,
     mut reset_offset_tx: mpsc::UnboundedSender<()>,
     mut shutdown_rx: broadcast::Receiver<()>,
-) -> impl Stream<Item = Vec<ConsumerRecord>> {
+) -> impl Stream<Item = ConsumerRecords<T>>
+where
+    <T as DeserializeMessage>::Output: DeserializeMessage,
+{
     stream! {
         while let Some(completed_fetch) = completed_fetches_rx.next().await {
             let records_fut = handle_partition_response(
@@ -378,9 +402,12 @@ fn fetch_stream<Exe: Executor>(
                 Either::Left((Ok(Some((tp, raw_records))), _)) => {
                     let mut records = Vec::with_capacity(raw_records.len());
                     for record in raw_records {
-                        records.push(ConsumerRecord::deserialize_message(&tp, record));
+                        records.push(T::deserialize_message(record));
                     }
-                    yield records;
+                    yield ConsumerRecords {
+                        partition: tp,
+                        records
+                    };
                 }
                 Either::Left((Ok(None), _)) => {},
                 Either::Left((Err(err), _)) => error!("Fetch error: {}", err),
