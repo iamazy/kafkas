@@ -34,7 +34,6 @@ async fn main() -> Result<(), Box<Error>> {
     while let Some(records) = consume_stream.next().await {
         let partition = records.partition_id();
         for record in records {
-            i += 1;
             if let Some(value) = record.value {
                 println!(
                     "value: {} - offset: {} - partition: {}",
