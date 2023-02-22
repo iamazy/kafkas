@@ -5,7 +5,7 @@ use std::{
 };
 
 use futures::{
-    channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
+    channel::mpsc,
     future::{select, Either},
     pin_mut, SinkExt, StreamExt,
 };
@@ -42,7 +42,7 @@ use crate::{
         subscription_state::{
             OffsetMetadata, SubscriptionState, SubscriptionType, TopicPartitionState,
         },
-        ConsumerGroupMetadata, ConsumerOptions,
+        ConsumerGroupMetadata, ConsumerOptions, Fetcher,
     },
     coordinator::{find_coordinator, CoordinatorEvent, CoordinatorType},
     error::{ConsumeError, Result},
@@ -66,7 +66,7 @@ macro_rules! offset_fetch_block {
                         partition_state.position.offset = partition.committed_offset;
                         partition_state.position.offset_epoch =
                             Some(partition.committed_leader_epoch);
-                        debug!(
+                        info!(
                             "Fetch {tp} offset success, offset: {}",
                             partition.committed_offset
                         );
@@ -145,9 +145,9 @@ pub struct ConsumerCoordinator<Exe: Executor> {
     client: Kafka<Exe>,
     inner: Option<CoordinatorInner<Exe>>,
     inner_handle: Option<JoinHandle<CoordinatorInner<Exe>>>,
-    event_tx: UnboundedSender<CoordinatorEvent>,
+    event_tx: mpsc::UnboundedSender<CoordinatorEvent>,
     options: Arc<ConsumerOptions>,
-    commit_offset_tx: Option<UnboundedSender<()>>,
+    commit_offset_tx: Option<mpsc::UnboundedSender<()>>,
     notify_shutdown: broadcast::Sender<()>,
 }
 
@@ -155,11 +155,14 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
     pub async fn new(
         client: Kafka<Exe>,
         options: Arc<ConsumerOptions>,
+        fetcher: Fetcher<Exe>,
+        event_rx: mpsc::UnboundedReceiver<CoordinatorEvent>,
         notify: broadcast::Sender<()>,
     ) -> Result<ConsumerCoordinator<Exe>> {
-        let (event_tx, event_rx) = unbounded();
+        let event_tx = fetcher.event_tx.clone();
 
-        let inner = CoordinatorInner::new(client.clone(), options.clone(), event_rx).await?;
+        let inner =
+            CoordinatorInner::new(client.clone(), options.clone(), fetcher, event_rx).await?;
         let handle = client.executor.spawn(Box::pin(coordinator_loop(inner)));
 
         Ok(Self {
@@ -173,7 +176,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         })
     }
 
-    pub fn event_sender(&self) -> UnboundedSender<CoordinatorEvent> {
+    pub fn event_sender(&self) -> mpsc::UnboundedSender<CoordinatorEvent> {
         self.event_tx.clone()
     }
 
@@ -211,6 +214,17 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
         Ok(())
     }
 
+    pub async fn pause(&self) -> Result<()> {
+        self.event_tx.unbounded_send(CoordinatorEvent::PauseFetch)?;
+        Ok(())
+    }
+
+    pub async fn resume(&self) -> Result<()> {
+        self.event_tx
+            .unbounded_send(CoordinatorEvent::ResumeFetch)?;
+        Ok(())
+    }
+
     pub async fn commit_async(&mut self) -> Result<()> {
         if let Some(ref mut tx) = self.commit_offset_tx {
             tx.send(()).await?;
@@ -241,6 +255,9 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
             "Heartbeat task is started, which group is [{}].",
             self.options.group_id
         );
+
+        // Start the fetch thread.
+        self.resume().await?;
         Ok(())
     }
 
@@ -258,7 +275,7 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 
 impl<Exe: Executor> ConsumerCoordinator<Exe> {
     async fn async_commit_offset(&mut self) -> Result<()> {
-        let (commit_offset_tx, mut commit_offset_rx) = unbounded();
+        let (commit_offset_tx, mut commit_offset_rx) = mpsc::unbounded();
         self.commit_offset_tx = Some(commit_offset_tx);
 
         let mut shutdown = self.notify_shutdown.subscribe();
@@ -292,7 +309,8 @@ impl<Exe: Executor> ConsumerCoordinator<Exe> {
 struct CoordinatorInner<Exe: Executor> {
     client: Kafka<Exe>,
     node: Node,
-    event_rx: UnboundedReceiver<CoordinatorEvent>,
+    fetcher: Fetcher<Exe>,
+    event_rx: mpsc::UnboundedReceiver<CoordinatorEvent>,
     pub group_meta: ConsumerGroupMetadata,
     group_subscription: GroupSubscription,
     consumer_options: Arc<ConsumerOptions>,
@@ -305,7 +323,8 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
     pub async fn new(
         client: Kafka<Exe>,
         options: Arc<ConsumerOptions>,
-        event_rx: UnboundedReceiver<CoordinatorEvent>,
+        fetcher: Fetcher<Exe>,
+        event_rx: mpsc::UnboundedReceiver<CoordinatorEvent>,
     ) -> Result<CoordinatorInner<Exe>> {
         let group_id = options.group_id.clone().to_str_bytes();
 
@@ -327,6 +346,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         Ok(Self {
             client,
             node,
+            fetcher,
             event_rx,
             subscriptions: SubscriptionState::default(),
             group_meta: ConsumerGroupMetadata::new(group_id.into()),
@@ -346,9 +366,16 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
     }
 
     async fn rejoin_group(&mut self) -> Result<()> {
+        self.fetcher.pause();
+
         self.join_group().await?;
         self.sync_group().await?;
-        self.offset_fetch().await
+        self.offset_fetch().await?;
+
+        // resume fetch thread.
+        self.fetcher.resume();
+
+        Ok(())
     }
 
     fn reset_state(&mut self, should_reset_member_id: bool) {
@@ -632,10 +659,15 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                         Err(error.into())
                     }
                     Some(error @ ResponseError::RebalanceInProgress) => {
+                        // since we may be sending the request during rebalance, we should check
+                        // this case and ignore the REBALANCE_IN_PROGRESS error
+                        warn!(
+                            "Group [{}] is rebalance in progress.",
+                            self.group_meta.group_id.0
+                        );
                         if matches!(self.state, MemberState::Stable) {
-                            warn!("Request joining group due to: group is already rebalancing");
                             self.rejoin_group().await?;
-                            Err(error.into())
+                            Ok(())
                         } else {
                             debug!(
                                 "Ignoring heartbeat response with error {error} during {:?} state",
@@ -947,6 +979,14 @@ async fn coordinator_loop<Exe: Executor>(
             CoordinatorEvent::SyncGroup => coordinator.sync_group().await,
             CoordinatorEvent::LeaveGroup(reason) => coordinator.maybe_leave_group(reason).await,
             CoordinatorEvent::OffsetFetch => coordinator.offset_fetch().await,
+            CoordinatorEvent::PauseFetch => {
+                coordinator.fetcher.pause();
+                Ok(())
+            }
+            CoordinatorEvent::ResumeFetch => {
+                coordinator.fetcher.resume();
+                Ok(())
+            }
             CoordinatorEvent::OffsetCommit => coordinator.offset_commit().await,
             CoordinatorEvent::SeekOffset { partition, offset } => {
                 let _ = coordinator
@@ -993,8 +1033,8 @@ async fn coordinator_loop<Exe: Executor>(
                     if data.high_watermark >= 0 {
                         tp_state.high_water_mark = data.high_watermark;
                     }
-                    let _ = notify.send(());
                 }
+                let _ = notify.send(());
                 Ok(())
             }
             CoordinatorEvent::FetchablePartitions {

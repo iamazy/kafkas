@@ -340,7 +340,11 @@ mod tests {
         let executor = AsyncStdExecutor;
         let (_tx, rx) = futures::channel::oneshot::channel::<i32>();
         // let _ = tx.send(1);
-        if (executor.timeout(Duration::from_millis(1), rx).await).is_err() {
+        if executor
+            .timeout(Duration::from_millis(1), rx)
+            .await
+            .is_err()
+        {
             println!("did not receive value within 1 ms");
         }
     }

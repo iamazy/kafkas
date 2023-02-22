@@ -31,21 +31,21 @@ async fn main() -> Result<(), Box<Error>> {
         .await?;
     pin_mut!(consume_stream);
 
-    let mut i = 0;
     while let Some(records) = consume_stream.next().await {
+        let partition = records.partition_id();
         for record in records {
             i += 1;
             if let Some(value) = record.value {
                 println!(
-                    "{:?} - {}",
+                    "value: {} - offset: {} - partition: {}",
                     String::from_utf8(value.to_vec())?,
-                    record.offset
+                    record.offset,
+                    partition
                 );
             }
         }
         // needed only when `auto_commit_enabled` is false
         consumer.commit_async().await?;
-        println!("consume records size: {}", i);
     }
 
     Ok(())

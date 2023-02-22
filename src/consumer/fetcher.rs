@@ -1,11 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     vec::Drain,
 };
 
 use dashmap::{DashMap, DashSet};
-use futures::channel::{mpsc, mpsc::UnboundedSender, oneshot};
+use futures::channel::{mpsc, oneshot};
 use kafka_protocol::{
     error::ParseResponseErrorCode,
     messages::{
@@ -41,18 +44,19 @@ pub struct Fetcher<Exe: Executor> {
     pub client: Kafka<Exe>,
     timestamp: i64,
     options: Arc<ConsumerOptions>,
-    event_tx: UnboundedSender<CoordinatorEvent>,
+    pub event_tx: mpsc::UnboundedSender<CoordinatorEvent>,
     sessions: Arc<DashMap<NodeId, FetchSession>>,
     completed_fetches_tx: mpsc::UnboundedSender<CompletedFetch>,
     pub completed_partitions: Arc<DashSet<TopicPartition>>,
     nodes_with_pending_fetch_requests: HashSet<i32>,
+    paused: Arc<AtomicBool>,
 }
 
 impl<Exe: Executor> Fetcher<Exe> {
     pub fn new(
         client: Kafka<Exe>,
         timestamp: i64,
-        event_tx: UnboundedSender<CoordinatorEvent>,
+        event_tx: mpsc::UnboundedSender<CoordinatorEvent>,
         options: Arc<ConsumerOptions>,
         completed_fetches_tx: mpsc::UnboundedSender<CompletedFetch>,
     ) -> Self {
@@ -70,7 +74,20 @@ impl<Exe: Executor> Fetcher<Exe> {
             completed_partitions: Arc::new(DashSet::with_capacity(100)),
             options,
             nodes_with_pending_fetch_requests: HashSet::new(),
+            paused: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    pub(crate) fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
     }
 
     pub async fn fetch(&mut self) -> Result<()> {
@@ -176,8 +193,8 @@ impl<Exe: Executor> Fetcher<Exe> {
                             }
                             None => {
                                 error!(
-                                    "Unable to find FetchSessionHandler for node {}. Ignoring \
-                                     fetch response.",
+                                    "Unable to find FetchSession for node {}. Ignoring fetch \
+                                     response.",
                                     node.key()
                                 );
                                 continue;
@@ -206,24 +223,37 @@ impl<Exe: Executor> Fetcher<Exe> {
                 exclude,
                 partitions_tx: tx,
             })?;
-        Ok(rx.await?)
+        match rx.await {
+            Ok(partitions) => Ok(partitions),
+            Err(err) => {
+                error!("Failed to get fetchable partitions, error: Canceled");
+                Err(err.into())
+            }
+        }
     }
 
     async fn validate_position_on_metadata_change(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.event_tx
             .unbounded_send(CoordinatorEvent::Assignments { partitions_tx: tx })?;
-        for tp in rx.await? {
-            let current_leader = self.client.cluster_meta.current_leader(&tp);
-            self.event_tx.unbounded_send(
-                CoordinatorEvent::MaybeValidatePositionForCurrentLeader {
-                    partition: tp,
-                    current_leader,
-                },
-            )?;
+        match rx.await {
+            Ok(partitions) => {
+                for tp in partitions {
+                    let current_leader = self.client.cluster_meta.current_leader(&tp);
+                    self.event_tx.unbounded_send(
+                        CoordinatorEvent::MaybeValidatePositionForCurrentLeader {
+                            partition: tp,
+                            current_leader,
+                        },
+                    )?;
+                }
+                Ok(())
+            }
+            Err(err) => {
+                error!("Failed to validate position on metadata change, error: Canceled");
+                Err(err.into())
+            }
         }
-
-        Ok(())
     }
 
     async fn fetch_position(&self, partition: TopicPartition) -> Result<Option<FetchPosition>> {
@@ -233,7 +263,13 @@ impl<Exe: Executor> Fetcher<Exe> {
                 partition,
                 position_tx: tx,
             })?;
-        Ok(rx.await?)
+        match rx.await {
+            Ok(position) => Ok(position),
+            Err(err) => {
+                error!("Failed to get fetch position, error: Canceled");
+                Err(err.into())
+            }
+        }
     }
 
     async fn prepare_fetch_requests(&self) -> Result<HashMap<NodeId, FetchRequestData>> {
@@ -314,7 +350,13 @@ impl<Exe: Executor> Fetcher<Exe> {
                 partition,
                 timestamp_tx: tx,
             })?;
-        Ok(rx.await?)
+        match rx.await {
+            Ok(timestamp) => Ok(timestamp),
+            Err(err) => {
+                error!("Failed to get strategy timestamp, error: Canceled");
+                Err(err.into())
+            }
+        }
     }
 
     async fn partitions_need_reset(&self, timestamp: i64) -> Result<Vec<TopicPartition>> {
@@ -324,7 +366,13 @@ impl<Exe: Executor> Fetcher<Exe> {
                 timestamp,
                 partition_tx: tx,
             })?;
-        Ok(rx.await?)
+        match rx.await {
+            Ok(partitions) => Ok(partitions),
+            Err(err) => {
+                error!("Failed to partitions which need reset, error: Canceled");
+                Err(err.into())
+            }
+        }
     }
 
     pub(crate) async fn reset_offset(&mut self) -> Result<()> {
