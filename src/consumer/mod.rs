@@ -5,7 +5,7 @@ pub use fetcher::Fetcher;
 pub(crate) mod partition_assignor;
 pub(crate) mod subscription_state;
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use async_stream::stream;
 use bytes::Bytes;
@@ -64,7 +64,7 @@ impl DeserializeMessage for ConsumerRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerRecords<T: DeserializeMessage + Sized> {
     partition: TopicPartition,
-    records: Vec<T>,
+    records: VecDeque<T>,
 }
 
 impl<T: DeserializeMessage + Sized> ConsumerRecords<T> {
@@ -81,7 +81,7 @@ impl<T: DeserializeMessage + Sized> Iterator for ConsumerRecords<T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.records.pop()
+        self.records.pop_back()
     }
 }
 
@@ -407,39 +407,49 @@ where
     T: DeserializeMessage<Output = T> + Sized,
 {
     stream! {
-        while let Some(completed_fetch) = completed_fetches_rx.next().await {
-            let records_fut = handle_partition_response(
-                &client,
-                &mut reset_offset_tx,
-                completed_fetch,
-                &options,
-                &mut event_tx,
-                &completed_partitions,
-            );
+        loop {
+            let next_fut = completed_fetches_rx.next();
             let shutdown = shutdown_rx.recv();
 
-            pin_mut!(records_fut);
+            pin_mut!(next_fut);
             pin_mut!(shutdown);
 
-            match select(records_fut, shutdown).await {
-                Either::Left((Ok(Some((tp, raw_records))), _)) => {
-                    let mut records = Vec::with_capacity(raw_records.len());
-                    for record in raw_records {
-                        records.push(T::deserialize_message(record));
+            match select(next_fut, shutdown).await {
+                Either::Left((completed_fetch, _)) => {
+                    if let Some(completed_fetch) = completed_fetch {
+                        match handle_partition_response(
+                            &client,
+                            &mut reset_offset_tx,
+                            completed_fetch,
+                            &options,
+                            &mut event_tx,
+                            &completed_partitions,
+                        ).await {
+                            Ok(response) => {
+                                if let Some((tp, raw_records)) = response {
+                                    let mut records = VecDeque::with_capacity(raw_records.len());
+                                    for record in raw_records {
+                                        records.push_front(T::deserialize_message(record));
+                                    }
+                                    yield ConsumerRecords {
+                                        partition: tp,
+                                        records
+                                    };
+                                }
+                            }
+                            Err(err) => {
+                                error!("Fetch error: {}", err);
+                            }
+                        }
                     }
-                    yield ConsumerRecords {
-                        partition: tp,
-                        records
-                    };
                 }
-                Either::Left((Ok(None), _)) => {},
-                Either::Left((Err(err), _)) => error!("Fetch error: {}", err),
                 Either::Right(_) => {
                     info!("Fetch task is shutting down");
                     break
                 }
             }
         }
+        info!("Fetch task is shutting down");
     }
 }
 
