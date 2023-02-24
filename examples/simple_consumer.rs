@@ -32,12 +32,14 @@ async fn main() -> Result<(), Box<Error>> {
     pin_mut!(consume_stream);
 
     while let Some(records) = consume_stream.next().await {
+        let partition = records.partition_id();
         for record in records {
             if let Some(value) = record.value {
                 println!(
-                    "{:?} - {}",
+                    "value: {} - offset: {} - partition: {}",
                     String::from_utf8(value.to_vec())?,
-                    record.offset
+                    record.offset,
+                    partition
                 );
             }
         }

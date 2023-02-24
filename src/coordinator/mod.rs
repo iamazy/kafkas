@@ -42,6 +42,8 @@ pub enum CoordinatorEvent {
     SyncGroup,
     LeaveGroup(StrBytes),
     OffsetFetch,
+    PauseFetch,
+    ResumeFetch,
     OffsetCommit,
     ResetOffset {
         partition: TopicPartition,

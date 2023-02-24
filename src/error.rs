@@ -24,6 +24,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub enum Error {
     Custom(String),
+    KafkaError(ResponseError),
     Connection(ConnectionError),
     InvalidVersion(i16),
     InvalidApiRequest(ApiKey),
@@ -55,7 +56,7 @@ impl From<()> for Error {
 
 impl From<ResponseError> for Error {
     fn from(value: ResponseError) -> Self {
-        Error::Custom(value.to_string())
+        Error::KafkaError(value)
     }
 }
 
@@ -133,6 +134,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Error::Custom(e) => write!(f, "{e}"),
+            Error::KafkaError(e) => write!(f, "{e}"),
             Error::Connection(e) => write!(f, "{e}"),
             Error::InvalidVersion(v) => write!(f, "Invalid version: {v}"),
             Error::InvalidApiRequest(v) => write!(f, "Invalid Api Request: {v:?}"),

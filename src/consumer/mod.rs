@@ -1,9 +1,11 @@
 mod fetch_session;
 mod fetcher;
+pub use fetcher::Fetcher;
+
 pub(crate) mod partition_assignor;
 pub(crate) mod subscription_state;
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use async_stream::stream;
 use bytes::Bytes;
@@ -27,14 +29,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     client::{DeserializeMessage, Kafka},
-    consumer::{
-        fetcher::{CompletedFetch, Fetcher},
-        subscription_state::FetchPosition,
-    },
+    consumer::{fetcher::CompletedFetch, subscription_state::FetchPosition},
     coordinator::{ConsumerCoordinator, CoordinatorEvent},
     executor::Executor,
     metadata::TopicPartition,
-    NodeId, PartitionId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
+    Error, NodeId, PartitionId, Result, ToStrBytes, DEFAULT_GENERATION_ID,
 };
 
 /// High-level consumer record.
@@ -65,7 +64,7 @@ impl DeserializeMessage for ConsumerRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerRecords<T: DeserializeMessage + Sized> {
     partition: TopicPartition,
-    records: Vec<T>,
+    records: VecDeque<T>,
 }
 
 impl<T: DeserializeMessage + Sized> ConsumerRecords<T> {
@@ -73,7 +72,7 @@ impl<T: DeserializeMessage + Sized> ConsumerRecords<T> {
         self.partition.topic()
     }
 
-    pub fn partition(&self) -> PartitionId {
+    pub fn partition_id(&self) -> PartitionId {
         self.partition.partition()
     }
 }
@@ -82,7 +81,7 @@ impl<T: DeserializeMessage + Sized> Iterator for ConsumerRecords<T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.records.pop()
+        self.records.pop_back()
     }
 }
 
@@ -245,7 +244,7 @@ pub struct Consumer<Exe: Executor> {
     fetcher: Fetcher<Exe>,
     options: Arc<ConsumerOptions>,
     notify_shutdown: broadcast::Sender<()>,
-    fetches_rx: Option<mpsc::UnboundedReceiver<CompletedFetch>>,
+    completed_fetches_rx: Option<mpsc::UnboundedReceiver<CompletedFetch>>,
 }
 
 impl<Exe: Executor> Consumer<Exe> {
@@ -253,19 +252,26 @@ impl<Exe: Executor> Consumer<Exe> {
         let options = Arc::new(options);
 
         let (notify_shutdown, _) = broadcast::channel(1);
-        let coordinator =
-            ConsumerCoordinator::new(client.clone(), options.clone(), notify_shutdown.clone())
-                .await?;
+        let (event_tx, event_rx) = mpsc::unbounded();
 
-        let (tx, rx) = mpsc::unbounded();
+        let (completed_fetches_tx, completed_fetches_rx) = mpsc::unbounded();
 
         let fetcher = Fetcher::new(
             client.clone(),
             Local::now().timestamp(),
-            coordinator.event_sender(),
+            event_tx,
             options.clone(),
-            tx,
+            completed_fetches_tx,
         );
+
+        let coordinator = ConsumerCoordinator::new(
+            client.clone(),
+            options.clone(),
+            fetcher.clone(),
+            event_rx,
+            notify_shutdown.clone(),
+        )
+        .await?;
 
         Ok(Self {
             client,
@@ -273,7 +279,7 @@ impl<Exe: Executor> Consumer<Exe> {
             fetcher,
             options,
             notify_shutdown,
-            fetches_rx: Some(rx),
+            completed_fetches_rx: Some(completed_fetches_rx),
         })
     }
 
@@ -325,7 +331,7 @@ impl<Exe: Executor> Consumer<Exe> {
             self.client.clone(),
             self.options.clone(),
             self.coordinator.event_sender(),
-            self.fetches_rx.take().unwrap(),
+            self.completed_fetches_rx.take().unwrap(),
             self.fetcher.completed_partitions.clone(),
             reset_offset_tx,
             self.notify_shutdown.subscribe(),
@@ -352,13 +358,29 @@ impl<Exe: Executor> Drop for Consumer<Exe> {
     }
 }
 
-async fn do_fetch<Exe: Executor>(mut fetcher: Fetcher<Exe>, mut rx: broadcast::Receiver<()>) {
+async fn do_fetch<Exe: Executor>(
+    mut fetcher: Fetcher<Exe>,
+    mut notify_shutdown: broadcast::Receiver<()>,
+) {
     let mut interval = fetcher.client.executor.interval(Duration::from_millis(100));
+
     while interval.next().await.is_some() {
-        let fetcher_fut = fetcher.fetch();
-        let shutdown = rx.recv();
-        pin_mut!(fetcher_fut);
+        let shutdown = notify_shutdown.recv();
         pin_mut!(shutdown);
+
+        if fetcher.is_paused() {
+            // Pause fetch thread if coordinator is rebalancing.
+            let delay_fut = fetcher.client.executor.delay(Duration::from_millis(1000));
+            pin_mut!(delay_fut);
+
+            match select(delay_fut, shutdown).await {
+                Either::Left(_) => continue,
+                Either::Right(_) => break,
+            }
+        }
+
+        let fetcher_fut = fetcher.fetch();
+        pin_mut!(fetcher_fut);
 
         match select(fetcher_fut, shutdown).await {
             Either::Left((Err(err), _)) => {
@@ -385,39 +407,49 @@ where
     T: DeserializeMessage<Output = T> + Sized,
 {
     stream! {
-        while let Some(completed_fetch) = completed_fetches_rx.next().await {
-            let records_fut = handle_partition_response(
-                &client,
-                &mut reset_offset_tx,
-                completed_fetch,
-                &options,
-                &mut event_tx,
-                &completed_partitions,
-            );
+        loop {
+            let next_fut = completed_fetches_rx.next();
             let shutdown = shutdown_rx.recv();
 
-            pin_mut!(records_fut);
+            pin_mut!(next_fut);
             pin_mut!(shutdown);
 
-            match select(records_fut, shutdown).await {
-                Either::Left((Ok(Some((tp, raw_records))), _)) => {
-                    let mut records = Vec::with_capacity(raw_records.len());
-                    for record in raw_records {
-                        records.push(T::deserialize_message(record));
+            match select(next_fut, shutdown).await {
+                Either::Left((completed_fetch, _)) => {
+                    if let Some(completed_fetch) = completed_fetch {
+                        match handle_partition_response(
+                            &client,
+                            &mut reset_offset_tx,
+                            completed_fetch,
+                            &options,
+                            &mut event_tx,
+                            &completed_partitions,
+                        ).await {
+                            Ok(response) => {
+                                if let Some((tp, raw_records)) = response {
+                                    let mut records = VecDeque::with_capacity(raw_records.len());
+                                    for record in raw_records {
+                                        records.push_front(T::deserialize_message(record));
+                                    }
+                                    yield ConsumerRecords {
+                                        partition: tp,
+                                        records
+                                    };
+                                }
+                            }
+                            Err(err) => {
+                                error!("Fetch error: {}", err);
+                            }
+                        }
                     }
-                    yield ConsumerRecords {
-                        partition: tp,
-                        records
-                    };
                 }
-                Either::Left((Ok(None), _)) => {},
-                Either::Left((Err(err), _)) => error!("Fetch error: {}", err),
                 Either::Right(_) => {
                     info!("Fetch task is shutting down");
                     break
                 }
             }
         }
+        info!("Fetch task is shutting down");
     }
 }
 
@@ -536,7 +568,11 @@ async fn handle_partition_response<Exe: Executor>(
                         data: partition,
                         notify: tx,
                     })?;
-                    rx.await?;
+                    if rx.await.is_err() {
+                        return Err(Error::Custom(
+                            "Failed to await records, error: Canceled".into(),
+                        ));
+                    }
                     completed_partitions.remove(&completed_fetch.partition);
                     return Ok(Some((completed_fetch.partition, records)));
                 }
@@ -547,7 +583,6 @@ async fn handle_partition_response<Exe: Executor>(
                         data: partition,
                         notify: tx,
                     })?;
-                    rx.await?;
                 }
             }
         }
