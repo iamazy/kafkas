@@ -635,10 +635,10 @@ mod tests {
         error: i16,
         throttle_time_ms: i32,
         session_id: i32,
-        mut map: IndexMap<TopicIdPartition, PartitionData>,
+        map: IndexMap<TopicIdPartition, PartitionData>,
     ) -> FetchResponse {
         let mut topic_responses = Vec::new();
-        for (tp, data) in map.iter_mut() {
+        for (tp, mut data) in map {
             // Since PartitionData alone doesn't know the partition ID, we set it here
             data.partition_index = tp.partition.partition;
             // We have to keep the order of input topic-partition. Hence, we batch the partitions
@@ -647,21 +647,18 @@ mod tests {
             let prev_topic = if topic_responses.is_empty() {
                 None
             } else {
-                let index = topic_responses.len() - 1;
-                topic_responses.get_mut(index)
+                topic_responses.last_mut()
             };
 
-            if matching_topic(&prev_topic, tp) {
+            if matching_topic(&prev_topic, &tp) {
                 if let Some(prev_topic) = prev_topic {
-                    prev_topic.partitions.push(data.clone());
+                    prev_topic.partitions.push(data);
                 }
             } else {
-                let partition_response = vec![data.clone()];
-
                 let mut partition_data = FetchableTopicResponse::default();
                 partition_data.topic = tp.partition.topic.clone();
                 partition_data.topic_id = tp.topic_id;
-                partition_data.partitions = partition_response;
+                partition_data.partitions = vec![data];
 
                 topic_responses.push(partition_data);
             }
@@ -851,6 +848,405 @@ mod tests {
                     200,
                 )]),
                 vec![&data.to_send, &data.session_partitions],
+            );
+        }
+    }
+
+    /// Test handling an incremental fetch session.
+    #[test]
+    fn test_incremental() {
+        let mut topic_ids = HashMap::new();
+        let mut topic_names = HashMap::new();
+
+        // We want to test both on older versions that do not use topic IDs and on newer versions
+        // that do.
+        let versions = vec![12i16, FetchRequest::VERSIONS.max];
+
+        for version in versions {
+            let mut fetch_session = FetchSession::new(1);
+            let mut fetch_session_builder = FetchRequestDataBuilder::new();
+
+            add_topic_id(
+                &mut topic_ids,
+                &mut topic_names,
+                StrBytes::from_str("foo"),
+                version,
+            );
+            let foo_id = match topic_ids.get("foo") {
+                Some(id) => *id,
+                None => Uuid::nil(),
+            };
+
+            let foo0 = TopicPartition::new("foo", 0);
+            let foo1 = TopicPartition::new("foo", 1);
+
+            fetch_session_builder.add(
+                foo0.clone(),
+                FetchRequestPartitionData {
+                    topic_id: foo_id,
+                    fetch_offset: 0,
+                    log_start_offset: 100,
+                    max_bytes: 200,
+                    current_leader_epoch: None,
+                    last_fetched_epoch: None,
+                },
+            );
+
+            fetch_session_builder.add(
+                foo1.clone(),
+                FetchRequestPartitionData {
+                    topic_id: foo_id,
+                    fetch_offset: 10,
+                    log_start_offset: 110,
+                    max_bytes: 210,
+                    current_leader_epoch: None,
+                    last_fetched_epoch: None,
+                },
+            );
+
+            let data = fetch_session_builder.build(&mut fetch_session);
+
+            assert_maps_equals(
+                &req_map(vec![
+                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 0, 0, 100, 200),
+                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 1, 10, 110, 210),
+                ]),
+                vec![&data.to_send, &data.session_partitions],
+            );
+
+            assert_eq!(INVALID_SESSION_ID, data.metadata.session_id);
+            assert_eq!(INITIAL_EPOCH, data.metadata.epoch);
+
+            let resp = to_fetch_response(
+                0,
+                0,
+                123,
+                resp_map(vec![
+                    RespEntry::new(StrBytes::from_str("foo"), 0, foo_id, 10, 20),
+                    RespEntry::new(StrBytes::from_str("foo"), 1, foo_id, 10, 20),
+                ]),
+            );
+
+            fetch_session.handle_fetch_response(&resp, version);
+
+            // Test an incremental fetch request which adds one partition and modifies another.
+            let mut fetch_session_builder = FetchRequestDataBuilder::new();
+            add_topic_id(
+                &mut topic_ids,
+                &mut topic_names,
+                StrBytes::from_str("bar"),
+                version,
+            );
+            let bar_id = match topic_ids.get("bar") {
+                Some(id) => *id,
+                None => Uuid::nil(),
+            };
+
+            let bar0 = TopicPartition::new("bar", 0);
+
+            fetch_session_builder.add(
+                foo0.clone(),
+                FetchRequestPartitionData {
+                    topic_id: foo_id,
+                    fetch_offset: 0,
+                    log_start_offset: 100,
+                    max_bytes: 200,
+                    current_leader_epoch: None,
+                    last_fetched_epoch: None,
+                },
+            );
+
+            fetch_session_builder.add(
+                foo1.clone(),
+                FetchRequestPartitionData {
+                    topic_id: foo_id,
+                    fetch_offset: 10,
+                    log_start_offset: 120,
+                    max_bytes: 210,
+                    current_leader_epoch: None,
+                    last_fetched_epoch: None,
+                },
+            );
+
+            fetch_session_builder.add(
+                bar0.clone(),
+                FetchRequestPartitionData {
+                    topic_id: bar_id,
+                    fetch_offset: 20,
+                    log_start_offset: 200,
+                    max_bytes: 200,
+                    current_leader_epoch: None,
+                    last_fetched_epoch: None,
+                },
+            );
+
+            let data2 = fetch_session_builder.build(&mut fetch_session);
+            assert_eq!(data2.metadata.is_full(), false);
+
+            assert_map_equals(
+                &req_map(vec![
+                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 0, 0, 100, 200),
+                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 1, 10, 120, 210),
+                    ReqEntry::new(StrBytes::from_str("bar"), bar_id, 0, 20, 200, 200),
+                ]),
+                &data2.session_partitions,
+            );
+            assert_map_equals(
+                &req_map(vec![
+                    ReqEntry::new(StrBytes::from_str("bar"), bar_id, 0, 20, 200, 200),
+                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 1, 10, 120, 210),
+                ]),
+                &data2.to_send,
+            );
+
+            let resp = to_fetch_response(
+                0,
+                0,
+                123,
+                resp_map(vec![RespEntry::new(
+                    StrBytes::from_str("foo"),
+                    1,
+                    foo_id,
+                    20,
+                    20,
+                )]),
+            );
+
+            fetch_session.handle_fetch_response(&resp, version);
+
+            // Skip building a new request.  Test that handling an invalid fetch session epoch
+            // response results in a request which closes the session.
+            //
+            // 71 -> ResponseError::InvalidFetchSessionEpoch
+            let resp = to_fetch_response(71, 0, INVALID_SESSION_ID, resp_map(vec![]));
+            fetch_session.handle_fetch_response(&resp, version);
+
+            let mut fetch_session_builder = FetchRequestDataBuilder::new();
+
+            fetch_session_builder.add(
+                foo0,
+                FetchRequestPartitionData {
+                    topic_id: foo_id,
+                    fetch_offset: 0,
+                    log_start_offset: 100,
+                    max_bytes: 200,
+                    current_leader_epoch: None,
+                    last_fetched_epoch: None,
+                },
+            );
+
+            fetch_session_builder.add(
+                foo1,
+                FetchRequestPartitionData {
+                    topic_id: foo_id,
+                    fetch_offset: 10,
+                    log_start_offset: 120,
+                    max_bytes: 210,
+                    current_leader_epoch: None,
+                    last_fetched_epoch: None,
+                },
+            );
+
+            fetch_session_builder.add(
+                bar0,
+                FetchRequestPartitionData {
+                    topic_id: bar_id,
+                    fetch_offset: 20,
+                    log_start_offset: 200,
+                    max_bytes: 200,
+                    current_leader_epoch: None,
+                    last_fetched_epoch: None,
+                },
+            );
+
+            let data4 = fetch_session_builder.build(&mut fetch_session);
+            assert_eq!(data4.metadata.is_full(), true);
+            assert_eq!(data2.metadata.session_id, data4.metadata.session_id);
+            assert_eq!(INITIAL_EPOCH, data4.metadata.epoch);
+
+            assert_maps_equals(
+                &req_map(vec![
+                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 0, 0, 100, 200),
+                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 1, 10, 120, 210),
+                    ReqEntry::new(StrBytes::from_str("bar"), bar_id, 0, 20, 200, 200),
+                ]),
+                vec![&data4.session_partitions, &data4.to_send],
+            );
+        }
+    }
+
+    #[test]
+    fn test_incremental_partition_removal() {
+        let mut topic_ids = HashMap::new();
+        let mut topic_names = HashMap::new();
+
+        // We want to test both on older versions that do not use topic IDs and on newer versions
+        // that do.
+        let versions = vec![12i16, FetchRequest::VERSIONS.max];
+
+        for version in versions {
+            let mut fetch_session = FetchSession::new(1);
+            let mut fetch_session_builder = FetchRequestDataBuilder::new();
+
+            add_topic_id(
+                &mut topic_ids,
+                &mut topic_names,
+                StrBytes::from_str("foo"),
+                version,
+            );
+            add_topic_id(
+                &mut topic_ids,
+                &mut topic_names,
+                StrBytes::from_str("bar"),
+                version,
+            );
+
+            let foo_id = match topic_ids.get("foo") {
+                Some(id) => *id,
+                None => Uuid::nil(),
+            };
+            let bar_id = match topic_ids.get("bar") {
+                Some(id) => *id,
+                None => Uuid::nil(),
+            };
+
+            let foo0 = TopicPartition::new("foo", 0);
+            let foo1 = TopicPartition::new("foo", 1);
+            let bar0 = TopicPartition::new("bar", 0);
+
+            fetch_session_builder.add(
+                foo0.clone(),
+                FetchRequestPartitionData {
+                    topic_id: foo_id,
+                    fetch_offset: 0,
+                    log_start_offset: 100,
+                    max_bytes: 200,
+                    current_leader_epoch: None,
+                    last_fetched_epoch: None,
+                },
+            );
+            fetch_session_builder.add(
+                foo1.clone(),
+                FetchRequestPartitionData {
+                    topic_id: foo_id,
+                    fetch_offset: 10,
+                    log_start_offset: 110,
+                    max_bytes: 210,
+                    current_leader_epoch: None,
+                    last_fetched_epoch: None,
+                },
+            );
+            fetch_session_builder.add(
+                bar0.clone(),
+                FetchRequestPartitionData {
+                    topic_id: bar_id,
+                    fetch_offset: 20,
+                    log_start_offset: 120,
+                    max_bytes: 220,
+                    current_leader_epoch: None,
+                    last_fetched_epoch: None,
+                },
+            );
+            let data = fetch_session_builder.build(&mut fetch_session);
+            assert_maps_equals(
+                &req_map(vec![
+                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 0, 0, 100, 200),
+                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 1, 10, 110, 210),
+                    ReqEntry::new(StrBytes::from_str("bar"), bar_id, 0, 20, 120, 220),
+                ]),
+                vec![&data.to_send, &data.session_partitions],
+            );
+            assert_eq!(data.metadata.is_full(), true);
+
+            let resp = to_fetch_response(
+                0,
+                0,
+                123,
+                resp_map(vec![
+                    RespEntry::new(StrBytes::from_str("foo"), 0, foo_id, 10, 20),
+                    RespEntry::new(StrBytes::from_str("foo"), 1, foo_id, 10, 20),
+                    RespEntry::new(StrBytes::from_str("bar"), 0, bar_id, 10, 20),
+                ]),
+            );
+
+            fetch_session.handle_fetch_response(&resp, version);
+
+            // Test an incremental fetch request which removes two partitions.
+            let mut fetch_session_builder = FetchRequestDataBuilder::new();
+            fetch_session_builder.add(
+                foo1.clone(),
+                FetchRequestPartitionData {
+                    topic_id: foo_id,
+                    fetch_offset: 10,
+                    log_start_offset: 110,
+                    max_bytes: 210,
+                    current_leader_epoch: None,
+                    last_fetched_epoch: None,
+                },
+            );
+            let data = fetch_session_builder.build(&mut fetch_session);
+            assert_eq!(data.metadata.is_full(), false);
+            assert_eq!(123, data.metadata.session_id);
+            assert_eq!(1, data.metadata.epoch);
+            assert_map_equals(
+                &req_map(vec![ReqEntry::new(
+                    StrBytes::from_str("foo"),
+                    foo_id,
+                    1,
+                    10,
+                    110,
+                    210,
+                )]),
+                &data.session_partitions,
+            );
+            assert_map_equals(&req_map(vec![]), &data.to_send);
+
+            let expected_to_forget2 = vec![
+                TopicIdPartition {
+                    topic_id: foo_id,
+                    partition: foo0.clone(),
+                },
+                TopicIdPartition {
+                    topic_id: bar_id,
+                    partition: bar0.clone(),
+                },
+            ];
+            assert_list_equals(&expected_to_forget2, &data.to_forget);
+
+            // A FETCH_SESSION_ID_NOT_FOUND response triggers us to close the session.
+            // The next request is a session establishing FULL request.
+            //
+            // 70 -> ResponseError::FetchSessionIdNotFound
+            let resp = to_fetch_response(70, 0, INVALID_SESSION_ID, resp_map(vec![]));
+
+            fetch_session.handle_fetch_response(&resp, version);
+
+            let mut fetch_session_builder = FetchRequestDataBuilder::new();
+            fetch_session_builder.add(
+                foo0.clone(),
+                FetchRequestPartitionData {
+                    topic_id: foo_id,
+                    fetch_offset: 0,
+                    log_start_offset: 100,
+                    max_bytes: 200,
+                    current_leader_epoch: None,
+                    last_fetched_epoch: None,
+                },
+            );
+            let data = fetch_session_builder.build(&mut fetch_session);
+            assert_eq!(data.metadata.is_full(), true);
+            assert_eq!(INVALID_SESSION_ID, data.metadata.session_id);
+            assert_eq!(INITIAL_EPOCH, data.metadata.epoch);
+            assert_maps_equals(
+                &req_map(vec![ReqEntry::new(
+                    StrBytes::from_str("foo"),
+                    foo_id,
+                    0,
+                    0,
+                    100,
+                    200,
+                )]),
+                vec![&data.session_partitions, &data.to_send],
             );
         }
     }

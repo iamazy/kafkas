@@ -94,7 +94,9 @@ fn array_display<T: Display, I: Iterator<Item = T>>(array: I) -> String {
     for item in array {
         display.extend(format!("{item}, ").chars());
     }
-    display.remove(display.len() - 1);
-    display.remove(display.len() - 1);
+    if display.len() >= 2 {
+        display.remove(display.len() - 1);
+        display.remove(display.len() - 1);
+    }
     display
 }

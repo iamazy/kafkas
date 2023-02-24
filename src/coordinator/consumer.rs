@@ -1124,7 +1124,7 @@ async fn coordinator_loop<Exe: Executor>(
             CoordinatorEvent::Shutdown => break,
         };
         if let Err(err) = ret {
-            error!("CoordinatorEvent handled error: {err}");
+            error!("{err}");
         }
     }
     coordinator
