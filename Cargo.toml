@@ -26,7 +26,7 @@ fnv = "1"
 futures = "0.3"
 fxhash = "0.2"
 indexmap = "1"
-kafka-protocol = { git = "https://github.com/iamazy/kafka-protocol-rs", rev = "d8a289bbdebd71f89d52838810303902a7368773"}
+kafka-protocol = { git = "https://github.com/iamazy/kafka-protocol-rs", rev = "888636fd6aa10b3436096dfe3fd08f82de76d892"}
 native-tls = "0.2"
 pin-project-lite = "0.2"
 rand = "0.8"

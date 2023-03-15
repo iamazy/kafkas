@@ -184,22 +184,12 @@ impl KafkaCodec {
         header.request_api_key = api_key;
         header.request_api_version = api_version;
 
-        let header_version = Req::header_version(api_version);
-        header.encode(dst, header_version)?;
+        header.encode(dst, Req::header_version(api_version))?;
 
         self.active_requests.insert(header.correlation_id, header);
 
         req.encode(dst, api_version)?;
         Ok(())
-    }
-
-    fn response_header_version(&self, api_key: i16, api_version: i16) -> i16 {
-        if let Some(version_range) = self.support_versions.get(&api_key) {
-            if api_version >= version_range.max {
-                return 1;
-            }
-        }
-        0
     }
 
     fn decode_response(&mut self, src: &mut BytesMut) -> Result<Option<Command>, ConnectionError> {
@@ -213,16 +203,14 @@ impl KafkaCodec {
                 ConnectionError::UnexpectedResponse(format!("correlation_id: {correlation_id}"))
             })?;
 
-        let response_header_version = self.response_header_version(
-            request_header.request_api_key,
-            request_header.request_api_version,
-        );
+        let api_key = ApiKey::try_from(request_header.request_api_key)?;
+        let response_header_version =
+            api_key.response_header_version(request_header.request_api_version);
 
         // decode response header
         let response_header = ResponseHeader::decode(src, response_header_version)?;
         let header_version = request_header.request_api_version;
 
-        let api_key = ApiKey::try_from(request_header.request_api_key)?;
         let response_kind = match api_key {
             ApiKey::ProduceKey => {
                 let res = ProduceResponse::decode(src, header_version)?;
