@@ -340,7 +340,7 @@ impl<Exe: Executor> Consumer<Exe> {
 
     pub async fn unsubscribe(&mut self) -> Result<()> {
         self.coordinator
-            .maybe_leave_group(StrBytes::from_str(
+            .maybe_leave_group(StrBytes::from_static_str(
                 "the consumer unsubscribed from all topics",
             ))
             .await?;

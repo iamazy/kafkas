@@ -56,10 +56,10 @@ impl tokio_util::codec::Decoder for KafkaCodec {
 
 #[cfg(feature = "async-std-runtime")]
 impl asynchronous_codec::Encoder for KafkaCodec {
-    type Item = Command;
+    type Item<'a> = Command;
     type Error = ConnectionError;
 
-    fn encode(&mut self, cmd: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, cmd: Self::Item<'_>, dst: &mut BytesMut) -> Result<(), Self::Error> {
         let mut bytes = BytesMut::new();
         self.encode0(cmd, &mut bytes)?;
         self.length_codec
@@ -184,8 +184,7 @@ impl KafkaCodec {
         header.request_api_key = api_key;
         header.request_api_version = api_version;
 
-        let header_version = Req::header_version(api_version);
-        header.encode(dst, header_version)?;
+        header.encode(dst, Req::header_version(api_version))?;
 
         self.active_requests.insert(header.correlation_id, header);
 
@@ -213,16 +212,14 @@ impl KafkaCodec {
                 ConnectionError::UnexpectedResponse(format!("correlation_id: {correlation_id}"))
             })?;
 
-        let response_header_version = self.response_header_version(
-            request_header.request_api_key,
-            request_header.request_api_version,
-        );
+        let api_key = ApiKey::try_from(request_header.request_api_key)?;
+        let response_header_version =
+            api_key.response_header_version(request_header.request_api_version);
 
         // decode response header
         let response_header = ResponseHeader::decode(src, response_header_version)?;
         let header_version = request_header.request_api_version;
 
-        let api_key = ApiKey::try_from(request_header.request_api_key)?;
         let response_kind = match api_key {
             ApiKey::ProduceKey => {
                 let res = ProduceResponse::decode(src, header_version)?;
@@ -504,6 +501,30 @@ impl KafkaCodec {
             ApiKey::AllocateProducerIdsKey => {
                 let res = AllocateProducerIdsResponse::decode(src, header_version)?;
                 ResponseKind::AllocateProducerIdsResponse(res)
+            }
+            ApiKey::ConsumerGroupHeartbeatKey => {
+                let res = ConsumerGroupHeartbeatResponse::decode(src, header_version)?;
+                ResponseKind::ConsumerGroupHeartbeatResponse(res)
+            }
+            ApiKey::ControllerRegistrationKey => {
+                let res = ControllerRegistrationResponse::decode(src, header_version)?;
+                ResponseKind::ControllerRegistrationResponse(res)
+            }
+            ApiKey::GetTelemetrySubscriptionsKey => {
+                let res = GetTelemetrySubscriptionsResponse::decode(src, header_version)?;
+                ResponseKind::GetTelemetrySubscriptionsResponse(res)
+            }
+            ApiKey::PushTelemetryKey => {
+                let res = PushTelemetryResponse::decode(src, header_version)?;
+                ResponseKind::PushTelemetryResponse(res)
+            }
+            ApiKey::AssignReplicasToDirsKey => {
+                let res = AssignReplicasToDirsResponse::decode(src, header_version)?;
+                ResponseKind::AssignReplicasToDirsResponse(res)
+            }
+            ApiKey::ListClientMetricsResourcesKey => {
+                let res = ListClientMetricsResourcesResponse::decode(src, header_version)?;
+                ResponseKind::ListClientMetricsResourcesResponse(res)
             }
         };
         let response = KafkaResponse::new(response_header, response_kind);

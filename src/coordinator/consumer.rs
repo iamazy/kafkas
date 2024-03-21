@@ -331,7 +331,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         let node = find_coordinator(&client, group_id.clone(), CoordinatorType::Group).await?;
         info!(
             "Find coordinator success, group {}, node: {}",
-            group_id,
+            group_id.as_str(),
             node.address()
         );
 
@@ -399,7 +399,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                     .await?;
                 for group in describe_groups_response.groups {
                     if group.error_code.is_err() {
-                        error!("Describe group [{}] failed", group.group_id.0);
+                        error!("Describe group [{}] failed", group.group_id.as_str());
                     }
                 }
                 Ok(())
@@ -424,7 +424,8 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                         warn!(
                             "Join group with unknown member id, will rejoin group [{}] with \
                              member id: {}",
-                            self.group_meta.group_id.0, self.group_meta.member_id
+                            self.group_meta.group_id.as_str(),
+                            self.group_meta.member_id.as_str()
                         );
                         self.join_group().await
                     }
@@ -443,9 +444,9 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                         info!(
                             "Join group [{}] success, leader = {}, member_id = {}, generation_id \
                              = {}",
-                            self.group_meta.group_id.0,
-                            self.group_meta.leader,
-                            self.group_meta.member_id,
+                            self.group_meta.group_id.as_str(),
+                            self.group_meta.leader.as_str(),
+                            self.group_meta.member_id.as_str(),
                             self.group_meta.generation_id
                         );
                         Ok(())
@@ -460,9 +461,10 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         match self.client.version_range(ApiKey::LeaveGroupKey) {
             Some(version_range) => {
                 debug!(
-                    "Member {} send LeaveGroup request to coordinator {} due to {reason}",
-                    self.group_meta.member_id,
+                    "Member {} send LeaveGroup request to coordinator {} due to {}",
+                    self.group_meta.member_id.as_str(),
                     self.node.address(),
+                    reason.as_str()
                 );
 
                 let leave_group_request = self.leave_group_builder(version_range.max, reason)?;
@@ -478,25 +480,28 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                             if member.error_code.is_ok() {
                                 debug!(
                                     "Member {} leave group {} success.",
-                                    member.member_id, self.group_meta.group_id.0
+                                    member.member_id.as_str(),
+                                    self.group_meta.group_id.as_str()
                                 );
                             } else {
                                 error!(
                                     "Member {} leave group {} failed.",
-                                    member.member_id, self.group_meta.group_id.0
+                                    member.member_id.as_str(),
+                                    self.group_meta.group_id.as_str()
                                 );
                             }
                         }
                         info!(
                             "Leave group [{}] success, member: {}",
-                            self.group_meta.group_id.0, self.group_meta.member_id
+                            self.group_meta.group_id.as_str(),
+                            self.group_meta.member_id.as_str()
                         );
                         Ok(())
                     }
                     Some(error) => {
                         error!(
                             "Leave group [{}] failed, error: {error}",
-                            self.group_meta.group_id.0
+                            self.group_meta.group_id.as_str()
                         );
                         Err(error.into())
                     }
@@ -528,8 +533,8 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                             error!(
                                 "JoinGroup failed: Inconsistent Protocol Type, received {} but \
                                  expected {}",
-                                sync_group_response.protocol_type.unwrap(),
-                                self.group_meta.protocol_type.as_ref().unwrap()
+                                sync_group_response.protocol_type.unwrap().as_str(),
+                                self.group_meta.protocol_type.as_ref().unwrap().as_str()
                             );
                             return Err(ResponseError::InconsistentGroupProtocol.into());
                         }
@@ -560,12 +565,12 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                         info!(
                             "Sync group [{}] success, leader = {}, member_id = {}, generation_id \
                              = {}, protocol_type = {}, protocol_name = {}, assignments = <{}>",
-                            self.group_meta.group_id.0,
-                            self.group_meta.leader,
-                            self.group_meta.member_id,
+                            self.group_meta.group_id.as_str(),
+                            self.group_meta.leader.as_str(),
+                            self.group_meta.member_id.as_str(),
                             self.group_meta.generation_id,
-                            self.group_meta.protocol_type.as_ref().unwrap(),
-                            self.group_meta.protocol_name.as_ref().unwrap(),
+                            self.group_meta.protocol_type.as_ref().unwrap().as_str(),
+                            self.group_meta.protocol_name.as_ref().unwrap().as_str(),
                             crate::array_display(self.subscriptions.assignments.keys()),
                         );
                         Ok(())
@@ -643,7 +648,8 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                     None => {
                         debug!(
                             "Heartbeat success, group: {}, member: {}",
-                            self.group_meta.group_id.0, self.group_meta.member_id
+                            self.group_meta.group_id.as_str(),
+                            self.group_meta.member_id.as_str()
                         );
                         Ok(())
                     }
@@ -663,7 +669,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                         // this case and ignore the REBALANCE_IN_PROGRESS error
                         warn!(
                             "Group [{}] is rebalance in progress.",
-                            self.group_meta.group_id.0
+                            self.group_meta.group_id.as_str()
                         );
                         if matches!(self.state, MemberState::Stable) {
                             self.rejoin_group().await?;
@@ -780,7 +786,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         let mut request = JoinGroupRequest::default();
         request.group_id = self.group_meta.group_id.clone();
         request.member_id = self.group_meta.member_id.clone();
-        request.protocol_type = StrBytes::from_str(CONSUMER_PROTOCOL_TYPE);
+        request.protocol_type = StrBytes::from_static_str(CONSUMER_PROTOCOL_TYPE);
         request.protocols = self.join_group_protocol()?;
         request.session_timeout_ms = self.consumer_options.rebalance_options.session_timeout_ms;
         if version >= 1 {
@@ -830,7 +836,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                 None => {
                     return Err(Error::Custom(format!(
                         "Group leader {} has no partition assignor protocol",
-                        self.group_meta.leader
+                        self.group_meta.leader.as_str()
                     )));
                 }
             }
@@ -945,11 +951,11 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
             }
         } else {
             generation = DEFAULT_GENERATION_ID;
-            member = StrBytes::from_str("");
+            member = StrBytes::default();
         }
 
         request.group_id = self.group_meta.group_id.clone();
-        request.generation_id = generation;
+        request.generation_id_or_member_epoch = generation;
         request.member_id = member;
         request.group_instance_id = self.group_meta.group_instance_id.clone();
         request.retention_time_ms = -1;

@@ -423,7 +423,7 @@ impl FetchRequestDataBuilder {
 
         let mut session_remove = Vec::new();
         for (tp, prev_data) in session.session_partitions.iter_mut() {
-            match self.next.remove(tp) {
+            match self.next.swap_remove(tp) {
                 Some(next_data) => {
                     // We basically check if the new partition had the same topic ID. If not,
                     // we add it to the "replaced" set. If the request is version 13 or higher, the
@@ -470,7 +470,7 @@ impl FetchRequestDataBuilder {
         }
 
         for tp in session_remove.iter() {
-            session.session_partitions.remove(tp);
+            session.session_partitions.swap_remove(tp);
         }
 
         // Add any new partitions to the session.

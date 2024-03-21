@@ -40,7 +40,7 @@ impl SubscriptionState {
                     OffsetMetadata {
                         committed_offset: tp_state.position.offset,
                         committed_leader_epoch: tp_state.position.current_leader.epoch,
-                        metadata: Some(StrBytes::from_str("")),
+                        metadata: Some(StrBytes::default()),
                     },
                 );
             }
@@ -150,25 +150,30 @@ impl SubscriptionState {
             if !matches!(partition_state.fetch_state, FetchState::AwaitReset) {
                 debug!(
                     "Skipping reset of [{} - {}] since it is no longer needed",
-                    partition.topic.0, partition.partition
+                    partition.topic.as_str(),
+                    partition.partition
                 );
             } else if partition_state.offset_strategy != offset_strategy {
                 debug!(
                     "Skipping reset of topic [{} - {}] since an alternative reset has been \
                      requested",
-                    partition.topic.0, partition.partition
+                    partition.topic.as_str(),
+                    partition.partition
                 );
             } else {
                 info!(
                     "Resetting offset for topic [{} - {}] to position {}.",
-                    partition.topic.0, partition.partition, position.offset
+                    partition.topic.as_str(),
+                    partition.partition,
+                    position.offset
                 );
                 partition_state.seek_unvalidated(position)?;
             }
         } else {
             debug!(
                 "Skipping reset of [{} - {}] since it is no longer assigned",
-                partition.topic.0, partition.partition
+                partition.topic.as_str(),
+                partition.partition
             );
         }
 
