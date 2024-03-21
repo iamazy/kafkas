@@ -10,10 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          channel: nightly, stable
-          profile: minimal
+          components: rustfmt, clippy
+      - uses: dtolnay/rust-toolchain@stable
+        with:
           components: rustfmt, clippy
       - uses: actions/cache@v3
         with:
