@@ -272,7 +272,10 @@ impl<Exe: Executor> Producer<Exe> {
                 }
             }
             Err(err) => {
-                error!("failed to push record, topic: {}, err: {err}", topic.0,);
+                error!(
+                    "failed to push record, topic: {}, err: {err}",
+                    topic.as_str(),
+                );
                 Err(err)
             }
         };
@@ -348,7 +351,9 @@ impl<Exe: Executor> Producer<Exe> {
                     {
                         error!(
                             "failed to flush topic produce data, topic: [{} - {}], error: {}",
-                            partition.topic.0, partition.partition, e
+                            partition.topic.as_str(),
+                            partition.partition,
+                            e
                         );
                     }
                 }

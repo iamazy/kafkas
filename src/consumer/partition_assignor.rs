@@ -61,7 +61,7 @@ pub trait PartitionAssigner {
             } else {
                 debug!(
                     "skipping assignment for topic {} since no metadata is available",
-                    topic.0
+                    topic.as_str()
                 );
             }
         }

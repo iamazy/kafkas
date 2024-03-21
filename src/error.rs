@@ -12,7 +12,7 @@ use futures::channel::{
 };
 use kafka_protocol::{
     messages::{ApiKey, TopicName},
-    protocol::{buf::NotEnoughBytesError, DecodeError, EncodeError},
+    protocol::{buf::NotEnoughBytesError, EncodeError},
     records::Record,
     ResponseError,
 };
@@ -108,12 +108,6 @@ impl From<EncodeError> for Error {
     }
 }
 
-impl From<DecodeError> for Error {
-    fn from(value: DecodeError) -> Self {
-        Error::Connection(ConnectionError::Decoding(value.to_string()))
-    }
-}
-
 impl<T> From<TrySendError<T>> for Error {
     fn from(value: TrySendError<T>) -> Self {
         Error::Custom(format!("{value}"))
@@ -141,16 +135,20 @@ impl std::fmt::Display for Error {
             Error::Produce(e) => write!(f, "Produce error: {e}"),
             Error::Consume(e) => write!(f, "Consume error: {e}"),
             Error::PartitionNotAvailable { topic, partition } => {
-                write!(f, "Partition {partition} not available, topic: {}", topic.0)
+                write!(
+                    f,
+                    "Partition {partition} not available, topic: {}",
+                    topic.as_str()
+                )
             }
             Error::TopicNotAvailable { topic } => {
-                write!(f, "Topic not available, topic: {}", topic.0)
+                write!(f, "Topic not available, topic: {}", topic.as_str())
             }
             Error::TopicAuthorizationError { topics } => {
                 write!(
                     f,
                     "Topic Authorization Error, topics: <{}>",
-                    array_display(topics.iter().map(|topic| &**topic))
+                    array_display(topics.iter().map(|topic| topic.as_str()))
                 )
             }
             Error::NodeNotAvailable { node } => {
@@ -185,12 +183,6 @@ impl From<NotEnoughBytesError> for ConnectionError {
 impl From<EncodeError> for ConnectionError {
     fn from(value: EncodeError) -> Self {
         ConnectionError::Encoding(value.to_string())
-    }
-}
-
-impl From<DecodeError> for ConnectionError {
-    fn from(value: DecodeError) -> Self {
-        ConnectionError::Decoding(value.to_string())
     }
 }
 

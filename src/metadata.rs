@@ -132,7 +132,12 @@ impl Debug for TopicPartition {
 
 impl Display for TopicPartition {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "partition [{} - {}]", self.topic.0, self.partition)
+        write!(
+            f,
+            "partition [{} - {}]",
+            self.topic.as_str(),
+            self.partition
+        )
     }
 }
 
@@ -146,7 +151,7 @@ impl Node {
     pub fn new(id: BrokerId, host: StrBytes, port: i32) -> Self {
         Self {
             id: id.0,
-            address: format!("{host}:{port}"),
+            address: format!("{}:{port}", host.as_str()),
         }
     }
 
@@ -180,7 +185,7 @@ impl Cluster {
         let cluster_id = other.cluster_id;
         {
             let mut lock = self.id.lock()?;
-            if matches!(*lock, None) {
+            if lock.is_none() {
                 *lock = cluster_id;
             } else if *lock != cluster_id {
                 return Err(Error::Custom(format!(

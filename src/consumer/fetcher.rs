@@ -467,7 +467,8 @@ impl<Exe: Executor> Fetcher<Exe> {
                             debug!(
                                 "Handing v0 ListOffsetResponse response for [{} - {}]. Fetched \
                                  offset {offset}",
-                                &topic.name.0, partition
+                                topic.name.as_str(),
+                                partition
                             );
                             if offset != UNKNOWN_OFFSET {
                                 let tp = TopicPartition {
@@ -488,7 +489,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                             debug!(
                                 "Handling ListOffsetResponse response for [{} - {}], Fetched \
                                  offset {}, timestamp {}",
-                                topic.name.0,
+                                topic.name.as_str(),
                                 partition,
                                 partition_response.offset,
                                 partition_response.timestamp
@@ -525,7 +526,8 @@ impl<Exe: Executor> Fetcher<Exe> {
                         debug!(
                             "Cannot search by timestamp for [{} - {}] because the message format \
                              version is before 0.10.0",
-                            topic.name.0, partition
+                            topic.name.as_str(),
+                            partition
                         );
                         break;
                     }
@@ -540,7 +542,9 @@ impl<Exe: Executor> Fetcher<Exe> {
                     ) => {
                         debug!(
                             "Attempt to fetch offsets for [{} - {}] failed due to {}, retrying.",
-                            topic.name.0, partition, error
+                            topic.name.as_str(),
+                            partition,
+                            error
                         );
                         let tp = TopicPartition {
                             topic: topic.name.clone(),
@@ -552,7 +556,8 @@ impl<Exe: Executor> Fetcher<Exe> {
                         warn!(
                             "Received unknown topic or partition error in ListOffset request for \
                              partition [{} - {}]",
-                            topic.name.0, partition
+                            topic.name.as_str(),
+                            partition
                         );
                         let tp = TopicPartition {
                             topic: topic.name.clone(),
@@ -567,7 +572,9 @@ impl<Exe: Executor> Fetcher<Exe> {
                         warn!(
                             "Attempt to fetch offsets for [{} - {}] failed due to unexpected \
                              exception: {}, retrying.",
-                            topic.name.0, partition, error
+                            topic.name.as_str(),
+                            partition,
+                            error
                         );
                         let tp = TopicPartition {
                             topic: topic.name.clone(),
