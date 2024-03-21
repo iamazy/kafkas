@@ -1101,7 +1101,7 @@ mod tests {
                 version,
             );
 
-            let foo_id = match topic_ids.get(&StrBytes::from_static_str("bar")) {
+            let foo_id = match topic_ids.get(&StrBytes::from_static_str("foo")) {
                 Some(id) => *id,
                 None => Uuid::nil(),
             };
