@@ -768,10 +768,10 @@ mod tests {
             add_topic_id(
                 &mut topic_ids,
                 &mut topic_names,
-                StrBytes::from_str("foo"),
+                StrBytes::from_static_str("foo"),
                 version,
             );
-            let foo_id = match topic_ids.get("foo") {
+            let foo_id = match topic_ids.get(&StrBytes::from_static_str("foo")) {
                 Some(id) => *id,
                 None => Uuid::nil(),
             };
@@ -803,8 +803,8 @@ mod tests {
 
             assert_maps_equals(
                 &req_map(vec![
-                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 0, 0, 100, 200),
-                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 1, 10, 110, 210),
+                    ReqEntry::new(StrBytes::from_static_str("foo"), foo_id, 0, 0, 100, 200),
+                    ReqEntry::new(StrBytes::from_static_str("foo"), foo_id, 1, 10, 110, 210),
                 ]),
                 vec![&data.to_send, &data.session_partitions],
             );
@@ -813,8 +813,8 @@ mod tests {
             assert_eq!(INITIAL_EPOCH, data.metadata.epoch);
 
             let resp_map = resp_map(vec![
-                RespEntry::new(StrBytes::from_str("foo"), 0, foo_id, 0, 0),
-                RespEntry::new(StrBytes::from_str("foo"), 1, foo_id, 0, 0),
+                RespEntry::new(StrBytes::from_static_str("foo"), 0, foo_id, 0, 0),
+                RespEntry::new(StrBytes::from_static_str("foo"), 1, foo_id, 0, 0),
             ]);
             let resp = to_fetch_response(0, 0, INVALID_SESSION_ID, resp_map);
 
@@ -840,7 +840,7 @@ mod tests {
 
             assert_maps_equals(
                 &req_map(vec![ReqEntry::new(
-                    StrBytes::from_str("foo"),
+                    StrBytes::from_static_str("foo"),
                     foo_id,
                     0,
                     0,
@@ -869,10 +869,10 @@ mod tests {
             add_topic_id(
                 &mut topic_ids,
                 &mut topic_names,
-                StrBytes::from_str("foo"),
+                StrBytes::from_static_str("foo"),
                 version,
             );
-            let foo_id = match topic_ids.get("foo") {
+            let foo_id = match topic_ids.get(&StrBytes::from_static_str("foo")) {
                 Some(id) => *id,
                 None => Uuid::nil(),
             };
@@ -908,8 +908,8 @@ mod tests {
 
             assert_maps_equals(
                 &req_map(vec![
-                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 0, 0, 100, 200),
-                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 1, 10, 110, 210),
+                    ReqEntry::new(StrBytes::from_static_str("foo"), foo_id, 0, 0, 100, 200),
+                    ReqEntry::new(StrBytes::from_static_str("foo"), foo_id, 1, 10, 110, 210),
                 ]),
                 vec![&data.to_send, &data.session_partitions],
             );
@@ -922,8 +922,8 @@ mod tests {
                 0,
                 123,
                 resp_map(vec![
-                    RespEntry::new(StrBytes::from_str("foo"), 0, foo_id, 10, 20),
-                    RespEntry::new(StrBytes::from_str("foo"), 1, foo_id, 10, 20),
+                    RespEntry::new(StrBytes::from_static_str("foo"), 0, foo_id, 10, 20),
+                    RespEntry::new(StrBytes::from_static_str("foo"), 1, foo_id, 10, 20),
                 ]),
             );
 
@@ -934,10 +934,10 @@ mod tests {
             add_topic_id(
                 &mut topic_ids,
                 &mut topic_names,
-                StrBytes::from_str("bar"),
+                StrBytes::from_static_str("bar"),
                 version,
             );
-            let bar_id = match topic_ids.get("bar") {
+            let bar_id = match topic_ids.get(&StrBytes::from_static_str("bar")) {
                 Some(id) => *id,
                 None => Uuid::nil(),
             };
@@ -985,16 +985,16 @@ mod tests {
 
             assert_map_equals(
                 &req_map(vec![
-                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 0, 0, 100, 200),
-                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 1, 10, 120, 210),
-                    ReqEntry::new(StrBytes::from_str("bar"), bar_id, 0, 20, 200, 200),
+                    ReqEntry::new(StrBytes::from_static_str("foo"), foo_id, 0, 0, 100, 200),
+                    ReqEntry::new(StrBytes::from_static_str("foo"), foo_id, 1, 10, 120, 210),
+                    ReqEntry::new(StrBytes::from_static_str("bar"), bar_id, 0, 20, 200, 200),
                 ]),
                 &data2.session_partitions,
             );
             assert_map_equals(
                 &req_map(vec![
-                    ReqEntry::new(StrBytes::from_str("bar"), bar_id, 0, 20, 200, 200),
-                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 1, 10, 120, 210),
+                    ReqEntry::new(StrBytes::from_static_str("bar"), bar_id, 0, 20, 200, 200),
+                    ReqEntry::new(StrBytes::from_static_str("foo"), foo_id, 1, 10, 120, 210),
                 ]),
                 &data2.to_send,
             );
@@ -1004,7 +1004,7 @@ mod tests {
                 0,
                 123,
                 resp_map(vec![RespEntry::new(
-                    StrBytes::from_str("foo"),
+                    StrBytes::from_static_str("foo"),
                     1,
                     foo_id,
                     20,
@@ -1066,9 +1066,9 @@ mod tests {
 
             assert_maps_equals(
                 &req_map(vec![
-                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 0, 0, 100, 200),
-                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 1, 10, 120, 210),
-                    ReqEntry::new(StrBytes::from_str("bar"), bar_id, 0, 20, 200, 200),
+                    ReqEntry::new(StrBytes::from_static_str("foo"), foo_id, 0, 0, 100, 200),
+                    ReqEntry::new(StrBytes::from_static_str("foo"), foo_id, 1, 10, 120, 210),
+                    ReqEntry::new(StrBytes::from_static_str("bar"), bar_id, 0, 20, 200, 200),
                 ]),
                 vec![&data4.session_partitions, &data4.to_send],
             );
@@ -1091,21 +1091,21 @@ mod tests {
             add_topic_id(
                 &mut topic_ids,
                 &mut topic_names,
-                StrBytes::from_str("foo"),
+                StrBytes::from_static_str("foo"),
                 version,
             );
             add_topic_id(
                 &mut topic_ids,
                 &mut topic_names,
-                StrBytes::from_str("bar"),
+                StrBytes::from_static_str("bar"),
                 version,
             );
 
-            let foo_id = match topic_ids.get("foo") {
+            let foo_id = match topic_ids.get(&StrBytes::from_static_str("bar")) {
                 Some(id) => *id,
                 None => Uuid::nil(),
             };
-            let bar_id = match topic_ids.get("bar") {
+            let bar_id = match topic_ids.get(&StrBytes::from_static_str("bar")) {
                 Some(id) => *id,
                 None => Uuid::nil(),
             };
@@ -1150,9 +1150,9 @@ mod tests {
             let data = fetch_session_builder.build(&mut fetch_session);
             assert_maps_equals(
                 &req_map(vec![
-                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 0, 0, 100, 200),
-                    ReqEntry::new(StrBytes::from_str("foo"), foo_id, 1, 10, 110, 210),
-                    ReqEntry::new(StrBytes::from_str("bar"), bar_id, 0, 20, 120, 220),
+                    ReqEntry::new(StrBytes::from_static_str("foo"), foo_id, 0, 0, 100, 200),
+                    ReqEntry::new(StrBytes::from_static_str("foo"), foo_id, 1, 10, 110, 210),
+                    ReqEntry::new(StrBytes::from_static_str("bar"), bar_id, 0, 20, 120, 220),
                 ]),
                 vec![&data.to_send, &data.session_partitions],
             );
@@ -1163,9 +1163,9 @@ mod tests {
                 0,
                 123,
                 resp_map(vec![
-                    RespEntry::new(StrBytes::from_str("foo"), 0, foo_id, 10, 20),
-                    RespEntry::new(StrBytes::from_str("foo"), 1, foo_id, 10, 20),
-                    RespEntry::new(StrBytes::from_str("bar"), 0, bar_id, 10, 20),
+                    RespEntry::new(StrBytes::from_static_str("foo"), 0, foo_id, 10, 20),
+                    RespEntry::new(StrBytes::from_static_str("foo"), 1, foo_id, 10, 20),
+                    RespEntry::new(StrBytes::from_static_str("bar"), 0, bar_id, 10, 20),
                 ]),
             );
 
@@ -1190,7 +1190,7 @@ mod tests {
             assert_eq!(1, data.metadata.epoch);
             assert_map_equals(
                 &req_map(vec![ReqEntry::new(
-                    StrBytes::from_str("foo"),
+                    StrBytes::from_static_str("foo"),
                     foo_id,
                     1,
                     10,
@@ -1239,7 +1239,7 @@ mod tests {
             assert_eq!(INITIAL_EPOCH, data.metadata.epoch);
             assert_maps_equals(
                 &req_map(vec![ReqEntry::new(
-                    StrBytes::from_str("foo"),
+                    StrBytes::from_static_str("foo"),
                     foo_id,
                     0,
                     0,
