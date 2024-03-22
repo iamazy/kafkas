@@ -61,7 +61,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         completed_fetches_tx: mpsc::UnboundedSender<CompletedFetch>,
     ) -> Self {
         let sessions = DashMap::new();
-        for node in client.cluster_meta.nodes.iter() {
+        for node in client.cluster.nodes.iter() {
             sessions.insert(node.id, FetchSession::new(node.id));
         }
 
@@ -100,7 +100,7 @@ impl<Exe: Executor> Fetcher<Exe> {
                         version = 12;
                     }
                     let metadata = fetch_request_data.metadata;
-                    if let Some(node) = self.client.cluster_meta.nodes.get(&node) {
+                    if let Some(node) = self.client.cluster.nodes.get(&node) {
                         let fetch_request =
                             self.fetch_builder(&mut fetch_request_data, version).await?;
                         trace!("Send fetch request: {:?}", fetch_request);
@@ -239,7 +239,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         match rx.await {
             Ok(partitions) => {
                 for tp in partitions {
-                    let current_leader = self.client.cluster_meta.current_leader(&tp);
+                    let current_leader = self.client.cluster.current_leader(&tp);
                     self.event_tx.unbounded_send(
                         CoordinatorEvent::MaybeValidatePositionForCurrentLeader {
                             partition: tp,
@@ -428,7 +428,7 @@ impl<Exe: Executor> Fetcher<Exe> {
         let position = FetchPosition {
             offset: offset_data.offset - 1,
             offset_epoch: None,
-            current_leader: self.client.cluster_meta.current_leader(&partition),
+            current_leader: self.client.cluster.current_leader(&partition),
         };
         // TODO: metadata update last seen epoch if newer
         self.event_tx
@@ -603,8 +603,8 @@ impl<Exe: Executor> Fetcher<Exe> {
         offset_reset_timestamps: &mut HashMap<TopicPartition, i64>,
     ) -> Result<HashMap<Node, ListOffsetsRequest>> {
         let mut node_request = HashMap::new();
-        for node_entry in self.client.cluster_meta.nodes.iter() {
-            if let Ok(node_topology) = self.client.cluster_meta.drain_node(node_entry.value().id) {
+        for node_entry in self.client.cluster.nodes.iter() {
+            if let Ok(node_topology) = self.client.cluster.drain_node(node_entry.value().id) {
                 let partitions = node_topology.value();
 
                 let mut topics = HashMap::new();

@@ -557,7 +557,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                                 };
                                 let mut tp_state = TopicPartitionState::new(*partition);
                                 tp_state.position.current_leader =
-                                    self.client.cluster_meta.current_leader(&tp);
+                                    self.client.cluster.current_leader(&tp);
                                 self.subscriptions.assignments.insert(tp, tp_state);
                             }
                         }
@@ -837,7 +837,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
             match self.group_meta.protocol_name {
                 Some(ref protocol) => {
                     let assignor = self.look_up_assignor(&protocol.to_string())?;
-                    let cluster = self.client.cluster_meta.clone();
+                    let cluster = self.client.cluster.clone();
                     request.assignments =
                         serialize_assignments(assignor.assign(cluster, &self.group_subscription)?)?;
                 }
@@ -866,7 +866,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         if version <= 7 {
             let mut topics = Vec::with_capacity(self.subscriptions.topics.len());
             for assign in self.subscriptions.topics.iter() {
-                let partitions = self.client.cluster_meta.partitions(assign)?;
+                let partitions = self.client.cluster.partitions(assign)?;
 
                 let mut topic = OffsetFetchRequestTopic::default();
                 topic.name = assign.clone();
@@ -878,7 +878,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         } else {
             let mut topics = Vec::with_capacity(self.subscriptions.topics.len());
             for assign in self.subscriptions.topics.iter() {
-                let partitions = self.client.cluster_meta.partitions(assign)?;
+                let partitions = self.client.cluster.partitions(assign)?;
 
                 let mut topic = OffsetFetchRequestTopics::default();
                 topic.name = assign.clone();
