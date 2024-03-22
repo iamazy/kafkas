@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<Error>> {
         let record = TestData::new(&format!("hello - kafka {i}"));
         let ret = producer.send(&topic, record).await?;
         let _ = tx.send(ret).await;
-        // tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     info!("elapsed: {:?}", now.elapsed());
     // wait till all cached records send to kafka

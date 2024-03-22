@@ -299,17 +299,19 @@ impl Cluster {
         if !self.nodes.contains_key(&node) {
             return Err(Error::NodeNotAvailable { node });
         }
-        return if let Some(node_entry) = self.partitions_by_nodes.get(&node) {
-            Ok(node_entry)
+        return if let Some(node_ref) = self.partitions_by_nodes.get(&node) {
+            Ok(node_ref)
         } else {
             let mut topic_partitions = Vec::new();
-            for topic_entry in self.topics.iter() {
-                for partition in topic_entry.partitions.iter() {
-                    let tp = TopicPartition {
-                        topic: topic_entry.key().clone(),
-                        partition: partition.partition,
-                    };
-                    topic_partitions.push(tp);
+            for topic in self.topics.iter() {
+                for partition in topic.partitions.iter() {
+                    if partition.leader == node {
+                        let tp = TopicPartition {
+                            topic: topic.key().clone(),
+                            partition: partition.partition,
+                        };
+                        topic_partitions.push(tp);
+                    }
                 }
             }
             self.partitions_by_nodes.insert(node, topic_partitions);

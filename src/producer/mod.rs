@@ -333,8 +333,12 @@ impl<Exe: Executor> Producer<Exe> {
     ) -> Result<Vec<(Node, FlushResult)>> {
         let mut result = Vec::new();
         for node_entry in self.client.cluster_meta.nodes.iter() {
-            if let Ok(node_topology) = self.client.cluster_meta.drain_node(node_entry.value().id) {
-                let partitions = node_topology.value();
+            if let Ok(node) = self.client.cluster_meta.drain_node(node_entry.value().id) {
+                let partitions = node.value();
+                if partitions.is_empty() {
+                    continue;
+                }
+
                 let mut topic_data = IndexMap::new();
                 let mut topics_thunks = BTreeMap::new();
 

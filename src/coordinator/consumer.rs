@@ -562,17 +562,25 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                             }
                         }
                         self.state = MemberState::Stable;
+
+                        let group_id = self.group_meta.group_id.as_str();
                         info!(
-                            "Sync group [{}] success, leader = {}, member_id = {}, generation_id \
-                             = {}, protocol_type = {}, protocol_name = {}, assignments = <{}>",
-                            self.group_meta.group_id.as_str(),
+                            "Sync group [{group_id}] success, leader = {}, member_id = {}, \
+                             generation_id = {}, assignments = <{}>",
                             self.group_meta.leader.as_str(),
                             self.group_meta.member_id.as_str(),
                             self.group_meta.generation_id,
-                            self.group_meta.protocol_type.as_ref().unwrap().as_str(),
-                            self.group_meta.protocol_name.as_ref().unwrap().as_str(),
                             crate::array_display(self.subscriptions.assignments.keys()),
                         );
+
+                        if let Some(protocol_type) = self.group_meta.protocol_type.as_ref() {
+                            info!(
+                                "Sync group [{group_id}] success, protocol_type = {}, \
+                                 protocol_name = {}",
+                                protocol_type.as_str(),
+                                self.group_meta.protocol_name.as_ref().unwrap().as_str()
+                            );
+                        }
                         Ok(())
                     }
                     Some(error) => Err(error.into()),
