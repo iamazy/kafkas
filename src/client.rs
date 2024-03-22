@@ -49,7 +49,7 @@ pub struct Kafka<Exe: Executor> {
     pub manager: Arc<ConnectionManager<Exe>>,
     pub operation_retry_options: OperationRetryOptions,
     pub executor: Arc<Exe>,
-    pub cluster_meta: Arc<Cluster>,
+    pub cluster: Arc<Cluster>,
     supported_versions: Arc<DashMap<i16, VersionRange>>,
 }
 
@@ -122,20 +122,20 @@ impl<Exe: Executor> Kafka<Exe> {
             manager,
             operation_retry_options,
             executor,
-            cluster_meta: Arc::new(Cluster::default()),
+            cluster: Arc::new(Cluster::default()),
             supported_versions: Arc::new(supported_versions),
         })
     }
 
     pub fn topic_id(&self, topic_name: &TopicName) -> Uuid {
-        match self.cluster_meta.topic_id(topic_name) {
+        match self.cluster.topic_id(topic_name) {
             Some(topic_id) => topic_id,
             None => Uuid::nil(),
         }
     }
 
     pub fn partitions(&self, topic: &TopicName) -> Result<PartitionRef> {
-        self.cluster_meta.partitions(topic)
+        self.cluster.partitions(topic)
     }
 
     pub fn version_range(&self, key: ApiKey) -> Option<VersionRange> {
@@ -284,7 +284,7 @@ impl<Exe: Executor> Kafka<Exe> {
         let request = RequestKind::MetadataRequest(request);
         let response = self.manager.invoke(&self.manager.url, request).await?;
         if let ResponseKind::MetadataResponse(metadata) = response {
-            self.cluster_meta.update_metadata(metadata)
+            self.cluster.update_metadata(metadata)
         } else {
             Err(Error::Connection(ConnectionError::UnexpectedResponse(
                 format!("{response:?}"),
@@ -293,8 +293,8 @@ impl<Exe: Executor> Kafka<Exe> {
     }
 
     pub async fn update_full_metadata(&self) -> Result<()> {
-        let mut topics = Vec::with_capacity(self.cluster_meta.topics.len());
-        for topic in self.cluster_meta.topics.iter() {
+        let mut topics = Vec::with_capacity(self.cluster.topics.len());
+        for topic in self.cluster.topics.iter() {
             topics.push(topic.key().clone());
         }
         self.update_metadata(topics).await

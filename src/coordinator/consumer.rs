@@ -53,7 +53,7 @@ use crate::{
 
 const CONSUMER_PROTOCOL_TYPE: &str = "consumer";
 
-macro_rules! offset_fetch_block {
+macro_rules! fetch_offsets_block {
     ($self:ident, $source:ident) => {
         for topic in $source.topics {
             for partition in topic.partitions {
@@ -63,13 +63,22 @@ macro_rules! offset_fetch_block {
                 };
                 if partition.error_code.is_ok() {
                     if let Some(partition_state) = $self.subscriptions.assignments.get_mut(&tp) {
-                        partition_state.position.offset = partition.committed_offset;
-                        partition_state.position.offset_epoch =
-                            Some(partition.committed_leader_epoch);
-                        info!(
-                            "Fetch {tp} offset success, offset: {}",
-                            partition.committed_offset
-                        );
+                        // record the position with the offset (-1 indicates no committed offset to
+                        // fetch)
+                        if partition.committed_offset >= 0 {
+                            partition_state.position.offset = partition.committed_offset;
+                            partition_state.position.offset_epoch =
+                                Some(partition.committed_leader_epoch);
+                            info!(
+                                "Fetch {tp} offset success, offset: {}",
+                                partition.committed_offset
+                            );
+                        } else {
+                            debug!(
+                                "Found no committed offset for partition {}",
+                                partition.partition_index
+                            );
+                        }
                     }
                 } else {
                     error!(
@@ -86,7 +95,7 @@ macro_rules! offset_fetch_block {
             if let Some(tp_state) = $self.subscriptions.assignments.get_mut(&tp) {
                 tp_state.position.offset = offset;
                 tp_state.position.offset_epoch = None;
-                tp_state.position.current_leader = $self.client.cluster_meta.current_leader(&tp);
+                tp_state.position.current_leader = $self.client.cluster.current_leader(&tp);
                 info!("Seek {tp} with offset: {offset}",);
             }
         }
@@ -370,7 +379,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
 
         self.join_group().await?;
         self.sync_group().await?;
-        self.offset_fetch().await?;
+        self.fetch_offsets().await?;
 
         // resume fetch thread.
         self.fetcher.resume();
@@ -557,22 +566,30 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                                 };
                                 let mut tp_state = TopicPartitionState::new(*partition);
                                 tp_state.position.current_leader =
-                                    self.client.cluster_meta.current_leader(&tp);
+                                    self.client.cluster.current_leader(&tp);
                                 self.subscriptions.assignments.insert(tp, tp_state);
                             }
                         }
                         self.state = MemberState::Stable;
+
+                        let group_id = self.group_meta.group_id.as_str();
                         info!(
-                            "Sync group [{}] success, leader = {}, member_id = {}, generation_id \
-                             = {}, protocol_type = {}, protocol_name = {}, assignments = <{}>",
-                            self.group_meta.group_id.as_str(),
+                            "Sync group [{group_id}] success, leader = {}, member_id = {}, \
+                             generation_id = {}, assignments = <{}>",
                             self.group_meta.leader.as_str(),
                             self.group_meta.member_id.as_str(),
                             self.group_meta.generation_id,
-                            self.group_meta.protocol_type.as_ref().unwrap().as_str(),
-                            self.group_meta.protocol_name.as_ref().unwrap().as_str(),
                             crate::array_display(self.subscriptions.assignments.keys()),
                         );
+
+                        if let Some(protocol_type) = self.group_meta.protocol_type.as_ref() {
+                            info!(
+                                "Sync group [{group_id}] success, protocol_type = {}, \
+                                 protocol_name = {}",
+                                protocol_type.as_str(),
+                                self.group_meta.protocol_name.as_ref().unwrap().as_str()
+                            );
+                        }
                         Ok(())
                     }
                     Some(error) => Err(error.into()),
@@ -582,7 +599,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         }
     }
 
-    pub async fn offset_fetch(&mut self) -> Result<()> {
+    pub async fn fetch_offsets(&mut self) -> Result<()> {
         match self.client.version_range(ApiKey::OffsetFetchKey) {
             Some(version_range) => {
                 let mut offset_fetch_response = self
@@ -595,9 +612,9 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
                 match offset_fetch_response.error_code.err() {
                     None => {
                         if let Some(group) = offset_fetch_response.groups.pop() {
-                            offset_fetch_block!(self, group);
+                            fetch_offsets_block!(self, group);
                         } else {
-                            offset_fetch_block!(self, offset_fetch_response);
+                            fetch_offsets_block!(self, offset_fetch_response);
                         }
                         Ok(())
                     }
@@ -829,7 +846,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
             match self.group_meta.protocol_name {
                 Some(ref protocol) => {
                     let assignor = self.look_up_assignor(&protocol.to_string())?;
-                    let cluster = self.client.cluster_meta.clone();
+                    let cluster = self.client.cluster.clone();
                     request.assignments =
                         serialize_assignments(assignor.assign(cluster, &self.group_subscription)?)?;
                 }
@@ -858,7 +875,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         if version <= 7 {
             let mut topics = Vec::with_capacity(self.subscriptions.topics.len());
             for assign in self.subscriptions.topics.iter() {
-                let partitions = self.client.cluster_meta.partitions(assign)?;
+                let partitions = self.client.cluster.partitions(assign)?;
 
                 let mut topic = OffsetFetchRequestTopic::default();
                 topic.name = assign.clone();
@@ -870,7 +887,7 @@ impl<Exe: Executor> CoordinatorInner<Exe> {
         } else {
             let mut topics = Vec::with_capacity(self.subscriptions.topics.len());
             for assign in self.subscriptions.topics.iter() {
-                let partitions = self.client.cluster_meta.partitions(assign)?;
+                let partitions = self.client.cluster.partitions(assign)?;
 
                 let mut topic = OffsetFetchRequestTopics::default();
                 topic.name = assign.clone();
@@ -984,7 +1001,7 @@ async fn coordinator_loop<Exe: Executor>(
             CoordinatorEvent::JoinGroup => coordinator.join_group().await,
             CoordinatorEvent::SyncGroup => coordinator.sync_group().await,
             CoordinatorEvent::LeaveGroup(reason) => coordinator.maybe_leave_group(reason).await,
-            CoordinatorEvent::OffsetFetch => coordinator.offset_fetch().await,
+            CoordinatorEvent::OffsetFetch => coordinator.fetch_offsets().await,
             CoordinatorEvent::PauseFetch => {
                 coordinator.fetcher.pause();
                 Ok(())

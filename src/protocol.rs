@@ -160,6 +160,7 @@ impl KafkaCodec {
         }
         Ok(())
     }
+
     fn encode_request<Req: Request>(
         &mut self,
         mut header: RequestHeader,
@@ -192,18 +193,8 @@ impl KafkaCodec {
         Ok(())
     }
 
-    fn response_header_version(&self, api_key: i16, api_version: i16) -> i16 {
-        if let Some(version_range) = self.support_versions.get(&api_key) {
-            if api_version >= version_range.max {
-                return 1;
-            }
-        }
-        0
-    }
-
     fn decode_response(&mut self, src: &mut BytesMut) -> Result<Option<Command>, ConnectionError> {
-        let mut correlation_id_bytes = src.try_peek_bytes(0..4)?;
-        let correlation_id = correlation_id_bytes.get_i32();
+        let correlation_id = src.peek_bytes(0..4).get_i32();
 
         let request_header = self
             .active_requests

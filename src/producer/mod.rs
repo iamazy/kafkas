@@ -332,9 +332,13 @@ impl<Exe: Executor> Producer<Exe> {
         encode_options: &RecordEncodeOptions,
     ) -> Result<Vec<(Node, FlushResult)>> {
         let mut result = Vec::new();
-        for node_entry in self.client.cluster_meta.nodes.iter() {
-            if let Ok(node_topology) = self.client.cluster_meta.drain_node(node_entry.value().id) {
-                let partitions = node_topology.value();
+        for node_entry in self.client.cluster.nodes.iter() {
+            if let Ok(node) = self.client.cluster.drain_node(node_entry.value().id) {
+                let partitions = node.value();
+                if partitions.is_empty() {
+                    continue;
+                }
+
                 let mut topic_data = IndexMap::new();
                 let mut topics_thunks = BTreeMap::new();
 
@@ -444,7 +448,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
     pub async fn new(client: Arc<Kafka<Exe>>, topic: TopicName) -> Result<Arc<TopicProducer<Exe>>> {
         client.update_metadata(vec![topic.clone()]).await?;
 
-        let partitions = client.cluster_meta.partitions(&topic)?;
+        let partitions = client.cluster.partitions(&topic)?;
         let partitions = partitions.value();
         let num_partitions = partitions.len();
         let batches = DashMap::with_capacity_and_hasher(num_partitions, FxBuildHasher::default());
@@ -473,7 +477,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
                 &self.topic,
                 record.key(),
                 record.value(),
-                &self.client.cluster_meta,
+                &self.client.cluster,
             )?;
         }
         return match self.batches.get_mut(&partition) {
